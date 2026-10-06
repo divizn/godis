@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"io"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -8,6 +9,13 @@ import (
 
 	"github.com/divizn/godis/internal/wal"
 )
+
+func mustClose(t *testing.T, c io.Closer) {
+	t.Helper()
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
 
 func openDB(t *testing.T, path string) *DB {
 	t.Helper()
@@ -36,10 +44,10 @@ func TestReopenRestoresState(t *testing.T) {
 	if err := db.Delete("b"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	db.Close()
+	mustClose(t, db)
 
 	db = openDB(t, path)
-	defer db.Close()
+	defer mustClose(t, db)
 	want := map[string]string{"a": "3", "empty": "", "bin\x00\x01": "\x00\xff\x02"}
 	for k, v := range want {
 		if got, ok := db.Get(k); !ok || string(got) != v {
@@ -54,7 +62,7 @@ func TestReopenRestoresState(t *testing.T) {
 func TestFailedAppendLeavesMemoryUnchanged(t *testing.T) {
 	db := openDB(t, filepath.Join(t.TempDir(), "wal"))
 	mustSet(t, db, "k", "old")
-	db.Close()
+	mustClose(t, db)
 
 	if err := db.Set("k", []byte("new")); err == nil {
 		t.Fatal("set on closed log: want error")
@@ -83,10 +91,10 @@ func TestCorruptRecordFailsOpen(t *testing.T) {
 			if err := l.Append(rec); err != nil {
 				t.Fatal(err)
 			}
-			l.Close()
+			mustClose(t, l)
 
 			if db, err := Open(path); err == nil {
-				db.Close()
+				mustClose(t, db)
 				t.Fatal("open with corrupt record: want error")
 			}
 		})
@@ -103,10 +111,14 @@ func TestConcurrentWritesReplayToLiveState(t *testing.T) {
 			wg.Go(func() {
 				for i := range 50 {
 					k := keys[i%len(keys)]
+					var err error
 					if i%7 == 0 {
-						db.Delete(k)
+						err = db.Delete(k)
 					} else {
-						db.Set(k, []byte(strconv.Itoa(g*1000+i)))
+						err = db.Set(k, []byte(strconv.Itoa(g*1000+i)))
+					}
+					if err != nil {
+						t.Error(err)
 					}
 				}
 			})
@@ -118,7 +130,7 @@ func TestConcurrentWritesReplayToLiveState(t *testing.T) {
 				live[k] = string(v)
 			}
 		}
-		db.Close()
+		mustClose(t, db)
 
 		db = openDB(t, path)
 		for _, k := range keys {
@@ -128,6 +140,6 @@ func TestConcurrentWritesReplayToLiveState(t *testing.T) {
 				t.Errorf("round %d, key %q: replayed %q, %v; live was %q, %v", round, k, v, ok, lv, lok)
 			}
 		}
-		db.Close()
+		mustClose(t, db)
 	}
 }

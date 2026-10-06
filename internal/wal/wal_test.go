@@ -1,11 +1,19 @@
 package wal
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 )
+
+func mustClose(t *testing.T, c io.Closer) {
+	t.Helper()
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
 
 func open(t *testing.T, path string) (*Log, []string) {
 	t.Helper()
@@ -35,10 +43,10 @@ func appendRaw(t *testing.T, path string, b []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
 	if _, err := f.Write(b); err != nil {
 		t.Fatal(err)
 	}
+	mustClose(t, f)
 }
 
 func TestReplayInOrder(t *testing.T) {
@@ -49,10 +57,10 @@ func TestReplayInOrder(t *testing.T) {
 		t.Fatalf("new log replayed %v", got)
 	}
 	appendAll(t, l, "a", "bb", "ccc")
-	l.Close()
+	mustClose(t, l)
 
 	l, got = open(t, path)
-	defer l.Close()
+	defer mustClose(t, l)
 	if want := []string{"a", "bb", "ccc"}; !slices.Equal(got, want) {
 		t.Fatalf("replay: got %v, want %v", got, want)
 	}
@@ -69,7 +77,7 @@ func TestTornTailIsDropped(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "wal")
 			l, _ := open(t, path)
 			appendAll(t, l, "a")
-			l.Close()
+			mustClose(t, l)
 			appendRaw(t, path, tail)
 
 			l, got := open(t, path)
@@ -77,10 +85,10 @@ func TestTornTailIsDropped(t *testing.T) {
 				t.Fatalf("replay: got %v, want %v", got, want)
 			}
 			appendAll(t, l, "b")
-			l.Close()
+			mustClose(t, l)
 
 			l, got = open(t, path)
-			defer l.Close()
+			defer mustClose(t, l)
 			if want := []string{"a", "b"}; !slices.Equal(got, want) {
 				t.Fatalf("replay after append: got %v, want %v", got, want)
 			}
@@ -92,7 +100,7 @@ func TestChecksumMismatchFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wal")
 	l, _ := open(t, path)
 	appendAll(t, l, "abc", "def")
-	l.Close()
+	mustClose(t, l)
 
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -110,7 +118,7 @@ func TestChecksumMismatchFails(t *testing.T) {
 
 func TestAppendRejectsEmptyRecord(t *testing.T) {
 	l, _ := open(t, filepath.Join(t.TempDir(), "wal"))
-	defer l.Close()
+	defer mustClose(t, l)
 	if err := l.Append(nil); err == nil {
 		t.Fatal("append empty record: want error")
 	}

@@ -41,8 +41,7 @@ func Open(path string, replay func(record []byte) error) (*Log, error) {
 		return nil, fmt.Errorf("open wal: %w", err)
 	}
 	if err := syncDir(filepath.Dir(path)); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("sync wal dir: %w", err)
+		return nil, errors.Join(fmt.Errorf("sync wal dir: %w", err), f.Close())
 	}
 	return &Log{f: f}, nil
 }
@@ -74,7 +73,6 @@ func (l *Log) Close() error {
 	return l.f.Close()
 }
 
-// ponytail: a checksum mismatch anywhere, even in the last record, fails Open; add truncate-and-continue if torn tails show up as bad checksums in practice
 func replayFile(path string, replay func([]byte) error) (int64, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -83,9 +81,12 @@ func replayFile(path string, replay func([]byte) error) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("open wal for replay: %w", err)
 	}
-	defer f.Close()
+	off, err := replayRecords(bufio.NewReader(f), replay)
+	return off, errors.Join(err, f.Close())
+}
 
-	r := bufio.NewReader(f)
+// ponytail: a checksum mismatch anywhere, even in the last record, fails Open; add truncate-and-continue if torn tails show up as bad checksums in practice
+func replayRecords(r *bufio.Reader, replay func([]byte) error) (int64, error) {
 	var off int64
 	var hdr [headerSize]byte
 	for {
@@ -126,6 +127,5 @@ func syncDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
-	return d.Sync()
+	return errors.Join(d.Sync(), d.Close())
 }
