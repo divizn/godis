@@ -18,32 +18,7 @@ func TestOneLeaderPerTerm(t *testing.T) {
 		c := newCluster(t, 5)
 		defer c.stopAll()
 
-		var mu sync.Mutex
-		leaders := map[uint64]string{}
-		var violation string
-		done := make(chan struct{})
-		var wg sync.WaitGroup
-		wg.Go(func() {
-			for {
-				select {
-				case <-done:
-					return
-				case <-time.After(time.Millisecond):
-				}
-				for _, id := range c.live() {
-					s := c.node(id).Status()
-					if s.Role != Leader {
-						continue
-					}
-					mu.Lock()
-					if prev, ok := leaders[s.Term]; ok && prev != id && violation == "" {
-						violation = fmt.Sprintf("term %d has leaders %s and %s", s.Term, prev, id)
-					}
-					leaders[s.Term] = id
-					mu.Unlock()
-				}
-			}
-		})
+		c.net.setFaults(0, 5*time.Millisecond)
 
 		for range 10 {
 			old, term := c.waitLeader()
@@ -55,14 +30,9 @@ func TestOneLeaderPerTerm(t *testing.T) {
 			})
 			c.net.heal()
 		}
-		close(done)
-		wg.Wait()
-
-		if violation != "" {
-			t.Fatal(violation)
-		}
-		if len(leaders) < 10 {
-			t.Fatalf("saw leaders in %d terms, want at least 10", len(leaders))
+		c.checkOneLeaderPerTerm()
+		if n := c.net.leaderTerms(); n < 10 {
+			t.Fatalf("saw leaders in %d terms, want at least 10", n)
 		}
 	})
 }
@@ -131,6 +101,65 @@ func TestVoteOncePerTermAcrossRestart(t *testing.T) {
 	})
 }
 
+func appendEntries(t *testing.T, n *Node, args AppendEntriesArgs) AppendEntriesReply {
+	t.Helper()
+	r, err := n.HandleAppendEntries(args)
+	if err != nil {
+		t.Fatalf("append entries: %v", err)
+	}
+	return r
+}
+
+func entries(term uint64, cmds ...string) []Entry {
+	var es []Entry
+	for _, c := range cmds {
+		es = append(es, Entry{Term: term, Cmd: []byte(c)})
+	}
+	return es
+}
+
+func TestStaleAppendEntriesDoesNotTruncate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		n := singleNode(t, t.TempDir())
+		defer n.Stop()
+		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "x", "y", "z")})
+		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "x")})
+		if r := appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", PrevLogIndex: 3, PrevLogTerm: 1}); !r.Success {
+			t.Fatalf("entry 3 lost after a stale append: %+v", r)
+		}
+	})
+}
+
+func TestFollowerCommitsOnlyEntriesTheLeaderVouchedFor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		n := singleNode(t, t.TempDir())
+		defer n.Stop()
+		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "x", "y", "z")})
+		appendEntries(t, n, AppendEntriesArgs{Term: 2, Leader: "c", PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 3})
+		if got := n.Status().CommitIndex; got != 1 {
+			t.Fatalf("commit index %d, want 1: entries 2 and 3 were never checked against the leader", got)
+		}
+	})
+}
+
+func TestSameTermVoteRequestKeepsLeader(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+		leader, term := c.waitLeader()
+		other := c.ids[0]
+		if other == leader {
+			other = c.ids[1]
+		}
+		if _, err := c.node(leader).HandleRequestVote(RequestVoteArgs{Term: term, Candidate: other}); err != nil {
+			t.Fatal(err)
+		}
+		if s := c.node(leader).Status(); s.Role != Leader || s.Term != term {
+			t.Fatalf("leader of term %d became %v in term %d after a same-term vote request", term, s.Role, s.Term)
+		}
+	})
+}
+
 func TestReelectionAfterLeaderStops(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := newCluster(t, 3)
@@ -174,17 +203,25 @@ func TestLeaderWithoutQuorumStopsCommitting(t *testing.T) {
 		}
 		c.net.partition([]string{old, follower}, rest)
 
-		if err := c.propose(old, "minority", time.Second); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("propose on leader without quorum: got %v, want deadline exceeded", err)
-		}
+		minority := make(chan error, 1)
+		go func() { minority <- c.propose(old, "minority", time.Minute) }()
 		id, newTerm := c.waitLeader(rest...)
 		if newTerm <= term {
 			t.Fatalf("new leader term %d, want > %d", newTerm, term)
 		}
 		c.mustPropose(id, "majority")
+		time.Sleep(time.Second)
+		select {
+		case err := <-minority:
+			t.Fatalf("propose on leader without quorum returned %v while partitioned", err)
+		default:
+		}
 
 		c.net.heal()
 		c.waitApplied("majority")
+		if err := <-minority; !errors.Is(err, ErrProposalDropped) {
+			t.Fatalf("overwritten proposal: got %v, want ErrProposalDropped", err)
+		}
 		if s := c.node(old).Status(); s.Role == Leader && s.Term == term {
 			t.Fatalf("old leader still leads term %d after heal", term)
 		}
@@ -306,6 +343,7 @@ func TestFullRestartRestoresState(t *testing.T) {
 			}
 		}
 
+		c.waitApplied(before[len(before)-1].cmd)
 		id, _ := c.waitLeader()
 		c.mustPropose(id, "e")
 		c.waitApplied("e")

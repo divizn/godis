@@ -25,10 +25,13 @@ type memNet struct {
 	group map[string]int
 	drop  float64
 	delay time.Duration
+
+	leaders   map[uint64]string
+	violation string
 }
 
 func newMemNet() *memNet {
-	return &memNet{nodes: map[string]*Node{}, group: map[string]int{}}
+	return &memNet{nodes: map[string]*Node{}, group: map[string]int{}, leaders: map[uint64]string{}}
 }
 
 func (m *memNet) partition(groups ...[]string) {
@@ -82,6 +85,21 @@ func (m *memNet) hop(ctx context.Context, from, to string) (*Node, error) {
 	return n, nil
 }
 
+func (m *memNet) sawLeader(term uint64, id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if prev, ok := m.leaders[term]; ok && prev != id && m.violation == "" {
+		m.violation = fmt.Sprintf("term %d has leaders %s and %s", term, prev, id)
+	}
+	m.leaders[term] = id
+}
+
+func (m *memNet) leaderTerms() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.leaders)
+}
+
 type memTransport struct {
 	net  *memNet
 	from string
@@ -103,6 +121,7 @@ func (t memTransport) RequestVote(ctx context.Context, to string, args RequestVo
 }
 
 func (t memTransport) AppendEntries(ctx context.Context, to string, args AppendEntriesArgs) (AppendEntriesReply, error) {
+	t.net.sawLeader(args.Term, args.Leader)
 	n, err := t.net.hop(ctx, t.from, to)
 	if err != nil {
 		return AppendEntriesReply{}, err
@@ -328,9 +347,19 @@ func (c *cluster) waitApplied(cmd string, ids ...string) {
 	}
 }
 
+func (c *cluster) checkOneLeaderPerTerm() {
+	c.t.Helper()
+	c.net.mu.Lock()
+	defer c.net.mu.Unlock()
+	if c.net.violation != "" {
+		c.t.Fatal(c.net.violation)
+	}
+}
+
 // live nodes applied the same sequence, earlier incarnations a prefix of it
 func (c *cluster) checkSame() []applied {
 	c.t.Helper()
+	c.checkOneLeaderPerTerm()
 	ids := c.live()
 	want := c.log(ids[0]).snapshot()
 	for _, id := range ids[1:] {

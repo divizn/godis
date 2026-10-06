@@ -309,8 +309,10 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) (RequestVoteReply, error)
 	if args.Term < n.term {
 		return RequestVoteReply{Term: n.term}, nil
 	}
-	if err := n.becomeFollower(args.Term); err != nil {
-		return RequestVoteReply{}, err
+	if args.Term > n.term {
+		if err := n.becomeFollower(args.Term); err != nil {
+			return RequestVoteReply{}, err
+		}
 	}
 	last := n.lastIndex()
 	upToDate := args.LastLogTerm > n.log[last].Term ||
