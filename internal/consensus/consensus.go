@@ -1,2 +1,639 @@
-// Package consensus implements leader/follower replication.
+// Package consensus replicates a log of commands across a static cluster
+// using Raft (Ongaro and Ousterhout, extended paper, figure 2).
 package consensus
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/divizn/godis/internal/wal"
+)
+
+const maxBatch = 64
+
+var (
+	ErrStopped         = errors.New("consensus: node stopped")
+	ErrProposalDropped = errors.New("consensus: proposal overwritten by a newer leader")
+	ErrEmptyCommand    = errors.New("consensus: empty command")
+)
+
+// NotLeaderError is returned by Propose on a node that is not the leader.
+// Leader is empty when this node does not know the current leader.
+type NotLeaderError struct {
+	Leader string
+}
+
+func (e *NotLeaderError) Error() string {
+	if e.Leader == "" {
+		return "consensus: not the leader, leader unknown"
+	}
+	return "consensus: not the leader, leader is " + e.Leader
+}
+
+type Role int
+
+const (
+	Follower Role = iota
+	Candidate
+	Leader
+)
+
+func (r Role) String() string {
+	switch r {
+	case Follower:
+		return "follower"
+	case Candidate:
+		return "candidate"
+	case Leader:
+		return "leader"
+	}
+	return fmt.Sprintf("Role(%d)", int(r))
+}
+
+// Entry is one log entry. An empty Cmd is a leader's no-op and is never applied.
+type Entry struct {
+	Term uint64
+	Cmd  []byte
+}
+
+type RequestVoteArgs struct {
+	Term         uint64
+	Candidate    string
+	LastLogIndex uint64
+	LastLogTerm  uint64
+}
+
+type RequestVoteReply struct {
+	Term    uint64
+	Granted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         uint64
+	Leader       string
+	PrevLogIndex uint64
+	PrevLogTerm  uint64
+	Entries      []Entry
+	LeaderCommit uint64
+}
+
+// AppendEntriesReply carries ConflictIndex and ConflictTerm on a failed
+// consistency check so the leader can skip back a whole term at a time.
+type AppendEntriesReply struct {
+	Term          uint64
+	Success       bool
+	ConflictIndex uint64
+	ConflictTerm  uint64
+}
+
+// Transport sends the two Raft RPCs to a peer, which serves them with
+// HandleRequestVote and HandleAppendEntries.
+type Transport interface {
+	RequestVote(ctx context.Context, to string, args RequestVoteArgs) (RequestVoteReply, error)
+	AppendEntries(ctx context.Context, to string, args AppendEntriesArgs) (AppendEntriesReply, error)
+}
+
+type Config struct {
+	ID string
+	// Peers lists every member of the cluster, including ID.
+	Peers     []string
+	Dir       string
+	Transport Transport
+	// Apply receives committed commands in log order, exactly once per
+	// process lifetime; after a restart the whole log is applied again.
+	Apply func(index uint64, cmd []byte)
+	// ElectionTimeout is randomized in [ElectionTimeout, 2*ElectionTimeout).
+	// Defaults to 150ms.
+	ElectionTimeout time.Duration
+	// HeartbeatInterval defaults to 50ms and must be below ElectionTimeout.
+	HeartbeatInterval time.Duration
+}
+
+type Status struct {
+	ID          string
+	Role        Role
+	Term        uint64
+	Leader      string
+	CommitIndex uint64
+}
+
+type Node struct {
+	id        string
+	peers     []string
+	dir       string
+	tr        Transport
+	apply     func(uint64, []byte)
+	election  time.Duration
+	heartbeat time.Duration
+	wake      map[string]chan struct{}
+
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	wg     sync.WaitGroup
+
+	// ponytail: one lock over all state, held across fsyncs; split it and add group commit if a benchmark asks
+	mu          sync.Mutex
+	applyCond   *sync.Cond
+	wal         *wal.Log
+	role        Role
+	term        uint64
+	votedFor    string
+	leader      string
+	log         []Entry
+	commitIndex uint64
+	lastApplied uint64
+	deadline    time.Time
+	votes       int
+	nextIndex   map[string]uint64
+	matchIndex  map[string]uint64
+	waiters     map[uint64]chan error
+}
+
+// New restores the node's term, vote and log from cfg.Dir and starts it as a follower.
+func New(cfg Config) (*Node, error) {
+	if cfg.ID == "" || cfg.Dir == "" || cfg.Transport == nil || cfg.Apply == nil {
+		return nil, errors.New("consensus: ID, Dir, Transport and Apply are required")
+	}
+	if !slices.Contains(cfg.Peers, cfg.ID) {
+		return nil, fmt.Errorf("consensus: peers %v do not include %q", cfg.Peers, cfg.ID)
+	}
+	if len(slices.Compact(slices.Sorted(slices.Values(cfg.Peers)))) != len(cfg.Peers) {
+		return nil, fmt.Errorf("consensus: duplicate peers in %v", cfg.Peers)
+	}
+	if cfg.ElectionTimeout == 0 {
+		cfg.ElectionTimeout = 150 * time.Millisecond
+	}
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = 50 * time.Millisecond
+	}
+	if cfg.HeartbeatInterval >= cfg.ElectionTimeout {
+		return nil, fmt.Errorf("consensus: heartbeat %v must be below election timeout %v", cfg.HeartbeatInterval, cfg.ElectionTimeout)
+	}
+	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create raft dir: %w", err)
+	}
+	term, vote, err := readState(cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+
+	n := &Node{
+		id:        cfg.ID,
+		peers:     slices.DeleteFunc(slices.Clone(cfg.Peers), func(p string) bool { return p == cfg.ID }),
+		dir:       cfg.Dir,
+		tr:        cfg.Transport,
+		apply:     cfg.Apply,
+		election:  cfg.ElectionTimeout,
+		heartbeat: cfg.HeartbeatInterval,
+		wake:      map[string]chan struct{}{},
+		term:      term,
+		votedFor:  vote,
+		log:       []Entry{{}},
+		waiters:   map[uint64]chan error{},
+	}
+	n.wal, err = wal.Open(filepath.Join(cfg.Dir, "log"), n.replay)
+	if err != nil {
+		return nil, fmt.Errorf("open raft log: %w", err)
+	}
+	n.applyCond = sync.NewCond(&n.mu)
+	n.ctx, n.cancel = context.WithCancelCause(context.Background())
+	n.resetDeadline()
+
+	n.wg.Go(n.runTimer)
+	n.wg.Go(n.runApplier)
+	for _, p := range n.peers {
+		ch := make(chan struct{}, 1)
+		n.wake[p] = ch
+		n.wg.Go(func() { n.replicate(p, ch) })
+	}
+	return n, nil
+}
+
+func (n *Node) replay(rec []byte) error {
+	start, entries, err := decodeBatch(rec)
+	if err != nil {
+		return fmt.Errorf("decode raft log batch: %w", err)
+	}
+	if start == 0 || start > uint64(len(n.log)) {
+		return fmt.Errorf("raft log batch starts at %d but log ends at %d", start, len(n.log)-1)
+	}
+	n.log = append(n.log[:start], entries...)
+	return nil
+}
+
+// Propose replicates cmd and returns once it is committed and applied on this
+// node. If ctx ends first the command may still commit later.
+func (n *Node) Propose(ctx context.Context, cmd []byte) error {
+	if len(cmd) == 0 {
+		return ErrEmptyCommand
+	}
+	n.mu.Lock()
+	if n.ctx.Err() != nil {
+		n.mu.Unlock()
+		return context.Cause(n.ctx)
+	}
+	if n.role != Leader {
+		leader := n.leader
+		n.mu.Unlock()
+		return &NotLeaderError{Leader: leader}
+	}
+	idx := n.lastIndex() + 1
+	if err := n.appendLog(idx, []Entry{{Term: n.term, Cmd: slices.Clone(cmd)}}); err != nil {
+		n.mu.Unlock()
+		return err
+	}
+	done := make(chan error, 1)
+	n.waiters[idx] = done
+	n.advanceCommit()
+	n.wakeAll()
+	n.mu.Unlock()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		n.mu.Lock()
+		if n.waiters[idx] == done {
+			delete(n.waiters, idx)
+		}
+		n.mu.Unlock()
+		return ctx.Err()
+	case <-n.ctx.Done():
+		return context.Cause(n.ctx)
+	}
+}
+
+func (n *Node) Status() Status {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, CommitIndex: n.commitIndex}
+}
+
+// Stop halts the node, waits for its goroutines and closes its log. It
+// returns the persistence error that halted the node, if one did.
+func (n *Node) Stop() error {
+	n.mu.Lock()
+	n.halt(ErrStopped)
+	n.mu.Unlock()
+	n.wg.Wait()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var closeErr error
+	if n.wal != nil {
+		if err := n.wal.Close(); err != nil {
+			closeErr = fmt.Errorf("close raft log: %w", err)
+		}
+		n.wal = nil
+	}
+	if cause := context.Cause(n.ctx); !errors.Is(cause, ErrStopped) {
+		return cause
+	}
+	return closeErr
+}
+
+// HandleRequestVote serves a RequestVote RPC. An error means no reply must be sent.
+func (n *Node) HandleRequestVote(args RequestVoteArgs) (RequestVoteReply, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.ctx.Err() != nil {
+		return RequestVoteReply{}, context.Cause(n.ctx)
+	}
+	if args.Term < n.term {
+		return RequestVoteReply{Term: n.term}, nil
+	}
+	if err := n.becomeFollower(args.Term); err != nil {
+		return RequestVoteReply{}, err
+	}
+	last := n.lastIndex()
+	upToDate := args.LastLogTerm > n.log[last].Term ||
+		args.LastLogTerm == n.log[last].Term && args.LastLogIndex >= last
+	if (n.votedFor != "" && n.votedFor != args.Candidate) || !upToDate {
+		return RequestVoteReply{Term: n.term}, nil
+	}
+	if err := n.setTermVote(n.term, args.Candidate); err != nil {
+		return RequestVoteReply{}, err
+	}
+	n.resetDeadline()
+	return RequestVoteReply{Term: n.term, Granted: true}, nil
+}
+
+// HandleAppendEntries serves an AppendEntries RPC. An error means no reply must be sent.
+func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesReply, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.ctx.Err() != nil {
+		return AppendEntriesReply{}, context.Cause(n.ctx)
+	}
+	if args.Term < n.term {
+		return AppendEntriesReply{Term: n.term}, nil
+	}
+	if err := n.becomeFollower(args.Term); err != nil {
+		return AppendEntriesReply{}, err
+	}
+	n.leader = args.Leader
+	n.resetDeadline()
+
+	reply := AppendEntriesReply{Term: n.term}
+	if last := n.lastIndex(); args.PrevLogIndex > last {
+		reply.ConflictIndex = last + 1
+		return reply, nil
+	}
+	if t := n.log[args.PrevLogIndex].Term; t != args.PrevLogTerm {
+		i := args.PrevLogIndex
+		for i > 1 && n.log[i-1].Term == t {
+			i--
+		}
+		reply.ConflictTerm, reply.ConflictIndex = t, i
+		return reply, nil
+	}
+
+	for i, e := range args.Entries {
+		idx := args.PrevLogIndex + 1 + uint64(i)
+		if idx <= n.lastIndex() && n.log[idx].Term == e.Term {
+			continue
+		}
+		if err := n.appendLog(idx, args.Entries[i:]); err != nil {
+			return AppendEntriesReply{}, err
+		}
+		break
+	}
+	if c := min(args.LeaderCommit, args.PrevLogIndex+uint64(len(args.Entries))); c > n.commitIndex {
+		n.commitIndex = c
+		n.applyCond.Broadcast()
+	}
+	reply.Success = true
+	return reply, nil
+}
+
+func (n *Node) lastIndex() uint64 { return uint64(len(n.log) - 1) }
+
+func (n *Node) majority() int { return (len(n.peers)+1)/2 + 1 }
+
+func (n *Node) resetDeadline() {
+	n.deadline = time.Now().Add(n.election + rand.N(n.election))
+}
+
+// halt stops the node with cause; mu must be held
+func (n *Node) halt(cause error) error {
+	n.cancel(cause)
+	n.applyCond.Broadcast()
+	return cause
+}
+
+func (n *Node) setTermVote(term uint64, vote string) error {
+	if term == n.term && vote == n.votedFor {
+		return nil
+	}
+	if err := writeState(n.dir, term, vote); err != nil {
+		return n.halt(err)
+	}
+	n.term, n.votedFor = term, vote
+	return nil
+}
+
+// appendLog durably replaces the log from index start onwards with entries
+func (n *Node) appendLog(start uint64, entries []Entry) error {
+	if err := n.wal.Append(encodeBatch(start, entries)); err != nil {
+		return n.halt(fmt.Errorf("append raft log: %w", err))
+	}
+	for i, done := range n.waiters {
+		if i >= start {
+			done <- ErrProposalDropped
+			delete(n.waiters, i)
+		}
+	}
+	n.log = append(n.log[:start], entries...)
+	return nil
+}
+
+func (n *Node) becomeFollower(term uint64) error {
+	if n.role == Leader {
+		n.resetDeadline()
+	}
+	n.role = Follower
+	if term > n.term {
+		n.leader = ""
+		return n.setTermVote(term, "")
+	}
+	return nil
+}
+
+func (n *Node) runTimer() {
+	t := time.NewTicker(n.election / 10)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-t.C:
+		}
+		n.mu.Lock()
+		if n.ctx.Err() == nil && n.role != Leader && time.Now().After(n.deadline) {
+			n.startElection()
+		}
+		n.mu.Unlock()
+	}
+}
+
+func (n *Node) startElection() {
+	if err := n.setTermVote(n.term+1, n.id); err != nil {
+		return
+	}
+	n.role = Candidate
+	n.leader = ""
+	n.votes = 1
+	n.resetDeadline()
+	if n.votes >= n.majority() {
+		n.becomeLeader()
+		return
+	}
+	last := n.lastIndex()
+	args := RequestVoteArgs{Term: n.term, Candidate: n.id, LastLogIndex: last, LastLogTerm: n.log[last].Term}
+	for _, p := range n.peers {
+		n.wg.Go(func() { n.requestVote(p, args) })
+	}
+}
+
+func (n *Node) requestVote(peer string, args RequestVoteArgs) {
+	ctx, cancel := context.WithTimeout(n.ctx, n.election)
+	defer cancel()
+	reply, err := n.tr.RequestVote(ctx, peer, args)
+	if err != nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.ctx.Err() != nil {
+		return
+	}
+	if reply.Term > n.term {
+		n.becomeFollower(reply.Term)
+		return
+	}
+	if n.role != Candidate || n.term != args.Term || !reply.Granted {
+		return
+	}
+	n.votes++
+	if n.votes >= n.majority() {
+		n.becomeLeader()
+	}
+}
+
+func (n *Node) becomeLeader() {
+	n.role = Leader
+	n.leader = n.id
+	n.nextIndex = map[string]uint64{}
+	n.matchIndex = map[string]uint64{}
+	for _, p := range n.peers {
+		n.nextIndex[p] = n.lastIndex() + 1
+	}
+	if err := n.appendLog(n.lastIndex()+1, []Entry{{Term: n.term}}); err != nil {
+		return
+	}
+	n.advanceCommit()
+	n.wakeAll()
+}
+
+func (n *Node) wakeAll() {
+	for _, p := range n.peers {
+		n.wakeup(p)
+	}
+}
+
+func (n *Node) wakeup(peer string) {
+	select {
+	case n.wake[peer] <- struct{}{}:
+	default:
+	}
+}
+
+// advanceCommit commits by counting replicas only for entries of the current term (figure 8)
+func (n *Node) advanceCommit() {
+	for i := n.lastIndex(); i > n.commitIndex && n.log[i].Term == n.term; i-- {
+		count := 1
+		for _, p := range n.peers {
+			if n.matchIndex[p] >= i {
+				count++
+			}
+		}
+		if count >= n.majority() {
+			n.commitIndex = i
+			n.applyCond.Broadcast()
+			return
+		}
+	}
+}
+
+func (n *Node) replicate(peer string, wake chan struct{}) {
+	t := time.NewTicker(n.heartbeat)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-t.C:
+		case <-wake:
+		}
+
+		n.mu.Lock()
+		if n.ctx.Err() != nil || n.role != Leader {
+			n.mu.Unlock()
+			continue
+		}
+		next := n.nextIndex[peer]
+		args := AppendEntriesArgs{
+			Term:         n.term,
+			Leader:       n.id,
+			PrevLogIndex: next - 1,
+			PrevLogTerm:  n.log[next-1].Term,
+			Entries:      slices.Clone(n.log[next:min(n.lastIndex()+1, next+maxBatch)]),
+			LeaderCommit: n.commitIndex,
+		}
+		n.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(n.ctx, n.election)
+		reply, err := n.tr.AppendEntries(ctx, peer, args)
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		n.mu.Lock()
+		n.handleAppendReply(peer, args, reply)
+		n.mu.Unlock()
+	}
+}
+
+func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply AppendEntriesReply) {
+	if n.ctx.Err() != nil {
+		return
+	}
+	if reply.Term > n.term {
+		n.becomeFollower(reply.Term)
+		return
+	}
+	if n.role != Leader || n.term != args.Term {
+		return
+	}
+	if reply.Success {
+		match := args.PrevLogIndex + uint64(len(args.Entries))
+		if match > n.matchIndex[peer] {
+			n.matchIndex[peer] = match
+			n.advanceCommit()
+		}
+		n.nextIndex[peer] = match + 1
+	} else {
+		n.nextIndex[peer] = n.nextAfterConflict(reply)
+	}
+	if n.nextIndex[peer] <= n.lastIndex() {
+		n.wakeup(peer)
+	}
+}
+
+func (n *Node) nextAfterConflict(r AppendEntriesReply) uint64 {
+	if r.ConflictTerm != 0 {
+		for i := n.lastIndex(); i > 0 && n.log[i].Term >= r.ConflictTerm; i-- {
+			if n.log[i].Term == r.ConflictTerm {
+				return i + 1
+			}
+		}
+	}
+	return max(1, min(r.ConflictIndex, n.lastIndex()+1))
+}
+
+func (n *Node) runApplier() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for {
+		for n.ctx.Err() == nil && n.lastApplied >= n.commitIndex {
+			n.applyCond.Wait()
+		}
+		if n.ctx.Err() != nil {
+			return
+		}
+		start := n.lastApplied + 1
+		entries := slices.Clone(n.log[start : n.commitIndex+1])
+		n.mu.Unlock()
+		for i, e := range entries {
+			if len(e.Cmd) > 0 {
+				n.apply(start+uint64(i), e.Cmd)
+			}
+		}
+		n.mu.Lock()
+		n.lastApplied = start + uint64(len(entries)) - 1
+		for i, done := range n.waiters {
+			if i <= n.lastApplied {
+				done <- nil
+				delete(n.waiters, i)
+			}
+		}
+	}
+}
