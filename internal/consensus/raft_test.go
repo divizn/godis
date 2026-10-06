@@ -160,6 +160,55 @@ func TestSameTermVoteRequestKeepsLeader(t *testing.T) {
 	})
 }
 
+// heldVotes grants term 1 votes only once released, and refuses every later term
+type heldVotes struct{ release chan struct{} }
+
+func (h heldVotes) RequestVote(ctx context.Context, _ string, args RequestVoteArgs) (RequestVoteReply, error) {
+	if args.Term != 1 {
+		return RequestVoteReply{Term: args.Term}, nil
+	}
+	select {
+	case <-h.release:
+		return RequestVoteReply{Term: 1, Granted: true}, nil
+	case <-ctx.Done():
+		return RequestVoteReply{}, ctx.Err()
+	}
+}
+
+func (heldVotes) AppendEntries(context.Context, string, AppendEntriesArgs) (AppendEntriesReply, error) {
+	return AppendEntriesReply{}, errUnreachable
+}
+
+func TestVotesFromAnEarlierElectionAreNotCounted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := heldVotes{release: make(chan struct{})}
+		n, err := New(Config{
+			ID:                "a",
+			Peers:             []string{"a", "b", "c"},
+			Dir:               t.TempDir(),
+			Transport:         tr,
+			Apply:             func(uint64, []byte) {},
+			ElectionTimeout:   time.Hour,
+			HeartbeatInterval: time.Minute,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Stop()
+		for range 2 {
+			n.mu.Lock()
+			n.startElection()
+			n.mu.Unlock()
+			synctest.Wait()
+		}
+		close(tr.release)
+		synctest.Wait()
+		if s := n.Status(); s.Role == Leader {
+			t.Fatalf("became leader of term %d on votes granted in term 1", s.Term)
+		}
+	})
+}
+
 func TestReelectionAfterLeaderStops(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := newCluster(t, 3)

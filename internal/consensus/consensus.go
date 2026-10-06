@@ -595,7 +595,7 @@ func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply Appe
 	} else {
 		n.nextIndex[peer] = n.nextAfterConflict(reply)
 	}
-	if n.nextIndex[peer] <= n.lastIndex() {
+	if n.nextIndex[peer] <= n.lastIndex() && (reply.Success || n.nextIndex[peer] <= args.PrevLogIndex) {
 		n.wakeup(peer)
 	}
 }
