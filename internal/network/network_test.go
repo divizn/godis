@@ -201,15 +201,16 @@ func TestPipelinedRequestsAnsweredInOrder(t *testing.T) {
 	}
 	defer conn.Close()
 
-	const n = 100
+	const n = 50
 	var out bytes.Buffer
 	for i := range n {
-		if err := writeFrame(&out, appendRequest(nil, opSet, "k", fmt.Appendf(nil, "%d", i))); err != nil {
+		set := appendRequest(nil, opSet, "k", fmt.Appendf(nil, "%d", i))
+		if err := writeFrame(&out, set); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := writeFrame(&out, appendRequest(nil, opGet, "k", nil)); err != nil {
-		t.Fatal(err)
+		if err := writeFrame(&out, appendRequest(nil, opGet, "k", nil)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	go func() {
 		if _, err := conn.Write(out.Bytes()); err != nil {
@@ -218,16 +219,15 @@ func TestPipelinedRequestsAnsweredInOrder(t *testing.T) {
 	}()
 
 	r := bufio.NewReader(conn)
-	for i := range n + 1 {
-		resp, err := readFrame(r)
-		if err != nil {
-			t.Fatalf("response %d: %v", i, err)
-		}
-		if resp[0] != statusOK {
-			t.Fatalf("response %d: status %d", i, resp[0])
-		}
-		if i == n && string(resp[1:]) != fmt.Sprint(n-1) {
-			t.Fatalf("pipelined get: got %q, want %d", resp[1:], n-1)
+	for i := range n {
+		for _, want := range []string{"", fmt.Sprint(i)} {
+			resp, err := readFrame(r)
+			if err != nil {
+				t.Fatalf("request %d: %v", i, err)
+			}
+			if resp[0] != statusOK || string(resp[1:]) != want {
+				t.Fatalf("request %d: got status %d body %q, want OK %q", i, resp[0], resp[1:], want)
+			}
 		}
 	}
 }
@@ -385,8 +385,8 @@ func TestShutdownWaitsForInFlightRequest(t *testing.T) {
 	}
 	select {
 	case err := <-setDone:
-		if err == nil {
-			t.Error("set reported success although shutdown closed its connection before the response")
+		if err != nil {
+			t.Errorf("in-flight set during shutdown: %v, want OK", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("client set hung after shutdown")

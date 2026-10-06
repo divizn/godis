@@ -23,11 +23,11 @@ func NewServer(store Store) *Server {
 	return &Server{store: store}
 }
 
-// Serve runs until ctx is done (returning nil) or Accept fails, then closes every connection and waits for handlers, so the store is idle once it returns.
+// Serve runs until ctx is done (returning nil) or Accept fails, then closes idle connections, lets in-flight requests answer, and waits for handlers, so the store is idle once it returns.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	var (
 		mu     sync.Mutex
-		conns  = map[net.Conn]struct{}{}
+		busy   = map[net.Conn]bool{}
 		closed bool
 		wg     sync.WaitGroup
 	)
@@ -36,9 +36,22 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		mu.Lock()
 		defer mu.Unlock()
 		closed = true
-		for c := range conns {
-			c.Close()
+		// ponytail: busy conns are left open, so a peer that stops reading its response stalls shutdown; add a write deadline here if it bites
+		for c, b := range busy {
+			if !b {
+				c.Close()
+			}
 		}
+	}
+	// setBusy reports false once shutdown has begun, telling the handler to stop
+	setBusy := func(c net.Conn, b bool) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if closed {
+			return false
+		}
+		busy[c] = b
+		return true
 	}
 	stop := context.AfterFunc(ctx, shutdown)
 	defer func() {
@@ -62,15 +75,15 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			conn.Close()
 			continue
 		}
-		conns[conn] = struct{}{}
+		busy[conn] = false
 		wg.Add(1)
 		mu.Unlock()
 
 		go func() {
 			defer wg.Done()
-			s.handle(conn)
+			s.handle(conn, setBusy)
 			mu.Lock()
-			delete(conns, conn)
+			delete(busy, conn)
 			mu.Unlock()
 			conn.Close()
 		}()
@@ -78,21 +91,15 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 }
 
 // ponytail: no read deadlines, an idle or slow peer holds a goroutine and at most one frame of buffer until shutdown
-func (s *Server) handle(conn net.Conn) {
+func (s *Server) handle(conn net.Conn, setBusy func(net.Conn, bool) bool) {
 	r := bufio.NewReader(conn)
-	w := bufio.NewWriter(conn)
 	for {
 		req, err := readFrame(r)
-		if err != nil {
+		if err != nil || !setBusy(conn, true) {
 			return
 		}
-		if err := writeFrame(w, s.exec(req)); err != nil {
+		if err := writeFrame(conn, s.exec(req)); err != nil || !setBusy(conn, false) {
 			return
-		}
-		if r.Buffered() == 0 {
-			if err := w.Flush(); err != nil {
-				return
-			}
 		}
 	}
 }
