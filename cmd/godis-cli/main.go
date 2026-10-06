@@ -112,8 +112,7 @@ func run(c *network.Client, args []string) (string, error) {
 
 var errBadQuote = errors.New("invalid quoted argument")
 
-// splitArgs splits line on whitespace; an argument starting with a double
-// quote is a Go quoted string.
+// splitArgs splits line on whitespace; an argument starting with " is a Go quoted string.
 func splitArgs(line string) ([]string, error) {
 	var args []string
 	for {

@@ -29,8 +29,7 @@ const (
 
 var errFrameTooLarge = errors.New("frame too large")
 
-// readFrame grows its buffer as bytes arrive, so a peer cannot make it
-// allocate a length it never sends.
+// readFrame grows its buffer as bytes arrive, never allocating a length the peer has not sent.
 func readFrame(r io.Reader) ([]byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {

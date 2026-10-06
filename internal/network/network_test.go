@@ -211,7 +211,11 @@ func TestPipelinedRequestsAnsweredInOrder(t *testing.T) {
 	if err := writeFrame(&out, appendRequest(nil, opGet, "k", nil)); err != nil {
 		t.Fatal(err)
 	}
-	go conn.Write(out.Bytes())
+	go func() {
+		if _, err := conn.Write(out.Bytes()); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	r := bufio.NewReader(conn)
 	for i := range n + 1 {
@@ -316,7 +320,9 @@ func TestMalformedRequests(t *testing.T) {
 	if _, err := conn.Write(hdr[:]); err != nil {
 		t.Fatal(err)
 	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := r.ReadByte(); !errors.Is(err, io.EOF) {
 		t.Fatalf("after oversize frame: got %v, want connection closed", err)
 	}
@@ -360,7 +366,8 @@ func TestShutdownWaitsForInFlightRequest(t *testing.T) {
 	store := &blockingStore{entered: make(chan struct{}), release: make(chan struct{})}
 	addr, stop := serve(t, store)
 	c := dial(t, addr)
-	go c.Set("k", []byte("v"))
+	setDone := make(chan error, 1)
+	go func() { setDone <- c.Set("k", []byte("v")) }()
 	<-store.entered
 
 	done := make(chan struct{})
@@ -375,6 +382,14 @@ func TestShutdownWaitsForInFlightRequest(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("serve did not return after the set finished")
+	}
+	select {
+	case err := <-setDone:
+		if err == nil {
+			t.Error("set reported success although shutdown closed its connection before the response")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client set hung after shutdown")
 	}
 }
 

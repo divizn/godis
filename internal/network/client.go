@@ -7,9 +7,7 @@ import (
 	"net"
 )
 
-// Client is one connection to a server. It is not safe for concurrent use.
-// An error sent by the server leaves the connection usable; any other error
-// means it is broken and the Client should be closed.
+// Client is one connection, not safe for concurrent use; any error not sent by the server means it is broken.
 type Client struct {
 	conn net.Conn
 	r    *bufio.Reader

@@ -23,10 +23,7 @@ func NewServer(store Store) *Server {
 	return &Server{store: store}
 }
 
-// Serve handles connections on ln until ctx is done or Accept fails. Before
-// returning it closes ln and every open connection and waits for in-flight
-// requests to finish, so the store is no longer in use. It returns nil when
-// ctx ended it.
+// Serve runs until ctx is done (returning nil) or Accept fails, then closes every connection and waits for handlers, so the store is idle once it returns.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	var (
 		mu     sync.Mutex
