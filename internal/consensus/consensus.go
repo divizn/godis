@@ -216,6 +216,7 @@ func New(cfg Config) (*Node, error) {
 	return n, nil
 }
 
+// ponytail: no snapshots, so the log file, memory and restart replay grow with all history; add compaction when that hurts
 func (n *Node) replay(rec []byte) error {
 	start, entries, err := decodeBatch(rec)
 	if err != nil {
