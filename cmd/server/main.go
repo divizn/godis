@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/divizn/godis/internal/network"
 	"github.com/divizn/godis/internal/storage"
 )
 
@@ -39,9 +40,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
+	if err := network.NewServer(db).Serve(ctx, ln); err != nil {
+		slog.Error("serve", "err", err)
+	}
 
-	ln.Close()
 	if err := db.Close(); err != nil {
 		slog.Error("close storage", "err", err)
 	}
