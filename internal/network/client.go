@@ -18,7 +18,7 @@ type Client struct {
 func Dial(addr string) (*Client, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
+		return nil, fmt.Errorf("connect to godis: %w", err)
 	}
 	return &Client{conn: conn, r: bufio.NewReader(conn)}, nil
 }

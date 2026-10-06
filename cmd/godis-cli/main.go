@@ -22,7 +22,7 @@ func main() {
 
 	c, err := network.Dial(*addr)
 	if err != nil {
-		log.Fatalf("connect: %v", err)
+		log.Fatal(err)
 	}
 	defer c.Close()
 
