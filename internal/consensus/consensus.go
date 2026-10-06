@@ -1,11 +1,11 @@
-// Package consensus replicates a log of commands across a static cluster
-// using Raft (Ongaro and Ousterhout, extended paper, figure 2).
+// Package consensus replicates a command log across a static cluster with Raft (extended paper, figure 2).
 package consensus
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -24,8 +24,7 @@ var (
 	ErrEmptyCommand    = errors.New("consensus: empty command")
 )
 
-// NotLeaderError is returned by Propose on a node that is not the leader.
-// Leader is empty when this node does not know the current leader.
+// NotLeaderError carries the current leader's id, empty if unknown.
 type NotLeaderError struct {
 	Leader string
 }
@@ -84,8 +83,7 @@ type AppendEntriesArgs struct {
 	LeaderCommit uint64
 }
 
-// AppendEntriesReply carries ConflictIndex and ConflictTerm on a failed
-// consistency check so the leader can skip back a whole term at a time.
+// AppendEntriesReply carries conflict hints on a failed consistency check so the leader can skip a whole term.
 type AppendEntriesReply struct {
 	Term          uint64
 	Success       bool
@@ -93,8 +91,7 @@ type AppendEntriesReply struct {
 	ConflictTerm  uint64
 }
 
-// Transport sends the two Raft RPCs to a peer, which serves them with
-// HandleRequestVote and HandleAppendEntries.
+// Transport sends Raft RPCs to a peer, served there by HandleRequestVote and HandleAppendEntries.
 type Transport interface {
 	RequestVote(ctx context.Context, to string, args RequestVoteArgs) (RequestVoteReply, error)
 	AppendEntries(ctx context.Context, to string, args AppendEntriesArgs) (AppendEntriesReply, error)
@@ -102,15 +99,13 @@ type Transport interface {
 
 type Config struct {
 	ID string
-	// Peers lists every member of the cluster, including ID.
+	// Peers lists every member, including ID.
 	Peers     []string
 	Dir       string
 	Transport Transport
-	// Apply receives committed commands in log order, exactly once per
-	// process lifetime; after a restart the whole log is applied again.
+	// Apply gets committed commands in order, once per process lifetime (the whole log again after a restart).
 	Apply func(index uint64, cmd []byte)
-	// ElectionTimeout is randomized in [ElectionTimeout, 2*ElectionTimeout).
-	// Defaults to 150ms.
+	// ElectionTimeout is randomized up to twice its value, default 150ms.
 	ElectionTimeout time.Duration
 	// HeartbeatInterval defaults to 50ms and must be below ElectionTimeout.
 	HeartbeatInterval time.Duration
@@ -229,8 +224,7 @@ func (n *Node) replay(rec []byte) error {
 	return nil
 }
 
-// Propose replicates cmd and returns once it is committed and applied on this
-// node. If ctx ends first the command may still commit later.
+// Propose returns once cmd is committed and applied here; if ctx ends first it may still commit later.
 func (n *Node) Propose(ctx context.Context, cmd []byte) error {
 	if len(cmd) == 0 {
 		return ErrEmptyCommand
@@ -277,8 +271,7 @@ func (n *Node) Status() Status {
 	return Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, CommitIndex: n.commitIndex}
 }
 
-// Stop halts the node, waits for its goroutines and closes its log. It
-// returns the persistence error that halted the node, if one did.
+// Stop halts the node and closes its log, returning the persistence error that halted it, if any.
 func (n *Node) Stop() error {
 	n.mu.Lock()
 	n.halt(ErrStopped)
@@ -385,10 +378,12 @@ func (n *Node) resetDeadline() {
 }
 
 // halt stops the node with cause; mu must be held
-func (n *Node) halt(cause error) error {
+func (n *Node) halt(cause error) {
+	if n.ctx.Err() == nil && !errors.Is(cause, ErrStopped) {
+		slog.Error("raft node halted", "node", n.id, "err", cause)
+	}
 	n.cancel(cause)
 	n.applyCond.Broadcast()
-	return cause
 }
 
 func (n *Node) setTermVote(term uint64, vote string) error {
@@ -396,7 +391,8 @@ func (n *Node) setTermVote(term uint64, vote string) error {
 		return nil
 	}
 	if err := writeState(n.dir, term, vote); err != nil {
-		return n.halt(err)
+		n.halt(err)
+		return err
 	}
 	n.term, n.votedFor = term, vote
 	return nil
@@ -405,7 +401,9 @@ func (n *Node) setTermVote(term uint64, vote string) error {
 // appendLog durably replaces the log from index start onwards with entries
 func (n *Node) appendLog(start uint64, entries []Entry) error {
 	if err := n.wal.Append(encodeBatch(start, entries)); err != nil {
-		return n.halt(fmt.Errorf("append raft log: %w", err))
+		err = fmt.Errorf("append raft log: %w", err)
+		n.halt(err)
+		return err
 	}
 	for i, done := range n.waiters {
 		if i >= start {
@@ -478,8 +476,9 @@ func (n *Node) requestVote(peer string, args RequestVoteArgs) {
 		return
 	}
 	if reply.Term > n.term {
-		n.becomeFollower(reply.Term)
-		return
+		if err := n.becomeFollower(reply.Term); err != nil {
+			return
+		}
 	}
 	if n.role != Candidate || n.term != args.Term || !reply.Granted {
 		return
@@ -580,8 +579,9 @@ func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply Appe
 		return
 	}
 	if reply.Term > n.term {
-		n.becomeFollower(reply.Term)
-		return
+		if err := n.becomeFollower(reply.Term); err != nil {
+			return
+		}
 	}
 	if n.role != Leader || n.term != args.Term {
 		return

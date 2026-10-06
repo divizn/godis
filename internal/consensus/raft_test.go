@@ -54,6 +54,13 @@ func singleNode(t *testing.T, dir string) *Node {
 	return n
 }
 
+func mustStop(t *testing.T, n *Node) {
+	t.Helper()
+	if err := n.Stop(); err != nil {
+		t.Errorf("stop: %v", err)
+	}
+}
+
 func vote(t *testing.T, n *Node, term uint64, candidate string) bool {
 	t.Helper()
 	r, err := n.HandleRequestVote(RequestVoteArgs{Term: term, Candidate: candidate})
@@ -66,7 +73,7 @@ func vote(t *testing.T, n *Node, term uint64, candidate string) bool {
 func TestVoteOncePerTerm(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		n := singleNode(t, t.TempDir())
-		defer n.Stop()
+		defer mustStop(t, n)
 		if !vote(t, n, 5, "b") {
 			t.Fatal("first vote in term 5 refused")
 		}
@@ -91,7 +98,7 @@ func TestVoteOncePerTermAcrossRestart(t *testing.T) {
 		}
 
 		n = singleNode(t, dir)
-		defer n.Stop()
+		defer mustStop(t, n)
 		if got := n.Status().Term; got != 5 {
 			t.Fatalf("term after restart: got %d, want 5", got)
 		}
@@ -121,7 +128,7 @@ func entries(term uint64, cmds ...string) []Entry {
 func TestStaleAppendEntriesDoesNotTruncate(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		n := singleNode(t, t.TempDir())
-		defer n.Stop()
+		defer mustStop(t, n)
 		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "x", "y", "z")})
 		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "x")})
 		if r := appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", PrevLogIndex: 3, PrevLogTerm: 1}); !r.Success {
@@ -133,7 +140,7 @@ func TestStaleAppendEntriesDoesNotTruncate(t *testing.T) {
 func TestFollowerCommitsOnlyEntriesTheLeaderVouchedFor(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		n := singleNode(t, t.TempDir())
-		defer n.Stop()
+		defer mustStop(t, n)
 		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "x", "y", "z")})
 		appendEntries(t, n, AppendEntriesArgs{Term: 2, Leader: "c", PrevLogIndex: 1, PrevLogTerm: 1, LeaderCommit: 3})
 		if got := n.Status().CommitIndex; got != 1 {
@@ -194,7 +201,7 @@ func TestVotesFromAnEarlierElectionAreNotCounted(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer n.Stop()
+		defer mustStop(t, n)
 		for range 2 {
 			n.mu.Lock()
 			n.startElection()
