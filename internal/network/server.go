@@ -3,6 +3,7 @@ package network
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -10,7 +11,7 @@ import (
 
 // Store is the key-value store a Server serves.
 type Store interface {
-	Get(key string) ([]byte, bool)
+	Get(key string) ([]byte, bool, error)
 	Set(key string, value []byte) error
 	Delete(key string) error
 }
@@ -111,7 +112,10 @@ func (s *Server) exec(req []byte) []byte {
 	}
 	switch op {
 	case opGet:
-		v, ok := s.store.Get(key)
+		v, ok, err := s.store.Get(key)
+		if err != nil {
+			return errorResponse(err)
+		}
 		if !ok {
 			return []byte{statusNotFound}
 		}
@@ -128,5 +132,9 @@ func (s *Server) exec(req []byte) []byte {
 }
 
 func errorResponse(err error) []byte {
+	var re *RedirectError
+	if errors.As(err, &re) {
+		return append([]byte{statusRedirect}, re.Addr...)
+	}
 	return append([]byte{statusError}, err.Error()...)
 }

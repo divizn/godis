@@ -9,32 +9,52 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/divizn/godis/internal/storage"
 )
 
-func openDB(t testing.TB, dir string) *storage.DB {
-	t.Helper()
-	db, err := storage.Open(filepath.Join(dir, "wal"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	return db
+type memStore struct{ s *storage.Store }
+
+func newMemStore() memStore { return memStore{storage.New()} }
+
+func (m memStore) Get(key string) ([]byte, bool, error) {
+	v, ok := m.s.Get(key)
+	return v, ok, nil
 }
 
-// serve runs a server on 127.0.0.1:0; stop cancels it and waits for Serve
-func serve(t testing.TB, store Store) (string, func()) {
+func (m memStore) Set(key string, value []byte) error {
+	m.s.Set(key, value)
+	return nil
+}
+
+func (m memStore) Delete(key string) error {
+	m.s.Delete(key)
+	return nil
+}
+
+func listen(t testing.TB) net.Listener {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	return ln
+}
+
+// serve runs a server on 127.0.0.1:0; stop cancels it and waits for Serve
+func serve(t testing.TB, store Store) (string, func()) {
+	t.Helper()
+	return serveOn(t, listen(t), store)
+}
+
+func serveOn(t testing.TB, ln net.Listener, store Store) (string, func()) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- NewServer(store).Serve(ctx, ln) }()
@@ -71,9 +91,7 @@ func mustGet(t *testing.T, c *Client, key string) ([]byte, bool) {
 }
 
 func TestRoundTripValues(t *testing.T) {
-	db := openDB(t, t.TempDir())
-	defer db.Close()
-	addr, _ := serve(t, db)
+	addr, _ := serve(t, newMemStore())
 	c := dial(t, addr)
 
 	large := bytes.Repeat([]byte("0123456789abcdef"), 1<<16)
@@ -146,10 +164,8 @@ func TestWriteFrameRefusesOversize(t *testing.T) {
 	}
 }
 
-func TestEndToEndAndRestart(t *testing.T) {
-	dir := t.TempDir()
-	db := openDB(t, dir)
-	addr, stop := serve(t, db)
+func TestEndToEnd(t *testing.T) {
+	addr, _ := serve(t, newMemStore())
 	c := dial(t, addr)
 
 	if err := c.Ping(); err != nil {
@@ -172,29 +188,10 @@ func TestEndToEndAndRestart(t *testing.T) {
 	if v, ok := mustGet(t, c, "never"); ok {
 		t.Fatalf("get missing key: got %q", v)
 	}
-
-	c.Close()
-	stop()
-	if err := db.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
-	}
-
-	db = openDB(t, dir)
-	defer db.Close()
-	addr, _ = serve(t, db)
-	c = dial(t, addr)
-	if v, ok := mustGet(t, c, "a"); !ok || string(v) != "3" {
-		t.Fatalf("get a after restart: got %q, %v; want 3", v, ok)
-	}
-	if _, ok := mustGet(t, c, "b"); ok {
-		t.Fatal("deleted b came back after restart")
-	}
 }
 
 func TestPipelinedRequestsAnsweredInOrder(t *testing.T) {
-	db := openDB(t, t.TempDir())
-	defer db.Close()
-	addr, _ := serve(t, db)
+	addr, _ := serve(t, newMemStore())
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -233,9 +230,7 @@ func TestPipelinedRequestsAnsweredInOrder(t *testing.T) {
 }
 
 func TestConcurrentClients(t *testing.T) {
-	db := openDB(t, t.TempDir())
-	defer db.Close()
-	addr, _ := serve(t, db)
+	addr, _ := serve(t, newMemStore())
 
 	const clients, ops = 16, 30
 	var wg sync.WaitGroup
@@ -271,9 +266,7 @@ func TestConcurrentClients(t *testing.T) {
 }
 
 func TestMalformedRequests(t *testing.T) {
-	db := openDB(t, t.TempDir())
-	defer db.Close()
-	addr, _ := serve(t, db)
+	addr, _ := serve(t, newMemStore())
 	good := dial(t, addr)
 
 	conn, err := net.Dial("tcp", addr)
@@ -332,9 +325,7 @@ func TestMalformedRequests(t *testing.T) {
 }
 
 func TestShutdownClosesIdleConnections(t *testing.T) {
-	db := openDB(t, t.TempDir())
-	defer db.Close()
-	addr, stop := serve(t, db)
+	addr, stop := serve(t, newMemStore())
 	for range 5 {
 		if err := dial(t, addr).Ping(); err != nil {
 			t.Fatal(err)
@@ -354,8 +345,8 @@ type blockingStore struct {
 	entered, release chan struct{}
 }
 
-func (s *blockingStore) Get(string) ([]byte, bool) { return nil, false }
-func (s *blockingStore) Delete(string) error       { return nil }
+func (s *blockingStore) Get(string) ([]byte, bool, error) { return nil, false, nil }
+func (s *blockingStore) Delete(string) error              { return nil }
 func (s *blockingStore) Set(string, []byte) error {
 	close(s.entered)
 	<-s.release
@@ -395,9 +386,9 @@ func TestShutdownWaitsForInFlightRequest(t *testing.T) {
 
 type failingStore struct{}
 
-func (failingStore) Get(string) ([]byte, bool) { return nil, false }
-func (failingStore) Delete(string) error       { return nil }
-func (failingStore) Set(string, []byte) error  { return errors.New("disk on fire") }
+func (failingStore) Get(string) ([]byte, bool, error) { return nil, false, nil }
+func (failingStore) Delete(string) error              { return nil }
+func (failingStore) Set(string, []byte) error         { return errors.New("disk on fire") }
 
 func TestStoreErrorReachesClient(t *testing.T) {
 	addr, _ := serve(t, failingStore{})
@@ -411,10 +402,96 @@ func TestStoreErrorReachesClient(t *testing.T) {
 	}
 }
 
+// redirectStore redirects every request to addr, the first unknown requests with an unknown leader
+type redirectStore struct {
+	addr    string
+	unknown int64
+	calls   atomic.Int64
+	next    Store
+}
+
+func (r *redirectStore) redirect() error {
+	n := r.calls.Add(1)
+	if n <= r.unknown {
+		return &RedirectError{}
+	}
+	if r.next != nil {
+		return nil
+	}
+	return &RedirectError{Addr: r.addr}
+}
+
+func (r *redirectStore) Get(key string) ([]byte, bool, error) {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return nil, false, err
+	}
+	return r.next.Get(key)
+}
+
+func (r *redirectStore) Set(key string, value []byte) error {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return err
+	}
+	return r.next.Set(key, value)
+}
+
+func (r *redirectStore) Delete(key string) error {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return err
+	}
+	return r.next.Delete(key)
+}
+
+func TestClientFollowsRedirect(t *testing.T) {
+	leader, _ := serve(t, newMemStore())
+	follower := &redirectStore{addr: leader}
+	addr, _ := serve(t, follower)
+	c := dial(t, addr)
+
+	if err := c.Set("k", []byte("v")); err != nil {
+		t.Fatalf("set via follower: %v", err)
+	}
+	if v, ok := mustGet(t, c, "k"); !ok || string(v) != "v" {
+		t.Fatalf("get after redirected set: got %q, %v", v, ok)
+	}
+	if err := c.Del("k"); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	if _, ok := mustGet(t, c, "k"); ok {
+		t.Fatal("key still present after redirected del")
+	}
+	if n := follower.calls.Load(); n != 1 {
+		t.Fatalf("follower served %d requests, want 1: the client should stay on the leader", n)
+	}
+}
+
+func TestRedirectLoopIsBounded(t *testing.T) {
+	lnA, lnB := listen(t), listen(t)
+	serveOn(t, lnA, &redirectStore{addr: lnB.Addr().String()})
+	serveOn(t, lnB, &redirectStore{addr: lnA.Addr().String()})
+	c := dial(t, lnA.Addr().String())
+
+	var re *RedirectError
+	if err := c.Set("k", []byte("v")); !errors.As(err, &re) {
+		t.Fatalf("set in a redirect loop: got %v, want a *RedirectError", err)
+	}
+}
+
+func TestUnknownLeaderIsRetried(t *testing.T) {
+	store := &redirectStore{unknown: 2, next: newMemStore()}
+	addr, _ := serve(t, store)
+	c := dial(t, addr)
+
+	if err := c.Set("k", []byte("v")); err != nil {
+		t.Fatalf("set while the leader is briefly unknown: %v", err)
+	}
+	if n := store.calls.Load(); n != 3 {
+		t.Fatalf("store saw %d attempts, want 3", n)
+	}
+}
+
 func BenchmarkGet(b *testing.B) {
-	db := openDB(b, b.TempDir())
-	defer db.Close()
-	addr, _ := serve(b, db)
+	addr, _ := serve(b, newMemStore())
 	c := dial(b, addr)
 	if err := c.Set("k", bytes.Repeat([]byte("v"), 128)); err != nil {
 		b.Fatal(err)
@@ -427,9 +504,7 @@ func BenchmarkGet(b *testing.B) {
 }
 
 func BenchmarkSet(b *testing.B) {
-	db := openDB(b, b.TempDir())
-	defer db.Close()
-	addr, _ := serve(b, db)
+	addr, _ := serve(b, newMemStore())
 	c := dial(b, addr)
 	v := bytes.Repeat([]byte("v"), 128)
 	for b.Loop() {

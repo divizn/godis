@@ -25,9 +25,22 @@ const (
 	statusOK byte = iota
 	statusNotFound
 	statusError
+	statusRedirect
 )
 
 var errFrameTooLarge = errors.New("frame too large")
+
+// RedirectError reports that a node is not the leader. Addr is the leader's client address, empty if unknown.
+type RedirectError struct {
+	Addr string
+}
+
+func (e *RedirectError) Error() string {
+	if e.Addr == "" {
+		return "not the leader, leader unknown"
+	}
+	return "not the leader, leader is at " + e.Addr
+}
 
 // readFrame grows its buffer as bytes arrive, never allocating a length the peer has not sent.
 func readFrame(r io.Reader) ([]byte, error) {

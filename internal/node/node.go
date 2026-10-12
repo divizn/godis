@@ -1,0 +1,191 @@
+// Package node assembles a godis server: a Raft node, the key-value state machine it feeds, and its peer and client servers.
+package node
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/rpc"
+	"sync"
+	"time"
+
+	"github.com/divizn/godis/internal/consensus"
+	"github.com/divizn/godis/internal/network"
+	"github.com/divizn/godis/internal/storage"
+)
+
+const requestTimeout = 5 * time.Second
+
+type Peer struct {
+	ID         string
+	RaftAddr   string
+	ClientAddr string
+}
+
+type Config struct {
+	ID string
+	// Peers lists every member, including ID.
+	Peers []Peer
+	// Dir holds the Raft state and log.
+	Dir            string
+	ClientListener net.Listener
+	RaftListener   net.Listener
+}
+
+type Node struct {
+	raft  *consensus.Node
+	store *storage.Store
+	tr    *transport
+
+	cancel     context.CancelFunc
+	clientDone chan error
+
+	raftLn   net.Listener
+	raftDone chan error
+	mu       sync.Mutex
+	conns    map[net.Conn]struct{}
+	connWG   sync.WaitGroup
+}
+
+// Start runs the node until Stop. It takes ownership of both listeners, closing them if it fails.
+func Start(cfg Config) (*Node, error) {
+	n, err := start(cfg)
+	if err != nil {
+		cfg.ClientListener.Close()
+		cfg.RaftListener.Close()
+		return nil, err
+	}
+	return n, nil
+}
+
+func start(cfg Config) (*Node, error) {
+	ids := make([]string, 0, len(cfg.Peers))
+	raftAddrs := map[string]string{}
+	clientAddrs := map[string]string{}
+	for _, p := range cfg.Peers {
+		ids = append(ids, p.ID)
+		raftAddrs[p.ID] = p.RaftAddr
+		clientAddrs[p.ID] = p.ClientAddr
+	}
+
+	store := storage.New()
+	tr := &transport{addrs: raftAddrs, clients: map[string]*rpc.Client{}}
+	raft, err := consensus.New(consensus.Config{
+		ID:        cfg.ID,
+		Peers:     ids,
+		Dir:       cfg.Dir,
+		Transport: tr,
+		Apply: func(index uint64, cmd []byte) {
+			if err := store.Apply(cmd); err != nil {
+				panic(fmt.Sprintf("apply committed command %d: %v", index, err))
+			}
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("start raft: %w", err)
+	}
+	srv := rpc.NewServer()
+	if err := srv.RegisterName("Raft", raftService{raft}); err != nil {
+		return nil, errors.Join(fmt.Errorf("register raft rpc: %w", err), raft.Stop())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	n := &Node{
+		raft:       raft,
+		store:      store,
+		tr:         tr,
+		cancel:     cancel,
+		clientDone: make(chan error, 1),
+		raftLn:     cfg.RaftListener,
+		raftDone:   make(chan error, 1),
+		conns:      map[net.Conn]struct{}{},
+	}
+	go func() { n.raftDone <- n.serveRaft(srv) }()
+	kv := kvStore{raft: raft, store: store, clientAddrs: clientAddrs}
+	go func() { n.clientDone <- network.NewServer(kv).Serve(ctx, cfg.ClientListener) }()
+	return n, nil
+}
+
+func (n *Node) Status() consensus.Status {
+	return n.raft.Status()
+}
+
+// Stop lets in-flight client requests finish, then stops Raft and closes every connection.
+func (n *Node) Stop() error {
+	n.cancel()
+	errs := []error{<-n.clientDone, n.raft.Stop()}
+
+	n.raftLn.Close()
+	if err := <-n.raftDone; !errors.Is(err, net.ErrClosed) {
+		errs = append(errs, fmt.Errorf("raft accept: %w", err))
+	}
+	n.mu.Lock()
+	for c := range n.conns {
+		c.Close()
+	}
+	n.mu.Unlock()
+	n.connWG.Wait()
+	n.tr.close()
+	return errors.Join(errs...)
+}
+
+func (n *Node) serveRaft(srv *rpc.Server) error {
+	for {
+		conn, err := n.raftLn.Accept()
+		if err != nil {
+			return err
+		}
+		n.mu.Lock()
+		n.conns[conn] = struct{}{}
+		n.mu.Unlock()
+		n.connWG.Go(func() {
+			srv.ServeConn(conn)
+			n.mu.Lock()
+			delete(n.conns, conn)
+			n.mu.Unlock()
+		})
+	}
+}
+
+// kvStore serves the client protocol: writes through the Raft log, reads after a ReadIndex, both on the leader only
+type kvStore struct {
+	raft        *consensus.Node
+	store       *storage.Store
+	clientAddrs map[string]string
+}
+
+func (s kvStore) Get(key string) ([]byte, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	if err := s.raft.ReadIndex(ctx); err != nil {
+		return nil, false, s.redirect(fmt.Errorf("read index: %w", err))
+	}
+	v, ok := s.store.Get(key)
+	return v, ok, nil
+}
+
+func (s kvStore) Set(key string, value []byte) error {
+	return s.propose(storage.EncodeSet(key, value))
+}
+
+func (s kvStore) Delete(key string) error {
+	return s.propose(storage.EncodeDelete(key))
+}
+
+func (s kvStore) propose(cmd []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	if err := s.raft.Propose(ctx, cmd); err != nil {
+		return s.redirect(fmt.Errorf("propose: %w", err))
+	}
+	return nil
+}
+
+func (s kvStore) redirect(err error) error {
+	var nle *consensus.NotLeaderError
+	if errors.As(err, &nle) {
+		return &network.RedirectError{Addr: s.clientAddrs[nle.Leader]}
+	}
+	return err
+}

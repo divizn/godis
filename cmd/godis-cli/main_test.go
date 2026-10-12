@@ -1,15 +1,13 @@
 package main
 
 import (
-	"context"
 	"net"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/divizn/godis/internal/network"
-	"github.com/divizn/godis/internal/storage"
+	"github.com/divizn/godis/internal/node"
 )
 
 func TestSplitArgs(t *testing.T) {
@@ -35,21 +33,31 @@ func TestSplitArgs(t *testing.T) {
 }
 
 func TestScriptedSession(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "wal"))
+	var lns [2]net.Listener
+	for i := range lns {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lns[i] = ln
+	}
+	n, err := node.Start(node.Config{
+		ID:             "solo",
+		Peers:          []node.Peer{{ID: "solo", RaftAddr: lns[1].Addr().String(), ClientAddr: lns[0].Addr().String()}},
+		Dir:            t.TempDir(),
+		ClientListener: lns[0],
+		RaftListener:   lns[1],
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error)
-	go func() { done <- network.NewServer(db).Serve(ctx, ln) }()
-	defer func() { cancel(); <-done }()
+	defer func() {
+		if err := n.Stop(); err != nil {
+			t.Error(err)
+		}
+	}()
 
-	c, err := network.Dial(ln.Addr().String())
+	c, err := network.Dial(lns[0].Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
