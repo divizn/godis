@@ -16,7 +16,7 @@ const (
 )
 
 // Client is one connection, not safe for concurrent use; any error not sent by the server means it is broken.
-// It follows up to 10 redirects per request to the leader and stays connected there, waiting up to 5s for a leader to be elected.
+// It follows up to 10 redirects per request to the leader and stays connected there, waiting up to 5s for a reachable leader to be elected.
 type Client struct {
 	conn net.Conn
 	r    *bufio.Reader
@@ -57,25 +57,27 @@ func (c *Client) Close() error {
 // do retries on a redirect, which is safe because a node that redirects has not run the request
 func (c *Client) do(op byte, key string, value []byte) ([]byte, bool, error) {
 	var re *RedirectError
+	var dialErr error
 	deadline := time.Now().Add(unknownLeaderTimeout)
 	for redirects := 0; ; {
 		body, ok, err := c.roundTrip(op, key, value)
 		if !errors.As(err, &re) {
 			return body, ok, err
 		}
-		if re.Addr == "" {
-			if time.Now().After(deadline) {
-				return nil, false, fmt.Errorf("no leader after %v: %w", unknownLeaderTimeout, re)
+		if re.Addr != "" {
+			if redirects == maxRedirects {
+				return nil, false, fmt.Errorf("gave up after %d redirects: %w", maxRedirects, re)
 			}
-			time.Sleep(unknownLeaderWait)
-			continue
+			if dialErr = c.redial(re.Addr); dialErr == nil {
+				redirects++
+				continue
+			}
 		}
-		if redirects++; redirects > maxRedirects {
-			return nil, false, fmt.Errorf("gave up after %d redirects: %w", maxRedirects, re)
+		// the leader is unknown, or a dead one is still named until followers time out: ask again shortly
+		if time.Now().After(deadline) {
+			return nil, false, fmt.Errorf("no reachable leader after %v: %w", unknownLeaderTimeout, errors.Join(re, dialErr))
 		}
-		if err := c.redial(re.Addr); err != nil {
-			return nil, false, err
-		}
+		time.Sleep(unknownLeaderWait)
 	}
 }
 

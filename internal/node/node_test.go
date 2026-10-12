@@ -191,7 +191,9 @@ func TestFailoverAndCatchUp(t *testing.T) {
 
 	c.stop(old)
 	survivor := c.other(old)
-	waitFor(t, "a write after failover", func() error { return c.via(survivor, set("b", "2")) })
+	if err := c.via(survivor, set("b", "2")); err != nil {
+		t.Fatalf("set right after the leader stopped: %v", err)
+	}
 	if err := c.via(survivor, del("gone")); err != nil {
 		t.Fatalf("del after failover: %v", err)
 	}

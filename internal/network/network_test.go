@@ -403,10 +403,11 @@ func TestStoreErrorReachesClient(t *testing.T) {
 	}
 }
 
-// redirectStore redirects every request to addr, the first unknown requests with an unknown leader
+// redirectStore answers the first unknown requests with an unknown leader, the next stale with a redirect to addr, then serves from next if set, else redirects forever
 type redirectStore struct {
 	addr    string
 	unknown int64
+	stale   int64
 	calls   atomic.Int64
 	next    Store
 }
@@ -416,7 +417,7 @@ func (r *redirectStore) redirect() error {
 	if n <= r.unknown {
 		return &RedirectError{}
 	}
-	if r.next != nil {
+	if r.next != nil && n > r.unknown+r.stale {
 		return nil
 	}
 	return &RedirectError{Addr: r.addr}
@@ -488,6 +489,24 @@ func TestUnknownLeaderIsRetriedThroughAnElection(t *testing.T) {
 	}
 	if n := store.calls.Load(); n != 16 {
 		t.Fatalf("store saw %d attempts, want 16", n)
+	}
+}
+
+func TestRedirectToDeadLeaderIsRetried(t *testing.T) {
+	dead := listen(t)
+	deadAddr := dead.Addr().String()
+	if err := dead.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := &redirectStore{addr: deadAddr, stale: 3, next: newMemStore()}
+	addr, _ := serve(t, store)
+	c := dial(t, addr)
+
+	if err := c.Set("k", []byte("v")); err != nil {
+		t.Fatalf("set while followers still point at a dead leader: %v", err)
+	}
+	if n := store.calls.Load(); n != 4 {
+		t.Fatalf("store saw %d attempts, want 4", n)
 	}
 }
 
