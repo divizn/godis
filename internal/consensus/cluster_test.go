@@ -186,8 +186,15 @@ type cluster struct {
 	nodes map[string]*Node
 	logs  map[string]*applyLog
 	past  map[string][]*applyLog
+	// changes records each node's OnLeaderChange calls across restarts
+	changes map[string][]leaderChange
 
 	attempt int
+}
+
+type leaderChange struct {
+	term   uint64
+	leader string
 }
 
 func newCluster(t *testing.T, size int) *cluster {
@@ -199,6 +206,8 @@ func newCluster(t *testing.T, size int) *cluster {
 		nodes: map[string]*Node{},
 		logs:  map[string]*applyLog{},
 		past:  map[string][]*applyLog{},
+
+		changes: map[string][]leaderChange{},
 	}
 	for i := range size {
 		c.ids = append(c.ids, fmt.Sprintf("n%d", i+1))
@@ -220,6 +229,11 @@ func (c *cluster) start(id string) {
 		Apply:             al.apply,
 		ElectionTimeout:   testElection,
 		HeartbeatInterval: testHeartbeat,
+		OnLeaderChange: func(term uint64, leader string) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.changes[id] = append(c.changes[id], leaderChange{term, leader})
+		},
 	})
 	if err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
@@ -400,4 +414,10 @@ func cmds(entries []applied) []string {
 		out = append(out, e.cmd)
 	}
 	return out
+}
+
+func (c *cluster) leaderChanges(id string) []leaderChange {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.changes[id])
 }

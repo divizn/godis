@@ -117,6 +117,9 @@ type Config struct {
 	ElectionTimeout time.Duration
 	// HeartbeatInterval defaults to 50ms and must be below ElectionTimeout.
 	HeartbeatInterval time.Duration
+	// OnLeaderChange is called with the node's lock held each time the leader it knows changes to a known one,
+	// so at most once per term; it must not block or call into the Node.
+	OnLeaderChange func(term uint64, leader string)
 }
 
 type Status struct {
@@ -128,14 +131,15 @@ type Status struct {
 }
 
 type Node struct {
-	id        string
-	peers     []string
-	dir       string
-	tr        Transport
-	apply     func(uint64, []byte)
-	election  time.Duration
-	heartbeat time.Duration
-	wake      map[string]chan struct{}
+	id             string
+	peers          []string
+	dir            string
+	tr             Transport
+	apply          func(uint64, []byte)
+	onLeaderChange func(uint64, string)
+	election       time.Duration
+	heartbeat      time.Duration
+	wake           map[string]chan struct{}
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -190,19 +194,20 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		id:        cfg.ID,
-		peers:     slices.DeleteFunc(slices.Clone(cfg.Peers), func(p string) bool { return p == cfg.ID }),
-		dir:       cfg.Dir,
-		tr:        cfg.Transport,
-		apply:     cfg.Apply,
-		election:  cfg.ElectionTimeout,
-		heartbeat: cfg.HeartbeatInterval,
-		wake:      map[string]chan struct{}{},
-		term:      term,
-		votedFor:  vote,
-		log:       []Entry{{}},
-		waiters:   map[uint64]chan error{},
-		applied:   make(chan struct{}),
+		id:             cfg.ID,
+		peers:          slices.DeleteFunc(slices.Clone(cfg.Peers), func(p string) bool { return p == cfg.ID }),
+		dir:            cfg.Dir,
+		tr:             cfg.Transport,
+		apply:          cfg.Apply,
+		onLeaderChange: cfg.OnLeaderChange,
+		election:       cfg.ElectionTimeout,
+		heartbeat:      cfg.HeartbeatInterval,
+		wake:           map[string]chan struct{}{},
+		term:           term,
+		votedFor:       vote,
+		log:            []Entry{{}},
+		waiters:        map[uint64]chan error{},
+		applied:        make(chan struct{}),
 	}
 	n.wal, err = wal.Open(filepath.Join(cfg.Dir, "log"), n.replay)
 	if err != nil {
@@ -358,7 +363,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesReply, 
 	if err := n.becomeFollower(args.Term); err != nil {
 		return AppendEntriesReply{}, err
 	}
-	n.leader = args.Leader
+	n.setLeader(args.Leader)
 	n.resetDeadline()
 
 	reply := AppendEntriesReply{Term: n.term}
@@ -441,6 +446,7 @@ func (n *Node) appendLog(start uint64, entries []Entry) error {
 
 func (n *Node) becomeFollower(term uint64) error {
 	if n.role == Leader {
+		slog.Info("stepped down", "node", n.id, "term", n.term)
 		n.resetDeadline()
 	}
 	n.role = Follower
@@ -449,6 +455,22 @@ func (n *Node) becomeFollower(term uint64) error {
 		return n.setTermVote(term, "")
 	}
 	return nil
+}
+
+// setLeader records the leader of the current term, logging and reporting a change; mu must be held
+func (n *Node) setLeader(leader string) {
+	if leader == n.leader {
+		return
+	}
+	n.leader = leader
+	if leader == n.id {
+		slog.Info("became leader", "node", n.id, "term", n.term)
+	} else {
+		slog.Info("following leader", "node", n.id, "term", n.term, "leader", leader)
+	}
+	if n.onLeaderChange != nil {
+		n.onLeaderChange(n.term, leader)
+	}
 }
 
 func (n *Node) runTimer() {
@@ -515,7 +537,7 @@ func (n *Node) requestVote(peer string, args RequestVoteArgs) {
 
 func (n *Node) becomeLeader() {
 	n.role = Leader
-	n.leader = n.id
+	n.setLeader(n.id)
 	n.nextIndex = map[string]uint64{}
 	n.matchIndex = map[string]uint64{}
 	for _, p := range n.peers {

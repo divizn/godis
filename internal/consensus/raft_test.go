@@ -570,3 +570,29 @@ func TestBatchCarriesALoneOversizedEntry(t *testing.T) {
 		t.Fatalf("batch from an oversized entry has %d entries, want 1", len(got))
 	}
 }
+
+func TestLeaderChangeHook(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+
+		old, term := c.waitLeader()
+		time.Sleep(10 * testElection)
+		first := []leaderChange{{term, old}}
+		for _, id := range c.ids {
+			if got := c.leaderChanges(id); !slices.Equal(got, first) {
+				t.Fatalf("%s saw leader changes %v after many heartbeats, want %v", id, got, first)
+			}
+		}
+
+		c.stop(old)
+		leader, newTerm := c.waitLeader()
+		time.Sleep(10 * testElection)
+		want := append(first, leaderChange{newTerm, leader})
+		for _, id := range c.live() {
+			if got := c.leaderChanges(id); !slices.Equal(got, want) {
+				t.Fatalf("%s saw leader changes %v after failover, want %v", id, got, want)
+			}
+		}
+	})
+}
