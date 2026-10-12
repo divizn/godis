@@ -9,5 +9,5 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/godis /godis
 COPY --from=build --chown=nonroot:nonroot /out/data /data
 VOLUME /data
-EXPOSE 8080
+EXPOSE 8080 7000
 ENTRYPOINT ["/godis", "--data-dir=/data"]
