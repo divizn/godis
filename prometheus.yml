@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: godis
+    static_configs:
+      - targets: [godis-1:2112, godis-2:2112, godis-3:2112]

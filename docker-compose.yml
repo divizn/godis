@@ -10,20 +10,25 @@ services:
   godis-1:
     <<: *godis
     command: [--id=node-1, *cluster]
-    ports: ["8081:8080"]
+    ports: ["8081:8080", "2112:2112"]
     volumes: [godis-1-data:/data]
 
   godis-2:
     <<: *godis
     command: [--id=node-2, *cluster]
-    ports: ["8082:8080"]
+    ports: ["8082:8080", "2113:2112"]
     volumes: [godis-2-data:/data]
 
   godis-3:
     <<: *godis
     command: [--id=node-3, *cluster]
-    ports: ["8083:8080"]
+    ports: ["8083:8080", "2114:2112"]
     volumes: [godis-3-data:/data]
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    ports: ["9090:9090"]
+    volumes: [./prometheus.yml:/etc/prometheus/prometheus.yml:ro]
 
 volumes:
   godis-1-data:
