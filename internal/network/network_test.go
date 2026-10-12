@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"runtime"
 	"strings"
@@ -477,16 +478,27 @@ func TestRedirectLoopIsBounded(t *testing.T) {
 	}
 }
 
-func TestUnknownLeaderIsRetried(t *testing.T) {
-	store := &redirectStore{unknown: 2, next: newMemStore()}
+func TestUnknownLeaderIsRetriedThroughAnElection(t *testing.T) {
+	store := &redirectStore{unknown: 15, next: newMemStore()}
 	addr, _ := serve(t, store)
 	c := dial(t, addr)
 
 	if err := c.Set("k", []byte("v")); err != nil {
-		t.Fatalf("set while the leader is briefly unknown: %v", err)
+		t.Fatalf("set while the leader is unknown for 1.5s: %v", err)
 	}
-	if n := store.calls.Load(); n != 3 {
-		t.Fatalf("store saw %d attempts, want 3", n)
+	if n := store.calls.Load(); n != 16 {
+		t.Fatalf("store saw %d attempts, want 16", n)
+	}
+}
+
+func TestNeverElectedLeaderGivesUp(t *testing.T) {
+	t.Parallel()
+	addr, _ := serve(t, &redirectStore{unknown: math.MaxInt64})
+	c := dial(t, addr)
+
+	var re *RedirectError
+	if err := c.Set("k", []byte("v")); !errors.As(err, &re) || re.Addr != "" {
+		t.Fatalf("set with no leader ever elected: got %v, want a *RedirectError with no address", err)
 	}
 }
 
