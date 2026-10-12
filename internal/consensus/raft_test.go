@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/divizn/godis/internal/wal"
 )
 
 func TestOneLeaderPerTerm(t *testing.T) {
@@ -516,4 +519,54 @@ func TestStress(t *testing.T) {
 			return true
 		})
 	})
+}
+
+func TestCatchUpBatchesStayUnderByteLimit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+
+		leader, _ := c.waitLeader()
+		lagging := c.ids[0]
+		if lagging == leader {
+			lagging = c.ids[1]
+		}
+		c.stop(lagging)
+		third := strings.Repeat("x", maxBatchBytes/3+1)
+		for i := range 6 {
+			c.mustPropose(leader, fmt.Sprint(i, third))
+		}
+		oversized := strings.Repeat("y", maxBatchBytes+1)
+		c.mustPropose(leader, oversized)
+
+		c.start(lagging)
+		c.waitApplied(oversized, lagging)
+		c.net.mu.Lock()
+		defer c.net.mu.Unlock()
+		if c.net.oversized != "" {
+			t.Fatal(c.net.oversized)
+		}
+	})
+}
+
+func TestProposeRejectsCommandTooLargeForTheLog(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 1)
+		defer c.stopAll()
+
+		leader, _ := c.waitLeader()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := c.node(leader).Propose(ctx, make([]byte, wal.MaxRecordSize)); !errors.Is(err, ErrCommandTooLarge) {
+			t.Fatalf("propose %d bytes: got %v, want ErrCommandTooLarge", wal.MaxRecordSize, err)
+		}
+		c.mustPropose(leader, "still serving")
+	})
+}
+
+func TestBatchCarriesALoneOversizedEntry(t *testing.T) {
+	n := &Node{log: []Entry{{}, {Term: 1, Cmd: make([]byte, maxBatchBytes+1)}, {Term: 1, Cmd: []byte("a")}}}
+	if got := n.batch(1); len(got) != 1 {
+		t.Fatalf("batch from an oversized entry has %d entries, want 1", len(got))
+	}
 }

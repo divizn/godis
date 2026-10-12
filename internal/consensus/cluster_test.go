@@ -28,6 +28,7 @@ type memNet struct {
 
 	leaders   map[uint64]string
 	violation string
+	oversized string
 }
 
 func newMemNet() *memNet {
@@ -94,6 +95,18 @@ func (m *memNet) sawLeader(term uint64, id string) {
 	m.leaders[term] = id
 }
 
+func (m *memNet) sawBatch(entries []Entry) {
+	size := 0
+	for _, e := range entries {
+		size += len(e.Cmd)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(entries) > 1 && size > maxBatchBytes && m.oversized == "" {
+		m.oversized = fmt.Sprintf("batch of %d entries carries %d bytes, limit %d", len(entries), size, maxBatchBytes)
+	}
+}
+
 func (m *memNet) leaderTerms() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -122,6 +135,7 @@ func (t memTransport) RequestVote(ctx context.Context, to string, args RequestVo
 
 func (t memTransport) AppendEntries(ctx context.Context, to string, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	t.net.sawLeader(args.Term, args.Leader)
+	t.net.sawBatch(args.Entries)
 	n, err := t.net.hop(ctx, t.from, to)
 	if err != nil {
 		return AppendEntriesReply{}, err

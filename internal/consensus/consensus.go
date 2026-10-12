@@ -3,6 +3,7 @@ package consensus
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,13 +17,19 @@ import (
 	"github.com/divizn/godis/internal/wal"
 )
 
-const maxBatch = 64
+const (
+	maxBatch      = 64
+	maxBatchBytes = 1 << 20
+	// room in a wal record for the batch's varint header
+	maxCommandSize = wal.MaxRecordSize - 3*binary.MaxVarintLen64
+)
 
 var (
 	ErrStopped         = errors.New("consensus: node stopped")
 	ErrProposalDropped = errors.New("consensus: proposal overwritten by a newer leader")
 	ErrEmptyCommand    = errors.New("consensus: empty command")
 	ErrNoQuorum        = errors.New("consensus: leadership not confirmed by a majority")
+	ErrCommandTooLarge = errors.New("consensus: command too large for one log record")
 )
 
 // NotLeaderError carries the current leader's id, empty if unknown.
@@ -232,6 +239,9 @@ func (n *Node) replay(rec []byte) error {
 func (n *Node) Propose(ctx context.Context, cmd []byte) error {
 	if len(cmd) == 0 {
 		return ErrEmptyCommand
+	}
+	if len(cmd) > maxCommandSize {
+		return fmt.Errorf("%w: %d bytes, limit %d", ErrCommandTooLarge, len(cmd), maxCommandSize)
 	}
 	n.mu.Lock()
 	if n.ctx.Err() != nil {
@@ -560,7 +570,7 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 			Leader:       n.id,
 			PrevLogIndex: next - 1,
 			PrevLogTerm:  n.log[next-1].Term,
-			Entries:      slices.Clone(n.log[next:min(n.lastIndex()+1, next+maxBatch)]),
+			Entries:      slices.Clone(n.batch(next)),
 			LeaderCommit: n.commitIndex,
 		}
 		n.mu.Unlock()
@@ -576,6 +586,19 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 		n.handleAppendReply(peer, args, reply)
 		n.mu.Unlock()
 	}
+}
+
+// batch returns the entries from next, at most maxBatch of them and maxBatchBytes in total, but at least one if any remain; mu must be held
+func (n *Node) batch(next uint64) []Entry {
+	end, size := next, 0
+	for end <= n.lastIndex() && end-next < maxBatch {
+		size += len(n.log[end].Cmd)
+		if end > next && size > maxBatchBytes {
+			break
+		}
+		end++
+	}
+	return n.log[next:end]
 }
 
 func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply AppendEntriesReply) {

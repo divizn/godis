@@ -16,7 +16,7 @@ import (
 // record layout: uint32 payload length | uint32 crc32c of payload | payload, little endian
 const (
 	headerSize    = 8
-	maxRecordSize = 64 << 20
+	MaxRecordSize = 64 << 20
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
@@ -51,8 +51,8 @@ func (l *Log) Append(record []byte) error {
 	if len(record) == 0 {
 		return errors.New("wal record is empty")
 	}
-	if len(record) > maxRecordSize {
-		return fmt.Errorf("wal record of %d bytes exceeds limit of %d", len(record), maxRecordSize)
+	if len(record) > MaxRecordSize {
+		return fmt.Errorf("wal record of %d bytes exceeds limit of %d", len(record), MaxRecordSize)
 	}
 
 	buf := make([]byte, headerSize+len(record))
@@ -101,7 +101,7 @@ func replayRecords(r *bufio.Reader, replay func([]byte) error) (int64, error) {
 		if n == 0 {
 			return off, nil
 		}
-		if n > maxRecordSize {
+		if n > MaxRecordSize {
 			return 0, fmt.Errorf("wal record at offset %d: length %d exceeds limit", off, n)
 		}
 
