@@ -10,17 +10,19 @@ import (
 
 	"github.com/divizn/godis/internal/consensus"
 	"github.com/divizn/godis/internal/network"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type testCluster struct {
-	t        *testing.T
+	t        testing.TB
 	election time.Duration
 	root     string
 	peers    []Peer
 	nodes    map[string]*Node
+	regs     map[string]*prometheus.Registry
 }
 
-func listen(t *testing.T, addr string) net.Listener {
+func listen(t testing.TB, addr string) net.Listener {
 	t.Helper()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -29,15 +31,15 @@ func listen(t *testing.T, addr string) net.Listener {
 	return ln
 }
 
-func newTestCluster(t *testing.T, size int) *testCluster {
+func newTestCluster(t testing.TB, size int) *testCluster {
 	t.Helper()
 	return newTestClusterWithElection(t, size, 150*time.Millisecond)
 }
 
 // newTestClusterWithElection takes an election timeout, zero for the production default
-func newTestClusterWithElection(t *testing.T, size int, election time.Duration) *testCluster {
+func newTestClusterWithElection(t testing.TB, size int, election time.Duration) *testCluster {
 	t.Helper()
-	c := &testCluster{t: t, election: election, root: t.TempDir(), nodes: map[string]*Node{}}
+	c := &testCluster{t: t, election: election, root: t.TempDir(), nodes: map[string]*Node{}, regs: map[string]*prometheus.Registry{}}
 	var lns [][2]net.Listener
 	for i := range size {
 		cl, rl := listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0")
@@ -63,11 +65,12 @@ func (c *testCluster) peer(id string) Peer {
 
 func (c *testCluster) startOn(id string, cl, rl net.Listener) {
 	c.t.Helper()
-	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election})
+	reg := prometheus.NewRegistry()
+	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election, Metrics: reg})
 	if err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
-	c.nodes[id] = n
+	c.nodes[id], c.regs[id] = n, reg
 }
 
 func (c *testCluster) start(id string) {
@@ -118,7 +121,7 @@ func (c *testCluster) other(than string) string {
 	return ""
 }
 
-func waitFor(t *testing.T, what string, f func() error) {
+func waitFor(t testing.TB, what string, f func() error) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {

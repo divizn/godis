@@ -13,6 +13,7 @@ import (
 	"github.com/divizn/godis/internal/consensus"
 	"github.com/divizn/godis/internal/network"
 	"github.com/divizn/godis/internal/storage"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
@@ -36,6 +37,8 @@ type Config struct {
 	RaftListener   net.Listener
 	// ElectionTimeout defaults to 1s, long enough to replicate a maximum size value; heartbeats are a tenth of it.
 	ElectionTimeout time.Duration
+	// Metrics registers the node's metrics; nil means none.
+	Metrics prometheus.Registerer
 }
 
 type Node struct {
@@ -79,6 +82,7 @@ func start(cfg Config) (*Node, error) {
 		election = defaultElectionTimeout
 	}
 	store := storage.New()
+	m := newMetrics(cfg.Metrics)
 	tr := &transport{addrs: raftAddrs, clients: map[string]*rpc.Client{}}
 	raft, err := consensus.New(consensus.Config{
 		ID:        cfg.ID,
@@ -93,10 +97,12 @@ func start(cfg Config) (*Node, error) {
 				panic(fmt.Sprintf("apply committed command %d: %v", index, err))
 			}
 		},
+		OnLeaderChange: func(uint64, string) { m.leaderChanges.Inc() },
 	})
 	if err != nil {
 		return nil, fmt.Errorf("start raft: %w", err)
 	}
+	registerRaftGauges(cfg.Metrics, raft)
 	srv := rpc.NewServer()
 	if err := srv.RegisterName("Raft", raftService{raft}); err != nil {
 		return nil, errors.Join(fmt.Errorf("register raft rpc: %w", err), raft.Stop())
@@ -114,7 +120,7 @@ func start(cfg Config) (*Node, error) {
 		conns:      map[net.Conn]struct{}{},
 	}
 	go func() { n.raftDone <- n.serveRaft(srv) }()
-	kv := kvStore{raft: raft, store: store, clientAddrs: clientAddrs}
+	kv := kvStore{raft: raft, store: store, clientAddrs: clientAddrs, metrics: m}
 	go func() { n.clientDone <- network.NewServer(kv).Serve(ctx, cfg.ClientListener) }()
 	return n, nil
 }
@@ -174,9 +180,31 @@ type kvStore struct {
 	raft        *consensus.Node
 	store       *storage.Store
 	clientAddrs map[string]string
+	metrics     *metrics
 }
 
 func (s kvStore) Get(key string) ([]byte, bool, error) {
+	start := time.Now()
+	v, ok, err := s.get(key)
+	s.metrics.observe("get", start, ok, err)
+	return v, ok, err
+}
+
+func (s kvStore) Set(key string, value []byte) error {
+	start := time.Now()
+	err := s.propose(storage.EncodeSet(key, value))
+	s.metrics.observe("set", start, true, err)
+	return err
+}
+
+func (s kvStore) Delete(key string) error {
+	start := time.Now()
+	err := s.propose(storage.EncodeDelete(key))
+	s.metrics.observe("del", start, true, err)
+	return err
+}
+
+func (s kvStore) get(key string) ([]byte, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 	if err := s.raft.ReadIndex(ctx); err != nil {
@@ -184,14 +212,6 @@ func (s kvStore) Get(key string) ([]byte, bool, error) {
 	}
 	v, ok := s.store.Get(key)
 	return v, ok, nil
-}
-
-func (s kvStore) Set(key string, value []byte) error {
-	return s.propose(storage.EncodeSet(key, value))
-}
-
-func (s kvStore) Delete(key string) error {
-	return s.propose(storage.EncodeDelete(key))
 }
 
 func (s kvStore) propose(cmd []byte) error {

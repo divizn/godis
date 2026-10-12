@@ -3,11 +3,15 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,14 +55,74 @@ func freePort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func TestServerExitsWhenRaftHalts(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory permissions")
-	}
+func buildServer(t *testing.T) string {
+	t.Helper()
 	bin := filepath.Join(t.TempDir(), "server")
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
+	return bin
+}
+
+func TestServesMetrics(t *testing.T) {
+	bin := buildServer(t)
+	port, raftPort, metricsPort := freePort(t), freePort(t), freePort(t)
+	cmd := exec.Command(bin, "--id=a", fmt.Sprint("--port=", port), fmt.Sprint("--raft-port=", raftPort),
+		fmt.Sprint("--metrics-port=", metricsPort), "--data-dir="+t.TempDir(), "--election-timeout=50ms")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	t.Cleanup(func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Error(err)
+		}
+	})
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort)
+	var body string
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(body, "\ngodis_raft_leader 1\n") {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never reported this node as leader; last body:\n%s", url, body)
+		}
+		time.Sleep(20 * time.Millisecond)
+		resp, err := http.Get(url)
+		if err != nil {
+			continue
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read %s: %v", url, err)
+		}
+		body = string(b)
+	}
+	for _, want := range []string{"\ngo_goroutines ", "\nprocess_cpu_seconds_total ", "\ngodis_raft_leader_changes_total 1\n"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("%s lacks %q", url, strings.TrimSpace(want))
+		}
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("server exited with %v after SIGTERM, want a clean exit", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server still running 5s after SIGTERM")
+	}
+}
+
+func TestServerExitsWhenRaftHalts(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	bin := buildServer(t)
 	data := filepath.Join(t.TempDir(), "data")
 	t.Cleanup(func() {
 		if err := os.Chmod(data, 0o755); err != nil {
