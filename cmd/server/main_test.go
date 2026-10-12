@@ -82,10 +82,14 @@ func TestServesMetrics(t *testing.T) {
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort)
 	var body string
+	// the registry gathers collectors concurrently, so one scrape may read the counter before the election
+	elected := func() bool {
+		return strings.Contains(body, "\ngodis_raft_leader 1\n") && strings.Contains(body, "\ngodis_raft_leader_changes_total 1\n")
+	}
 	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(body, "\ngodis_raft_leader 1\n") {
+	for !elected() {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s never reported this node as leader; last body:\n%s", url, body)
+			t.Fatalf("%s never reported this node as leader after one leader change; last body:\n%s", url, body)
 		}
 		time.Sleep(20 * time.Millisecond)
 		resp, err := http.Get(url)
@@ -99,7 +103,7 @@ func TestServesMetrics(t *testing.T) {
 		}
 		body = string(b)
 	}
-	for _, want := range []string{"\ngo_goroutines ", "\nprocess_cpu_seconds_total ", "\ngodis_raft_leader_changes_total 1\n"} {
+	for _, want := range []string{"\ngo_goroutines ", "\nprocess_cpu_seconds_total "} {
 		if !strings.Contains(body, want) {
 			t.Errorf("%s lacks %q", url, strings.TrimSpace(want))
 		}
