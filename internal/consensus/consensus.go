@@ -22,6 +22,7 @@ var (
 	ErrStopped         = errors.New("consensus: node stopped")
 	ErrProposalDropped = errors.New("consensus: proposal overwritten by a newer leader")
 	ErrEmptyCommand    = errors.New("consensus: empty command")
+	ErrNoQuorum        = errors.New("consensus: leadership not confirmed by a majority")
 )
 
 // NotLeaderError carries the current leader's id, empty if unknown.
@@ -149,6 +150,8 @@ type Node struct {
 	nextIndex   map[string]uint64
 	matchIndex  map[string]uint64
 	waiters     map[uint64]chan error
+	// applied is closed and replaced each time lastApplied advances
+	applied chan struct{}
 }
 
 // New restores the node's term, vote and log from cfg.Dir and starts it as a follower.
@@ -192,6 +195,7 @@ func New(cfg Config) (*Node, error) {
 		votedFor:  vote,
 		log:       []Entry{{}},
 		waiters:   map[uint64]chan error{},
+		applied:   make(chan struct{}),
 	}
 	n.wal, err = wal.Open(filepath.Join(cfg.Dir, "log"), n.replay)
 	if err != nil {
@@ -632,6 +636,8 @@ func (n *Node) runApplier() {
 		}
 		n.mu.Lock()
 		n.lastApplied = start + uint64(len(entries)) - 1
+		close(n.applied)
+		n.applied = make(chan struct{})
 		for i, done := range n.waiters {
 			if i <= n.lastApplied {
 				done <- nil
@@ -639,4 +645,96 @@ func (n *Node) runApplier() {
 			}
 		}
 	}
+}
+
+// ReadIndex returns once a majority has confirmed this node still leads and everything committed
+// before the call is applied here, so a read of the state machine afterwards is linearizable.
+// ponytail: one heartbeat round per read; batch concurrent reads onto one round if read throughput matters
+func (n *Node) ReadIndex(ctx context.Context) error {
+	n.mu.Lock()
+	if n.ctx.Err() != nil {
+		n.mu.Unlock()
+		return context.Cause(n.ctx)
+	}
+	if n.role != Leader {
+		leader := n.leader
+		n.mu.Unlock()
+		return &NotLeaderError{Leader: leader}
+	}
+	term, idx := n.term, n.readIndex()
+	acks := make(chan bool, len(n.peers))
+	args := AppendEntriesArgs{Term: term, Leader: n.id}
+	// ponytail: one heartbeat round per read; batch concurrent reads onto one round if read throughput matters
+	for _, p := range n.peers {
+		n.wg.Go(func() { acks <- n.confirm(p, args) })
+	}
+	n.mu.Unlock()
+
+	confirmed := 1
+	for range n.peers {
+		if confirmed >= n.majority() {
+			break
+		}
+		select {
+		case ok := <-acks:
+			if ok {
+				confirmed++
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-n.ctx.Done():
+			return context.Cause(n.ctx)
+		}
+	}
+	if confirmed < n.majority() {
+		return ErrNoQuorum
+	}
+
+	for {
+		n.mu.Lock()
+		if n.role != Leader || n.term != term {
+			leader := n.leader
+			n.mu.Unlock()
+			return &NotLeaderError{Leader: leader}
+		}
+		if n.lastApplied >= idx {
+			n.mu.Unlock()
+			return nil
+		}
+		applied := n.applied
+		n.mu.Unlock()
+		select {
+		case <-applied:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-n.ctx.Done():
+			return context.Cause(n.ctx)
+		}
+	}
+}
+
+// readIndex is the commit index, or the last index until the leader has committed in its own term; mu must be held
+func (n *Node) readIndex() uint64 {
+	if n.log[n.commitIndex].Term == n.term {
+		return n.commitIndex
+	}
+	return n.lastIndex()
+}
+
+// confirm sends an empty AppendEntries that any follower of this term accepts without change, reporting whether it acked the term
+func (n *Node) confirm(peer string, args AppendEntriesArgs) bool {
+	ctx, cancel := context.WithTimeout(n.ctx, n.election)
+	defer cancel()
+	reply, err := n.tr.AppendEntries(ctx, peer, args)
+	if err != nil {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.ctx.Err() == nil && reply.Term > n.term {
+		if err := n.becomeFollower(reply.Term); err != nil {
+			return false
+		}
+	}
+	return reply.Term == args.Term
 }
