@@ -664,7 +664,6 @@ func (n *Node) ReadIndex(ctx context.Context) error {
 	term, idx := n.term, n.readIndex()
 	acks := make(chan bool, len(n.peers))
 	args := AppendEntriesArgs{Term: term, Leader: n.id}
-	// ponytail: one heartbeat round per read; batch concurrent reads onto one round if read throughput matters
 	for _, p := range n.peers {
 		n.wg.Go(func() { acks <- n.confirm(p, args) })
 	}
