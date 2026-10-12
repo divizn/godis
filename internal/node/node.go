@@ -15,7 +15,10 @@ import (
 	"github.com/divizn/godis/internal/storage"
 )
 
-const requestTimeout = 5 * time.Second
+const (
+	requestTimeout         = 5 * time.Second
+	defaultElectionTimeout = time.Second
+)
 
 type Peer struct {
 	ID         string
@@ -31,6 +34,8 @@ type Config struct {
 	Dir            string
 	ClientListener net.Listener
 	RaftListener   net.Listener
+	// ElectionTimeout defaults to 1s, long enough to replicate a maximum size value; heartbeats are a tenth of it.
+	ElectionTimeout time.Duration
 }
 
 type Node struct {
@@ -69,6 +74,10 @@ func start(cfg Config) (*Node, error) {
 		clientAddrs[p.ID] = p.ClientAddr
 	}
 
+	election := cfg.ElectionTimeout
+	if election == 0 {
+		election = defaultElectionTimeout
+	}
 	store := storage.New()
 	tr := &transport{addrs: raftAddrs, clients: map[string]*rpc.Client{}}
 	raft, err := consensus.New(consensus.Config{
@@ -76,6 +85,9 @@ func start(cfg Config) (*Node, error) {
 		Peers:     ids,
 		Dir:       cfg.Dir,
 		Transport: tr,
+
+		ElectionTimeout:   election,
+		HeartbeatInterval: election / 10,
 		Apply: func(index uint64, cmd []byte) {
 			if err := store.Apply(cmd); err != nil {
 				panic(fmt.Sprintf("apply committed command %d: %v", index, err))

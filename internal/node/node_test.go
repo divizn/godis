@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,10 +13,11 @@ import (
 )
 
 type testCluster struct {
-	t     *testing.T
-	root  string
-	peers []Peer
-	nodes map[string]*Node
+	t        *testing.T
+	election time.Duration
+	root     string
+	peers    []Peer
+	nodes    map[string]*Node
 }
 
 func listen(t *testing.T, addr string) net.Listener {
@@ -29,7 +31,13 @@ func listen(t *testing.T, addr string) net.Listener {
 
 func newTestCluster(t *testing.T, size int) *testCluster {
 	t.Helper()
-	c := &testCluster{t: t, root: t.TempDir(), nodes: map[string]*Node{}}
+	return newTestClusterWithElection(t, size, 150*time.Millisecond)
+}
+
+// newTestClusterWithElection takes an election timeout, zero for the production default
+func newTestClusterWithElection(t *testing.T, size int, election time.Duration) *testCluster {
+	t.Helper()
+	c := &testCluster{t: t, election: election, root: t.TempDir(), nodes: map[string]*Node{}}
 	var lns [][2]net.Listener
 	for i := range size {
 		cl, rl := listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0")
@@ -55,7 +63,7 @@ func (c *testCluster) peer(id string) Peer {
 
 func (c *testCluster) startOn(id string, cl, rl net.Listener) {
 	c.t.Helper()
-	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl})
+	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election})
 	if err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
@@ -228,5 +236,20 @@ func TestFullRestartKeepsData(t *testing.T) {
 		waitFor(t, fmt.Sprint("get k", i), func() error {
 			return c.via(c.peers[i%3].ID, get(t, fmt.Sprint("k", i), want, wantOK))
 		})
+	}
+}
+
+func TestMaxSizeValuesCommitWithoutElection(t *testing.T) {
+	c := newTestClusterWithElection(t, 3, 0)
+	leader := c.leader()
+	term := c.nodes[leader].Status().Term
+	value := strings.Repeat("v", 8<<20)
+	for i := range 3 {
+		if err := c.via(leader, set(fmt.Sprint("big", i), value)); err != nil {
+			t.Fatalf("set value %d of %d bytes: %v", i, len(value), err)
+		}
+	}
+	if s := c.nodes[leader].Status(); s.Role != consensus.Leader || s.Term != term {
+		t.Fatalf("leader %s moved from term %d to %v in term %d", leader, term, s.Role, s.Term)
 	}
 }

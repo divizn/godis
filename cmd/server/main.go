@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/divizn/godis/internal/node"
 )
@@ -20,6 +21,7 @@ func main() {
 	raftPort := flag.Int("raft-port", 7000, "raft port to listen on")
 	id := flag.String("id", "node-1", "node id")
 	dataDir := flag.String("data-dir", "data", "directory for the raft state and log")
+	election := flag.Duration("election-timeout", time.Second, "raft election timeout, randomized up to twice this; heartbeats are a tenth of it")
 	cluster := flag.String("cluster", "", "every member as id=raft-addr/client-addr, comma separated; empty means a cluster of one")
 	flag.Parse()
 
@@ -39,7 +41,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen on raft port %d: %v", *raftPort, err)
 	}
-	n, err := node.Start(node.Config{ID: *id, Peers: peers, Dir: *dataDir, ClientListener: cl, RaftListener: rl})
+	n, err := node.Start(node.Config{ID: *id, Peers: peers, Dir: *dataDir, ClientListener: cl, RaftListener: rl, ElectionTimeout: *election})
 	if err != nil {
 		log.Fatalf("start node: %v", err)
 	}
