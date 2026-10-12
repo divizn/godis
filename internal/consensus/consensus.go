@@ -286,6 +286,16 @@ func (n *Node) Status() Status {
 }
 
 // Stop halts the node and closes its log, returning the persistence error that halted it, if any.
+// Done is closed once the node stops, by Stop or because it could not persist its state; Err then says why.
+func (n *Node) Done() <-chan struct{} {
+	return n.ctx.Done()
+}
+
+// Err is nil while the node runs, ErrStopped after Stop, or the persistence failure that halted it.
+func (n *Node) Err() error {
+	return context.Cause(n.ctx)
+}
+
 func (n *Node) Stop() error {
 	n.mu.Lock()
 	n.halt(ErrStopped)

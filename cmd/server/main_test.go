@@ -1,8 +1,15 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/divizn/godis/internal/node"
 )
@@ -31,5 +38,70 @@ func TestParseCluster(t *testing.T) {
 		if got, err := parseCluster(bad); err == nil {
 			t.Errorf("parseCluster(%q) = %+v, want error", bad, got)
 		}
+	}
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func TestServerExitsWhenRaftHalts(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	bin := filepath.Join(t.TempDir(), "server")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	data := filepath.Join(t.TempDir(), "data")
+	t.Cleanup(func() {
+		if err := os.Chmod(data, 0o755); err != nil {
+			t.Error(err)
+		}
+	})
+
+	port, raftPort := freePort(t), freePort(t)
+	// the unreachable peer keeps the node in elections, each one persisting a new term
+	cmd := exec.Command(bin, "--id=a", fmt.Sprint("--port=", port), fmt.Sprint("--raft-port=", raftPort), "--data-dir="+data,
+		"--election-timeout=20ms", fmt.Sprintf("--cluster=a=127.0.0.1:%d/127.0.0.1:%d,b=127.0.0.1:1/127.0.0.1:1", raftPort, port))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	t.Cleanup(func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Error(err)
+		}
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(data, "state")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server never persisted a term")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.Chmod(data, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-exited:
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("server exited with %v, want a non-zero exit status", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server still running 5s after raft could no longer persist its term")
 	}
 }

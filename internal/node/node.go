@@ -123,6 +123,15 @@ func (n *Node) Status() consensus.Status {
 	return n.raft.Status()
 }
 
+// Done is closed once Raft stops, by Stop or because it halted on a persistence failure; Err then says why.
+func (n *Node) Done() <-chan struct{} {
+	return n.raft.Done()
+}
+
+func (n *Node) Err() error {
+	return n.raft.Err()
+}
+
 // Stop lets in-flight client requests finish, then stops Raft and closes every connection.
 func (n *Node) Stop() error {
 	n.cancel()

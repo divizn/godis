@@ -49,10 +49,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
-	slog.Info("shutting down", "node", *id)
+	select {
+	case <-ctx.Done():
+		slog.Info("shutting down", "node", *id)
+	case <-n.Done():
+		slog.Error("raft halted, shutting down", "node", *id, "err", n.Err())
+	}
 	if err := n.Stop(); err != nil {
-		slog.Error("stop node", "err", err)
+		log.Fatalf("stop node: %v", err)
 	}
 }
 
