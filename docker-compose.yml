@@ -3,6 +3,7 @@ name: godis
 x-godis: &godis
   build: .
   image: godis:dev
+  restart: unless-stopped
 
 x-cluster: &cluster --cluster=node-1=godis-1:7000/localhost:8081,node-2=godis-2:7000/localhost:8082,node-3=godis-3:7000/localhost:8083
 
