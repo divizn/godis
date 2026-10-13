@@ -269,18 +269,13 @@ func TestLeaderWithoutQuorumStopsCommitting(t *testing.T) {
 			t.Fatalf("new leader term %d, want > %d", newTerm, term)
 		}
 		c.mustPropose(id, "majority")
-		time.Sleep(time.Second)
-		select {
-		case err := <-minority:
-			t.Fatalf("propose on leader without quorum returned %v while partitioned", err)
-		default:
+		var nle *NotLeaderError
+		if err := <-minority; !errors.As(err, &nle) {
+			t.Fatalf("propose on leader without quorum: got %v, want *NotLeaderError", err)
 		}
 
 		c.net.heal()
 		c.waitApplied("majority")
-		if err := <-minority; !errors.Is(err, ErrProposalDropped) {
-			t.Fatalf("overwritten proposal: got %v, want ErrProposalDropped", err)
-		}
 		if s := c.node(old).Status(); s.Role == Leader && s.Term == term {
 			t.Fatalf("old leader still leads term %d after heal", term)
 		}
@@ -334,6 +329,20 @@ func TestMinorityCannotElectOrCommit(t *testing.T) {
 	})
 }
 
+// proposeIsolated appends cmds on a leader cut off from the rest, all at once so it has not yet stepped down
+func proposeIsolated(t *testing.T, c *cluster, leader string, cmds ...string) {
+	t.Helper()
+	errs := make(chan error, len(cmds))
+	for _, cmd := range cmds {
+		go func() { errs <- c.propose(leader, cmd, 50*time.Millisecond) }()
+	}
+	for range cmds {
+		if err := <-errs; !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("propose on isolated leader %s: got %v, want deadline exceeded", leader, err)
+		}
+	}
+}
+
 // diverge leaves old leaders holding uncommitted entries from two terms, then heals
 func diverge(t *testing.T, c *cluster) {
 	t.Helper()
@@ -341,21 +350,13 @@ func diverge(t *testing.T, c *cluster) {
 	c.mustPropose(l1, "a")
 	others := slices.DeleteFunc(slices.Clone(c.ids), func(id string) bool { return id == l1 })
 	c.net.partition([]string{l1}, others)
-	for _, cmd := range []string{"x1", "x2", "x3"} {
-		if err := c.propose(l1, cmd, 50*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("propose %q on isolated leader: got %v, want deadline exceeded", cmd, err)
-		}
-	}
+	proposeIsolated(t, c, l1, "x1", "x2", "x3")
 
 	l2, _ := c.waitLeader(others...)
 	c.mustPropose(l2, "b")
 	rest := slices.DeleteFunc(slices.Clone(others), func(id string) bool { return id == l2 })
 	c.net.partition([]string{l1}, []string{l2}, rest)
-	for _, cmd := range []string{"y1", "y2"} {
-		if err := c.propose(l2, cmd, 50*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("propose %q on isolated leader: got %v, want deadline exceeded", cmd, err)
-		}
-	}
+	proposeIsolated(t, c, l2, "y1", "y2")
 
 	l3, _ := c.waitLeader(rest...)
 	c.mustPropose(l3, "c")
@@ -593,6 +594,112 @@ func TestLeaderChangeHook(t *testing.T) {
 			if got := c.leaderChanges(id); !slices.Equal(got, want) {
 				t.Fatalf("%s saw leader changes %v after failover, want %v", id, got, want)
 			}
+		}
+	})
+}
+
+func TestOverwrittenProposalIsDropped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := heldVotes{release: make(chan struct{})}
+		close(tr.release)
+		n, err := New(Config{
+			ID:                "a",
+			Peers:             []string{"a", "b", "c"},
+			Dir:               t.TempDir(),
+			Transport:         tr,
+			Apply:             func(uint64, []byte) {},
+			ElectionTimeout:   time.Hour,
+			HeartbeatInterval: time.Minute,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mustStop(t, n)
+		n.mu.Lock()
+		n.startElection()
+		n.mu.Unlock()
+		synctest.Wait()
+
+		proposed := make(chan error, 1)
+		go func() { proposed <- n.Propose(context.Background(), []byte("x")) }()
+		synctest.Wait()
+		appendEntries(t, n, AppendEntriesArgs{Term: 2, Leader: "b", PrevLogIndex: 1, PrevLogTerm: 1, Entries: entries(2, "y")})
+		if err := <-proposed; !errors.Is(err, ErrProposalDropped) {
+			t.Fatalf("proposal overwritten by a newer leader: got %v, want ErrProposalDropped", err)
+		}
+	})
+}
+
+func TestIsolatedLeaderStepsDown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+		defer close(c.gate)
+
+		leader, _ := c.waitLeader()
+		n := c.node(leader)
+		c.mustPropose(leader, "a")
+		commit := n.Status().CommitIndex
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		errs := make(chan error, 3)
+		go func() { errs <- n.Propose(ctx, []byte("slow")) }()
+		waitFor(t, 10*time.Second, "slow to commit", func() bool { return n.Status().CommitIndex > commit })
+		go func() { errs <- n.ReadIndex(ctx) }()
+		synctest.Wait()
+
+		start := time.Now()
+		c.net.partition([]string{leader}, slices.DeleteFunc(slices.Clone(c.ids), func(id string) bool { return id == leader }))
+		go func() { errs <- n.Propose(ctx, []byte("p")) }()
+		for range 3 {
+			var nle *NotLeaderError
+			if err := <-errs; !errors.As(err, &nle) || nle.Leader != "" {
+				t.Fatalf("call waiting on an isolated leader: got %v, want NotLeaderError with no leader", err)
+			}
+			if d := time.Since(start); d > 2*testElection {
+				t.Fatalf("call waiting on an isolated leader failed after %v, want within %v", d, 2*testElection)
+			}
+		}
+		if s := n.Status(); s.Role == Leader || s.Leader != "" {
+			t.Fatalf("isolated leader is %v with leader %q, want no leader", s.Role, s.Leader)
+		}
+	})
+}
+
+func TestLeaderWithOneOfTwoFollowersKeepsLeading(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+
+		leader, term := c.waitLeader()
+		others := slices.DeleteFunc(slices.Clone(c.ids), func(id string) bool { return id == leader })
+		c.net.partition([]string{leader, others[0]}, others[1:])
+		for range 20 {
+			time.Sleep(testElection)
+			if s := c.node(leader).Status(); s.Role != Leader || s.Term != term {
+				t.Fatalf("leader of term %d with one follower became %v in term %d", term, s.Role, s.Term)
+			}
+		}
+		c.mustPropose(leader, "a")
+	})
+}
+
+func TestIdleClusterNeverStepsDown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+		c.net.setFaults(0, 5*time.Millisecond)
+
+		leader, term := c.waitLeader()
+		for range 30 {
+			time.Sleep(testElection)
+			if s := c.node(leader).Status(); s.Role != Leader || s.Term != term {
+				t.Fatalf("idle leader of term %d became %v in term %d", term, s.Role, s.Term)
+			}
+		}
+		if n := c.net.leaderTerms(); n != 1 {
+			t.Fatalf("saw leaders in %d terms in an idle cluster, want 1", n)
 		}
 	})
 }

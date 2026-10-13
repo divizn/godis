@@ -160,8 +160,10 @@ type Node struct {
 	votes       int
 	nextIndex   map[string]uint64
 	matchIndex  map[string]uint64
-	waiters     map[uint64]chan error
-	// applied is closed and replaced each time lastApplied advances
+	// contact is when the leader last had a reply in its term from each peer
+	contact map[string]time.Time
+	waiters map[uint64]chan error
+	// applied is closed and replaced each time lastApplied advances or the node stops leading
 	applied chan struct{}
 }
 
@@ -483,11 +485,38 @@ func (n *Node) runTimer() {
 		case <-t.C:
 		}
 		n.mu.Lock()
-		if n.ctx.Err() == nil && n.role != Leader && time.Now().After(n.deadline) {
+		switch {
+		case n.ctx.Err() != nil:
+		case n.role == Leader:
+			n.checkQuorum()
+		case time.Now().After(n.deadline):
 			n.startElection()
 		}
 		n.mu.Unlock()
 	}
+}
+
+// checkQuorum steps down a leader that has not heard from a majority for an election timeout; mu must be held
+func (n *Node) checkQuorum() {
+	heard := 1
+	for _, p := range n.peers {
+		if time.Since(n.contact[p]) < n.election {
+			heard++
+		}
+	}
+	if heard >= n.majority() {
+		return
+	}
+	if err := n.becomeFollower(n.term); err != nil {
+		return
+	}
+	n.leader = ""
+	for i, done := range n.waiters {
+		done <- &NotLeaderError{}
+		delete(n.waiters, i)
+	}
+	close(n.applied)
+	n.applied = make(chan struct{})
 }
 
 func (n *Node) startElection() {
@@ -540,8 +569,10 @@ func (n *Node) becomeLeader() {
 	n.setLeader(n.id)
 	n.nextIndex = map[string]uint64{}
 	n.matchIndex = map[string]uint64{}
+	n.contact = map[string]time.Time{}
 	for _, p := range n.peers {
 		n.nextIndex[p] = n.lastIndex() + 1
+		n.contact[p] = time.Now()
 	}
 	if err := n.appendLog(n.lastIndex()+1, []Entry{{Term: n.term}}); err != nil {
 		return
@@ -645,6 +676,7 @@ func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply Appe
 	if n.role != Leader || n.term != args.Term {
 		return
 	}
+	n.contact[peer] = time.Now()
 	if reply.Success {
 		match := args.PrevLogIndex + uint64(len(args.Entries))
 		if match > n.matchIndex[peer] {
@@ -789,6 +821,9 @@ func (n *Node) confirm(peer string, args AppendEntriesArgs) bool {
 		if err := n.becomeFollower(reply.Term); err != nil {
 			return false
 		}
+	}
+	if n.role == Leader && n.term == args.Term && reply.Term == args.Term {
+		n.contact[peer] = time.Now()
 	}
 	return reply.Term == args.Term
 }

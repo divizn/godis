@@ -156,11 +156,16 @@ type applied struct {
 }
 
 type applyLog struct {
+	// gate holds back applying the command "slow" until closed
+	gate    chan struct{}
 	mu      sync.Mutex
 	entries []applied
 }
 
 func (a *applyLog) apply(index uint64, cmd []byte) {
+	if string(cmd) == "slow" {
+		<-a.gate
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.entries = append(a.entries, applied{index, string(cmd)})
@@ -186,6 +191,7 @@ type cluster struct {
 	nodes map[string]*Node
 	logs  map[string]*applyLog
 	past  map[string][]*applyLog
+	gate  chan struct{}
 	// changes records each node's OnLeaderChange calls across restarts
 	changes map[string][]leaderChange
 
@@ -206,6 +212,7 @@ func newCluster(t *testing.T, size int) *cluster {
 		nodes: map[string]*Node{},
 		logs:  map[string]*applyLog{},
 		past:  map[string][]*applyLog{},
+		gate:  make(chan struct{}),
 
 		changes: map[string][]leaderChange{},
 	}
@@ -220,7 +227,7 @@ func newCluster(t *testing.T, size int) *cluster {
 
 func (c *cluster) start(id string) {
 	c.t.Helper()
-	al := &applyLog{}
+	al := &applyLog{gate: c.gate}
 	n, err := New(Config{
 		ID:                id,
 		Peers:             c.ids,
