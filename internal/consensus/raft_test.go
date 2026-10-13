@@ -620,8 +620,10 @@ func TestOverwrittenProposalIsDropped(t *testing.T) {
 		n.mu.Unlock()
 		synctest.Wait()
 
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
 		proposed := make(chan error, 1)
-		go func() { proposed <- n.Propose(context.Background(), []byte("x")) }()
+		go func() { proposed <- n.Propose(ctx, []byte("x")) }()
 		synctest.Wait()
 		appendEntries(t, n, AppendEntriesArgs{Term: 2, Leader: "b", PrevLogIndex: 1, PrevLogTerm: 1, Entries: entries(2, "y")})
 		if err := <-proposed; !errors.Is(err, ErrProposalDropped) {
@@ -689,7 +691,7 @@ func TestIdleClusterNeverStepsDown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := newCluster(t, 3)
 		defer c.stopAll()
-		c.net.setFaults(0, 5*time.Millisecond)
+		c.net.setFaults(0, 15*time.Millisecond)
 
 		leader, term := c.waitLeader()
 		for range 30 {
