@@ -93,14 +93,30 @@ func TestReadIndexWaitsForApply(t *testing.T) {
 	})
 }
 
-func TestReadIndexBeforeCommitInTermUsesLastIndex(t *testing.T) {
-	n := &Node{
-		role:        Leader,
-		term:        4,
-		log:         []Entry{{}, {Term: 1, Cmd: []byte("x")}, {Term: 4}},
-		commitIndex: 1,
-	}
-	if got := n.readIndex(); got != 2 {
-		t.Fatalf("read index %d, want 2: commit index 1 is from an earlier term and may be stale", got)
-	}
+func TestReadIndexWaitsForNewLeaderToCommitInItsTerm(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+
+		leader, _ := c.waitLeader()
+		c.mustPropose(leader, "a")
+		c.waitApplied("a")
+		c.stopAll()
+		c.net.setSlowAppend(time.Hour)
+		for _, id := range c.ids {
+			c.start(id)
+		}
+
+		leader, _ = c.waitLeader()
+		if err := readIndex(c, leader); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("read index on a new leader that has not committed in its term: got %v with a applied %v, want deadline exceeded", err, c.log(leader).has("a"))
+		}
+		c.net.setSlowAppend(0)
+		if err := readIndex(c, leader); err != nil {
+			t.Fatalf("read index once appends flow: %v", err)
+		}
+		if !c.log(leader).has("a") {
+			t.Fatal("read index returned before the leader applied a")
+		}
+	})
 }
