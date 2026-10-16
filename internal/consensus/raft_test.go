@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -784,6 +786,27 @@ func TestHeartbeatDoesNotCommitStaleEntries(t *testing.T) {
 		if got, want := cmds(c.checkSame()), []string{"a", "b", "c", "d"}; !slices.Equal(got, want) {
 			t.Fatalf("applied %v, want %v", got, want)
 		}
+	})
+}
+
+func TestWipedFollowerCatchesUpInAnIdleCluster(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+
+		leader, _ := c.waitLeader()
+		c.mustPropose(leader, "a")
+		c.waitApplied("a")
+		follower := c.ids[0]
+		if follower == leader {
+			follower = c.ids[1]
+		}
+		c.stop(follower)
+		if err := os.RemoveAll(filepath.Join(c.root, follower)); err != nil {
+			t.Fatal(err)
+		}
+		c.start(follower)
+		c.waitApplied("a", follower)
 	})
 }
 

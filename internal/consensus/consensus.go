@@ -612,7 +612,7 @@ func (n *Node) advanceCommit() {
 	}
 }
 
-// replicate sends entries to peer when woken, by a proposal, a new leadership, its own follow-up or a heartbeat reply from a lagging peer
+// replicate sends entries to peer when woken, by a proposal, a new leadership, its own follow-up or a heartbeat reply from a lagging or wiped peer
 func (n *Node) replicate(peer string, wake chan struct{}) {
 	for {
 		select {
@@ -622,11 +622,11 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 		}
 
 		n.mu.Lock()
-		next := n.nextIndex[peer]
-		if n.ctx.Err() != nil || n.role != Leader || next > n.lastIndex() {
+		if n.ctx.Err() != nil || n.role != Leader {
 			n.mu.Unlock()
 			continue
 		}
+		next := n.nextIndex[peer]
 		args := AppendEntriesArgs{
 			Term:         n.term,
 			Leader:       n.id,
@@ -685,7 +685,7 @@ func (n *Node) heartbeats(peer string) {
 		}
 
 		n.mu.Lock()
-		if n.recordReply(peer, args, reply) && n.matchIndex[peer] < n.lastIndex() {
+		if n.recordReply(peer, args, reply) && (!reply.Success || n.matchIndex[peer] < n.lastIndex()) {
 			n.wakeup(peer)
 		}
 		n.mu.Unlock()
