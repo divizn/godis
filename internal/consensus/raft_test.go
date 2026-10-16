@@ -830,3 +830,107 @@ func TestStaleTermAppendReplyIsIgnored(t *testing.T) {
 		t.Fatalf("a term 2 reply moved the term 4 leader to matchIndex %d, commitIndex %d; want 0, 0", n.matchIndex["b"], n.commitIndex)
 	}
 }
+
+func TestFailedAppendPersistIsNotAcked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		n := singleNode(t, t.TempDir())
+		n.mu.Lock()
+		if err := n.wal.Close(); err != nil {
+			t.Fatal(err)
+		}
+		n.mu.Unlock()
+
+		r, err := n.HandleAppendEntries(AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "x")})
+		if err == nil || r.Success {
+			t.Fatalf("append entries after the log failed: got %+v, %v; want an error and no reply", r, err)
+		}
+		if n.Err() == nil {
+			t.Fatal("node still running after failing to persist entries")
+		}
+		if err := n.Stop(); err == nil {
+			t.Fatal("stop after a persistence failure: want the failure")
+		}
+	})
+}
+
+func TestFailedVotePersistIsNotGranted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		n := singleNode(t, dir)
+		appendEntries(t, n, AppendEntriesArgs{Term: 5, Leader: "c"})
+		n.mu.Lock()
+		n.dir = filepath.Join(dir, "missing")
+		n.mu.Unlock()
+
+		r, err := n.HandleRequestVote(RequestVoteArgs{Term: 5, Candidate: "b"})
+		if err == nil || r.Granted {
+			t.Fatalf("vote that could not be persisted: got %+v, %v; want an error and no reply", r, err)
+		}
+		if n.Err() == nil {
+			t.Fatal("node still running after failing to persist its vote")
+		}
+		if err := n.Stop(); err == nil {
+			t.Fatal("stop after a persistence failure: want the failure")
+		}
+	})
+}
+
+func TestLogWithGapFailsNew(t *testing.T) {
+	dir := t.TempDir()
+	l, err := wal.Open(filepath.Join(dir, "log"), func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range [][]byte{encodeBatch(1, entries(1, "a")), encodeBatch(3, entries(1, "c"))} {
+		if err := l.Append(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := New(Config{ID: "a", Peers: []string{"a"}, Dir: dir, Transport: memTransport{net: newMemNet(), from: "a"}, Apply: func(uint64, []byte) {}})
+	if err == nil {
+		mustStop(t, n)
+		t.Fatal("new on a log missing entry 2: want error")
+	}
+}
+
+// higherTerm grants every vote and answers AppendEntries with or without entries, as chosen, with term 1000; the others hang
+type higherTerm struct{ withEntries bool }
+
+func (higherTerm) RequestVote(_ context.Context, _ string, args RequestVoteArgs) (RequestVoteReply, error) {
+	return RequestVoteReply{Term: args.Term, Granted: true}, nil
+}
+
+func (h higherTerm) AppendEntries(ctx context.Context, _ string, args AppendEntriesArgs) (AppendEntriesReply, error) {
+	if (len(args.Entries) > 0) == h.withEntries {
+		return AppendEntriesReply{Term: 1000}, nil
+	}
+	<-ctx.Done()
+	return AppendEntriesReply{}, ctx.Err()
+}
+
+func TestHigherTermAppendReplyStepsLeaderDown(t *testing.T) {
+	for name, withEntries := range map[string]bool{"replicate": true, "heartbeats": false} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				n, err := New(Config{
+					ID:                "a",
+					Peers:             []string{"a", "b", "c"},
+					Dir:               t.TempDir(),
+					Transport:         higherTerm{withEntries: withEntries},
+					Apply:             func(uint64, []byte) {},
+					ElectionTimeout:   testElection,
+					HeartbeatInterval: testHeartbeat,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer mustStop(t, n)
+				waitFor(t, time.Second, "a to adopt term 1000 from an append reply", func() bool { return n.Status().Term >= 1000 })
+			})
+		})
+	}
+}

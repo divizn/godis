@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -113,6 +114,27 @@ func TestChecksumMismatchFails(t *testing.T) {
 
 	if _, err := Open(path, func([]byte) error { return nil }); err == nil {
 		t.Fatal("open on corrupt log: want error")
+	}
+}
+
+func TestReplayErrorFailsOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal")
+	l, _ := open(t, path)
+	appendAll(t, l, "a", "b", "c")
+	mustClose(t, l)
+
+	errBad := errors.New("bad record")
+	l, err := Open(path, func(rec []byte) error {
+		if string(rec) == "b" {
+			return errBad
+		}
+		return nil
+	})
+	if !errors.Is(err, errBad) {
+		if err == nil {
+			mustClose(t, l)
+		}
+		t.Fatalf("open with a failing replay: got %v, want %v", err, errBad)
 	}
 }
 
