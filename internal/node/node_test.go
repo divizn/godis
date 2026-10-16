@@ -5,6 +5,8 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -241,6 +243,47 @@ func TestFullRestartKeepsData(t *testing.T) {
 		waitFor(t, fmt.Sprint("get k", i), func() error {
 			return c.via(c.peers[i%3].ID, get(t, fmt.Sprint("k", i), want, wantOK))
 		})
+	}
+}
+
+func TestStopAnswersInFlightWrites(t *testing.T) {
+	c := newTestCluster(t, 3)
+	leader := c.leader()
+
+	var wg sync.WaitGroup
+	var ok atomic.Int64
+	stopped := make(chan string, 8)
+	for i := range 8 {
+		wg.Go(func() {
+			cl, err := network.Dial(c.peer(leader).ClientAddr)
+			if err != nil {
+				t.Errorf("dial: %v", err)
+				return
+			}
+			defer cl.Close()
+			for j := 0; ; j++ {
+				err := cl.Set(fmt.Sprint("k", i, "-", j), []byte("v"))
+				if err != nil {
+					if strings.Contains(err.Error(), consensus.ErrStopped.Error()) {
+						stopped <- err.Error()
+					}
+					return
+				}
+				ok.Add(1)
+			}
+		})
+	}
+	waitFor(t, "50 writes", func() error {
+		if n := ok.Load(); n < 50 {
+			return fmt.Errorf("%d writes so far", n)
+		}
+		return nil
+	})
+	c.stop(leader)
+	wg.Wait()
+	close(stopped)
+	for err := range stopped {
+		t.Errorf("write in flight during stop answered %q", err)
 	}
 }
 
