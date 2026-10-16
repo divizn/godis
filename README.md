@@ -27,6 +27,7 @@ Followers never serve reads or writes; they answer REDIRECT with the leader's cl
 - Linearizable writes and reads, from the leader only.
 - A write is acked only once it is fsynced on a majority and applied on the leader.
 - Leader loss: the remaining majority elects a new leader within one to two election timeouts (1s by default) and the client retries through the redirect. A write that timed out may still have committed, and a retry applies it twice (no dedupe).
+- A leader that hasn't heard from a majority for an election timeout steps down, and its pending writes and reads fail with a redirect instead of timing out.
 - A node that can no longer persist its log or term halts and the process exits non-zero, rather than serve from a state it can't make durable.
 
 ## Running it
@@ -96,7 +97,6 @@ Raft is tested deterministically with `testing/synctest` on an in-memory network
 
 - No snapshots or log compaction: the log, memory and restart replay grow with all history.
 - No client dedupe: a write that timed out may still commit, and a retry applies it again.
-- No check-quorum: a leader cut off from the majority keeps accepting writes, which then time out.
 - One heartbeat round per read; concurrent reads are not batched.
 - Heartbeats to a peer stall while a big AppendEntries to it is in flight.
 - A corrupt log is not repaired: wipe that node's data dir by hand and let it catch up.
