@@ -469,13 +469,17 @@ func TestClientFollowsRedirect(t *testing.T) {
 
 func TestRedirectLoopIsBounded(t *testing.T) {
 	lnA, lnB := listen(t), listen(t)
-	serveOn(t, lnA, &redirectStore{addr: lnB.Addr().String()})
-	serveOn(t, lnB, &redirectStore{addr: lnA.Addr().String()})
+	a, b := &redirectStore{addr: lnB.Addr().String()}, &redirectStore{addr: lnA.Addr().String()}
+	serveOn(t, lnA, a)
+	serveOn(t, lnB, b)
 	c := dial(t, lnA.Addr().String())
 
 	var re *RedirectError
 	if err := c.Set("k", []byte("v")); !errors.As(err, &re) {
 		t.Fatalf("set in a redirect loop: got %v, want a *RedirectError", err)
+	}
+	if n := a.calls.Load() + b.calls.Load(); n != 11 {
+		t.Fatalf("stores saw %d attempts, want 11: the first plus 10 redirects", n)
 	}
 }
 
