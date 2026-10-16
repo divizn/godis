@@ -83,7 +83,7 @@ func start(cfg Config) (*Node, error) {
 	}
 	store := storage.New()
 	m := newMetrics(cfg.Metrics)
-	tr := &transport{addrs: raftAddrs, clients: map[string]*rpc.Client{}}
+	tr := &transport{addrs: raftAddrs, clients: map[conn]*rpc.Client{}}
 	raft, err := consensus.New(consensus.Config{
 		ID:        cfg.ID,
 		Peers:     ids,

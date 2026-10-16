@@ -11,17 +11,23 @@ import (
 	"github.com/divizn/godis/internal/consensus"
 )
 
-// transport sends Raft RPCs over net/rpc, one lazily dialed connection per peer, redialed after any connection error
+// transport sends Raft RPCs over net/rpc, one lazily dialed connection per peer for appends with entries and one for the rest
+// so heartbeats never queue behind a big append, each redialed after any connection error
 type transport struct {
 	addrs map[string]string
 
 	mu      sync.Mutex
-	clients map[string]*rpc.Client
+	clients map[conn]*rpc.Client
+}
+
+type conn struct {
+	peer    string
+	entries bool
 }
 
 func (t *transport) RequestVote(ctx context.Context, to string, args consensus.RequestVoteArgs) (consensus.RequestVoteReply, error) {
 	reply := new(consensus.RequestVoteReply)
-	if err := t.call(ctx, to, "Raft.RequestVote", args, reply); err != nil {
+	if err := t.call(ctx, conn{peer: to}, "Raft.RequestVote", args, reply); err != nil {
 		return consensus.RequestVoteReply{}, err
 	}
 	return *reply, nil
@@ -29,14 +35,14 @@ func (t *transport) RequestVote(ctx context.Context, to string, args consensus.R
 
 func (t *transport) AppendEntries(ctx context.Context, to string, args consensus.AppendEntriesArgs) (consensus.AppendEntriesReply, error) {
 	reply := new(consensus.AppendEntriesReply)
-	if err := t.call(ctx, to, "Raft.AppendEntries", args, reply); err != nil {
+	if err := t.call(ctx, conn{peer: to, entries: len(args.Entries) > 0}, "Raft.AppendEntries", args, reply); err != nil {
 		return consensus.AppendEntriesReply{}, err
 	}
 	return *reply, nil
 }
 
 // call must not touch reply after returning an error, since net/rpc may still decode into it
-func (t *transport) call(ctx context.Context, to, method string, args, reply any) error {
+func (t *transport) call(ctx context.Context, to conn, method string, args, reply any) error {
 	c, err := t.client(ctx, to)
 	if err != nil {
 		return err
@@ -52,28 +58,28 @@ func (t *transport) call(ctx context.Context, to, method string, args, reply any
 		if !errors.As(call.Error, &se) {
 			t.drop(to, c)
 		}
-		return fmt.Errorf("%s to %s: %w", method, to, call.Error)
+		return fmt.Errorf("%s to %s: %w", method, to.peer, call.Error)
 	}
 	return nil
 }
 
-func (t *transport) client(ctx context.Context, to string) (*rpc.Client, error) {
+func (t *transport) client(ctx context.Context, to conn) (*rpc.Client, error) {
 	t.mu.Lock()
 	c := t.clients[to]
 	t.mu.Unlock()
 	if c != nil {
 		return c, nil
 	}
-	addr, ok := t.addrs[to]
+	addr, ok := t.addrs[to.peer]
 	if !ok {
-		return nil, fmt.Errorf("unknown peer %q", to)
+		return nil, fmt.Errorf("unknown peer %q", to.peer)
 	}
 	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	nc, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("dial peer %s: %w", to, err)
+		return nil, fmt.Errorf("dial peer %s: %w", to.peer, err)
 	}
-	c = rpc.NewClient(conn)
+	c = rpc.NewClient(nc)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -85,7 +91,7 @@ func (t *transport) client(ctx context.Context, to string) (*rpc.Client, error) 
 	return c, nil
 }
 
-func (t *transport) drop(to string, c *rpc.Client) {
+func (t *transport) drop(to conn, c *rpc.Client) {
 	t.mu.Lock()
 	if t.clients[to] == c {
 		delete(t.clients, to)
