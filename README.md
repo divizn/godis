@@ -98,7 +98,7 @@ Raft is tested deterministically with `testing/synctest` on an in-memory network
 - No snapshots or log compaction: the log, memory and restart replay grow with all history.
 - No client dedupe: a write that timed out may still commit, and a retry applies it again.
 - One heartbeat round per read; concurrent reads are not batched.
-- Heartbeats to a peer stall while a big AppendEntries to it is in flight.
+- A follower holds the Raft mutex across the fsync of a big append, so a heartbeat arriving meanwhile waits for it.
 - A corrupt log is not repaired: wipe that node's data dir by hand and let it catch up.
 - No membership changes: the cluster is fixed at startup.
 - No pre-vote, so a node rejoining after a partition bumps the term and forces an election.
