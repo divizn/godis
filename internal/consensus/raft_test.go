@@ -706,6 +706,87 @@ func TestIdleClusterNeverStepsDown(t *testing.T) {
 	})
 }
 
+func TestSlowAppendDoesNotCauseElection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+
+		leader, term := c.waitLeader()
+		c.mustPropose(leader, "a")
+		c.waitApplied("a")
+		c.net.setSlowAppend(3 * testElection)
+
+		sameTerm := func() {
+			t.Helper()
+			for _, id := range c.ids {
+				if s := c.node(id).Status(); s.Term != term {
+					t.Fatalf("%s moved from term %d to %d while an append was slow", id, term, s.Term)
+				}
+			}
+		}
+		errs := make(chan error, 1)
+		go func() { errs <- c.propose(leader, "b", 10*time.Second) }()
+		for len(errs) == 0 {
+			sameTerm()
+			time.Sleep(testElection / 10)
+		}
+		if err := <-errs; err != nil {
+			t.Fatalf("propose with slow appends: %v", err)
+		}
+		c.waitApplied("b")
+		sameTerm()
+		if n := c.net.leaderTerms(); n != 1 {
+			t.Fatalf("saw leaders in %d terms, want 1", n)
+		}
+	})
+}
+
+func TestHeartbeatDoesNotCommitStaleEntries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 5)
+		defer c.stopAll()
+
+		old, _ := c.waitLeader()
+		c.mustPropose(old, "a")
+		c.waitApplied("a")
+		shared := c.node(old).Status().CommitIndex
+		others := slices.DeleteFunc(slices.Clone(c.ids), func(id string) bool { return id == old })
+		c.net.partition([]string{old}, others)
+		proposeIsolated(t, c, old, "x1", "x2", "x3")
+		// stopped before it campaigns, so it rejoins in its old term without disrupting the new leader
+		c.stop(old)
+
+		leader, term := c.waitLeader(others...)
+		for _, cmd := range []string{"b", "c", "d"} {
+			c.mustPropose(leader, cmd)
+		}
+		c.net.heal()
+		c.net.setSlowAppend(time.Hour)
+		c.start(old)
+
+		waitFor(t, 10*time.Second, old+" to follow the new leader", func() bool {
+			s := c.node(old).Status()
+			return s.Term == term && s.Leader == leader
+		})
+		for range 50 {
+			time.Sleep(testElection / 10)
+			s := c.node(old).Status()
+			if s.Term != term || s.Leader != leader {
+				t.Fatalf("%s left leader %s of term %d for %q in term %d while only heartbeats reached it", old, leader, term, s.Leader, s.Term)
+			}
+			if s.CommitIndex > shared {
+				t.Fatalf("%s committed up to %d through heartbeats, past its last entry %d shared with the leader", old, s.CommitIndex, shared)
+			}
+		}
+
+		c.net.setSlowAppend(0)
+		c.waitApplied("d", old)
+		if got, want := cmds(c.checkSame()), []string{"a", "b", "c", "d"}; !slices.Equal(got, want) {
+			t.Fatalf("applied %v, want %v", got, want)
+		}
+	})
+}
+
 func TestStaleTermAppendReplyIsIgnored(t *testing.T) {
 	n := &Node{
 		id:         "a",

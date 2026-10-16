@@ -25,6 +25,8 @@ type memNet struct {
 	group map[string]int
 	drop  float64
 	delay time.Duration
+	// slowAppend delays every AppendEntries that carries entries
+	slowAppend time.Duration
 
 	leaders   map[uint64]string
 	violation string
@@ -52,6 +54,12 @@ func (m *memNet) setFaults(drop float64, delay time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.drop, m.delay = drop, delay
+}
+
+func (m *memNet) setSlowAppend(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.slowAppend = d
 }
 
 func (m *memNet) register(id string, n *Node) {
@@ -136,6 +144,16 @@ func (t memTransport) RequestVote(ctx context.Context, to string, args RequestVo
 func (t memTransport) AppendEntries(ctx context.Context, to string, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	t.net.sawLeader(args.Term, args.Leader)
 	t.net.sawBatch(args.Entries)
+	t.net.mu.Lock()
+	slow := t.net.slowAppend
+	t.net.mu.Unlock()
+	if len(args.Entries) > 0 && slow > 0 {
+		select {
+		case <-time.After(slow):
+		case <-ctx.Done():
+			return AppendEntriesReply{}, ctx.Err()
+		}
+	}
 	n, err := t.net.hop(ctx, t.from, to)
 	if err != nil {
 		return AppendEntriesReply{}, err

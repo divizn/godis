@@ -225,6 +225,7 @@ func New(cfg Config) (*Node, error) {
 		ch := make(chan struct{}, 1)
 		n.wake[p] = ch
 		n.wg.Go(func() { n.replicate(p, ch) })
+		n.wg.Go(func() { n.heartbeats(p) })
 	}
 	return n, nil
 }
@@ -611,23 +612,21 @@ func (n *Node) advanceCommit() {
 	}
 }
 
+// replicate sends entries to peer when woken, by a proposal, a new leadership, its own follow-up or a heartbeat reply from a lagging peer
 func (n *Node) replicate(peer string, wake chan struct{}) {
-	t := time.NewTicker(n.heartbeat)
-	defer t.Stop()
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
-		case <-t.C:
 		case <-wake:
 		}
 
 		n.mu.Lock()
-		if n.ctx.Err() != nil || n.role != Leader {
+		next := n.nextIndex[peer]
+		if n.ctx.Err() != nil || n.role != Leader || next > n.lastIndex() {
 			n.mu.Unlock()
 			continue
 		}
-		next := n.nextIndex[peer]
 		args := AppendEntriesArgs{
 			Term:         n.term,
 			Leader:       n.id,
@@ -635,6 +634,46 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 			PrevLogTerm:  n.log[next-1].Term,
 			Entries:      slices.Clone(n.batch(next)),
 			LeaderCommit: n.commitIndex,
+		}
+		n.mu.Unlock()
+
+		// ponytail: fixed timeout so a big batch can finish transferring and syncing; scale it with batch bytes if peers get slower
+		ctx, cancel := context.WithTimeout(n.ctx, 10*n.election)
+		reply, err := n.tr.AppendEntries(ctx, peer, args)
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		n.mu.Lock()
+		n.handleAppendReply(peer, args, reply)
+		n.mu.Unlock()
+	}
+}
+
+// heartbeats sends an empty AppendEntries to peer every heartbeat interval, whatever replicate is doing
+func (n *Node) heartbeats(peer string) {
+	t := time.NewTicker(n.heartbeat)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		n.mu.Lock()
+		if n.ctx.Err() != nil || n.role != Leader {
+			n.mu.Unlock()
+			continue
+		}
+		match := n.matchIndex[peer]
+		args := AppendEntriesArgs{
+			Term:         n.term,
+			Leader:       n.id,
+			PrevLogIndex: match,
+			PrevLogTerm:  n.log[match].Term,
+			LeaderCommit: min(match, n.commitIndex),
 		}
 		n.mu.Unlock()
 
@@ -646,7 +685,9 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 		}
 
 		n.mu.Lock()
-		n.handleAppendReply(peer, args, reply)
+		if n.recordReply(peer, args, reply) && n.matchIndex[peer] < n.lastIndex() {
+			n.wakeup(peer)
+		}
 		n.mu.Unlock()
 	}
 }
@@ -664,19 +705,27 @@ func (n *Node) batch(next uint64) []Entry {
 	return n.log[next:end]
 }
 
-func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply AppendEntriesReply) {
+// recordReply steps down on a higher term and records contact, reporting whether the reply answers this leadership; mu must be held
+func (n *Node) recordReply(peer string, args AppendEntriesArgs, reply AppendEntriesReply) bool {
 	if n.ctx.Err() != nil {
-		return
+		return false
 	}
 	if reply.Term > n.term {
 		if err := n.becomeFollower(reply.Term); err != nil {
-			return
+			return false
 		}
 	}
 	if n.role != Leader || n.term != args.Term {
-		return
+		return false
 	}
 	n.contact[peer] = time.Now()
+	return true
+}
+
+func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply AppendEntriesReply) {
+	if !n.recordReply(peer, args, reply) {
+		return
+	}
 	if reply.Success {
 		match := args.PrevLogIndex + uint64(len(args.Entries))
 		if match > n.matchIndex[peer] {
