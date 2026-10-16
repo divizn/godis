@@ -102,4 +102,3 @@ Raft is tested deterministically with `testing/synctest` on an in-memory network
 - A corrupt log is not repaired: wipe that node's data dir by hand and let it catch up.
 - No membership changes: the cluster is fixed at startup.
 - No pre-vote, so a node rejoining after a partition bumps the term and forces an election.
-- The compose file has no restart policy.
