@@ -705,3 +705,24 @@ func TestIdleClusterNeverStepsDown(t *testing.T) {
 		}
 	})
 }
+
+func TestStaleTermAppendReplyIsIgnored(t *testing.T) {
+	n := &Node{
+		id:         "a",
+		peers:      []string{"b", "c"},
+		ctx:        context.Background(),
+		role:       Leader,
+		term:       4,
+		log:        []Entry{{}, {Term: 1}, {Term: 2, Cmd: []byte("x")}, {Term: 4}},
+		nextIndex:  map[string]uint64{"b": 4, "c": 4},
+		matchIndex: map[string]uint64{},
+		contact:    map[string]time.Time{},
+	}
+	n.applyCond = sync.NewCond(&n.mu)
+
+	args := AppendEntriesArgs{Term: 2, Leader: "a", Entries: []Entry{{Term: 1}, {Term: 2, Cmd: []byte("x")}, {Term: 2}}}
+	n.handleAppendReply("b", args, AppendEntriesReply{Term: 2, Success: true})
+	if n.matchIndex["b"] != 0 || n.commitIndex != 0 {
+		t.Fatalf("a term 2 reply moved the term 4 leader to matchIndex %d, commitIndex %d; want 0, 0", n.matchIndex["b"], n.commitIndex)
+	}
+}
