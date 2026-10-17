@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/divizn/godis/internal/storage"
 )
 
 const (
@@ -21,8 +23,11 @@ var errUnreachable = errors.New("unreachable")
 
 type memNet struct {
 	mu    sync.Mutex
+	rng   *rand.Rand
 	nodes map[string]*Node
 	group map[string]int
+	// deaf receives nothing, though what it sends arrives
+	deaf  string
 	drop  float64
 	delay time.Duration
 	// slowAppend delays every AppendEntries that carries entries
@@ -33,14 +38,15 @@ type memNet struct {
 	oversized string
 }
 
-func newMemNet() *memNet {
-	return &memNet{nodes: map[string]*Node{}, group: map[string]int{}, leaders: map[uint64]string{}}
+func newMemNet(seed uint64) *memNet {
+	return &memNet{rng: rand.New(rand.NewPCG(seed, seed)), nodes: map[string]*Node{}, group: map[string]int{}, leaders: map[uint64]string{}}
 }
 
 func (m *memNet) partition(groups ...[]string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	clear(m.group)
+	m.deaf = ""
 	for g, ids := range groups {
 		for _, id := range ids {
 			m.group[id] = g + 1
@@ -49,6 +55,12 @@ func (m *memNet) partition(groups ...[]string) {
 }
 
 func (m *memNet) heal() { m.partition() }
+
+func (m *memNet) deafen(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deaf = id
+}
 
 func (m *memNet) setFaults(drop float64, delay time.Duration) {
 	m.mu.Lock()
@@ -75,10 +87,10 @@ func (m *memNet) register(id string, n *Node) {
 func (m *memNet) hop(ctx context.Context, from, to string) (*Node, error) {
 	m.mu.Lock()
 	n := m.nodes[to]
-	ok := n != nil && m.group[from] == m.group[to] && (m.drop == 0 || rand.Float64() >= m.drop)
+	ok := n != nil && m.group[from] == m.group[to] && to != m.deaf && (m.drop == 0 || m.rng.Float64() >= m.drop)
 	var d time.Duration
 	if m.delay > 0 {
-		d = rand.N(m.delay)
+		d = time.Duration(m.rng.Int64N(int64(m.delay)))
 	}
 	m.mu.Unlock()
 	if !ok {
@@ -175,7 +187,9 @@ type applied struct {
 
 type applyLog struct {
 	// gate holds back applying the command "slow" until closed
-	gate    chan struct{}
+	gate chan struct{}
+	// store, if set, also applies every command as a storage command
+	store   *storage.Store
 	mu      sync.Mutex
 	entries []applied
 }
@@ -183,6 +197,11 @@ type applyLog struct {
 func (a *applyLog) apply(index uint64, cmd []byte) {
 	if string(cmd) == "slow" {
 		<-a.gate
+	}
+	if a.store != nil {
+		if err := a.store.Apply(cmd); err != nil {
+			panic(fmt.Sprintf("apply %d: %v", index, err))
+		}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -214,6 +233,8 @@ type cluster struct {
 	changes map[string][]leaderChange
 
 	attempt int
+	// kv gives each node incarnation a storage.Store fed by its applied commands
+	kv bool
 }
 
 type leaderChange struct {
@@ -223,9 +244,18 @@ type leaderChange struct {
 
 func newCluster(t *testing.T, size int) *cluster {
 	t.Helper()
+	c := newStoppedCluster(t, size, rand.Uint64())
+	for _, id := range c.ids {
+		c.start(id)
+	}
+	return c
+}
+
+// newStoppedCluster creates a cluster with its network seeded but no node started
+func newStoppedCluster(t *testing.T, size int, seed uint64) *cluster {
 	c := &cluster{
 		t:     t,
-		net:   newMemNet(),
+		net:   newMemNet(seed),
 		root:  t.TempDir(),
 		nodes: map[string]*Node{},
 		logs:  map[string]*applyLog{},
@@ -237,15 +267,15 @@ func newCluster(t *testing.T, size int) *cluster {
 	for i := range size {
 		c.ids = append(c.ids, fmt.Sprintf("n%d", i+1))
 	}
-	for _, id := range c.ids {
-		c.start(id)
-	}
 	return c
 }
 
 func (c *cluster) start(id string) {
 	c.t.Helper()
 	al := &applyLog{gate: c.gate}
+	if c.kv {
+		al.store = storage.New()
+	}
 	n, err := New(Config{
 		ID:                id,
 		Peers:             c.ids,

@@ -48,7 +48,7 @@ func singleNode(t *testing.T, dir string) *Node {
 		ID:                "a",
 		Peers:             []string{"a", "b", "c"},
 		Dir:               dir,
-		Transport:         memTransport{net: newMemNet(), from: "a"},
+		Transport:         memTransport{net: newMemNet(1), from: "a"},
 		Apply:             func(uint64, []byte) {},
 		ElectionTimeout:   time.Hour,
 		HeartbeatInterval: time.Minute,
@@ -890,7 +890,7 @@ func TestLogWithGapFailsNew(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := New(Config{ID: "a", Peers: []string{"a"}, Dir: dir, Transport: memTransport{net: newMemNet(), from: "a"}, Apply: func(uint64, []byte) {}})
+	n, err := New(Config{ID: "a", Peers: []string{"a"}, Dir: dir, Transport: memTransport{net: newMemNet(1), from: "a"}, Apply: func(uint64, []byte) {}})
 	if err == nil {
 		mustStop(t, n)
 		t.Fatal("new on a log missing entry 2: want error")

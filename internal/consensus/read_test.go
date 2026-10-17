@@ -52,7 +52,7 @@ func TestReadIndexWaitsForApply(t *testing.T) {
 			ID:        "a",
 			Peers:     []string{"a"},
 			Dir:       t.TempDir(),
-			Transport: memTransport{net: newMemNet(), from: "a"},
+			Transport: memTransport{net: newMemNet(1), from: "a"},
 			Apply: func(_ uint64, cmd []byte) {
 				if string(cmd) == "slow" {
 					<-release
