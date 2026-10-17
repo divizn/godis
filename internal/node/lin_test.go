@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/divizn/godis/internal/consensus"
 	"github.com/divizn/godis/internal/lincheck"
 	"github.com/divizn/godis/internal/network"
 )
@@ -51,7 +52,11 @@ func TestLinearizableAcrossRestarts(t *testing.T) {
 				c.start(p.ID)
 			}
 		case r == 1:
-			down = c.leader()
+			for id, n := range c.nodes {
+				if n.Status().Role == consensus.Leader {
+					down = id
+				}
+			}
 		default:
 			down = c.peers[rand.IntN(len(c.peers))].ID
 		}
