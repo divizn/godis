@@ -27,7 +27,7 @@ Followers never serve reads or writes; they answer REDIRECT with the leader's cl
 - Linearizable writes and reads, from the leader only.
 - A write is acked only once it is fsynced on a majority and applied on the leader.
 - Leader loss: the remaining majority elects a new leader within one to two election timeouts (1s by default) and the client retries through the redirect. A write that timed out may still have committed, and a retry applies it twice (no dedupe).
-- A leader that hasn't heard from a majority for an election timeout steps down, and its pending writes and reads fail with a redirect instead of timing out.
+- A leader that hasn't heard from a majority for an election timeout steps down instead of timing out its pending requests. Pending reads get a redirect. Pending writes get an error, not a redirect: a write already in the log may still commit, and a redirected client would send it again.
 - A node that can no longer persist its log or term halts and the process exits non-zero, rather than serve from a state it can't make durable.
 
 ## Running it
@@ -93,10 +93,25 @@ go test -race -count=20 ./internal/consensus/   # flake check for the Raft tests
 
 Raft is tested deterministically with `testing/synctest` on an in-memory network with partitions, drops and delays; `internal/node` runs real loopback clusters.
 
+### Linearizability
+
+`internal/lincheck` is a hand-written linearizability checker: Wing and Gong's search with Lowe's memoization, each key checked as its own register, writes with an unknown outcome allowed to take effect at any point after their call or never. Every test run cross-checks its verdicts against a brute-force search on 20,000 random small histories.
+
+`TestLinearizable` in `internal/consensus` runs 3 or 5 Raft nodes, each feeding a real `storage.Store`, on the in-memory network: 4 clients over 3 keys for 30 to 60 fake seconds, while a seeded nemesis partitions the cluster, deafens the leader (it sends but hears nothing), stops and restarts single nodes or the whole cluster, drops and delays messages, and holds back appends that carry entries. Each run's history goes through the checker, every write must apply at most once, and the usual invariants hold (one leader per term, every node applied a prefix of the same log).
+
+```sh
+go test -run TestLinearizable ./internal/consensus/ -lin.runs=500   # 3 runs by default
+go test -run TestLinearizable ./internal/consensus/ -lin.seed=N     # replay a failing run's fault schedule
+```
+
+On 2026-10-17, 2000 runs passed with no failures, about 265,000 operations and 56,000 leader terms in 75 minutes. The fuzz catches the bugs it exists for: with reads served from the commit index instead of a read index confirmed in the leader's term, 13 of 15 runs fail; with a step-down answered by a redirect (the client resends a logged write), 13 of 15 runs apply a write twice; with followers acking before they persist, every run fails.
+
+A seed reproduces the fault schedule, not every goroutine interleaving (synctest fixes time, not scheduling), so a replay usually but not always fails the same way. `TestLinearizableAcrossRestarts` in `internal/node` checks the real stack the same way (TCP client with its redirects, net/rpc, fsync) for 15 seconds while nodes, the leader included, are stopped and restarted; it is skipped under `-short`.
+
 ## Limitations
 
 - No snapshots or log compaction: the log, memory and restart replay grow with all history.
-- No client dedupe: a write that timed out may still commit, and a retry applies it again.
+- No client dedupe: a write that timed out, or failed because its leader stepped down, may still commit, and a retry applies it again.
 - One heartbeat round per read; concurrent reads are not batched.
 - A follower holds the Raft mutex across the fsync of a big append, so a heartbeat arriving meanwhile waits for it.
 - A corrupt log is not repaired: wipe that node's data dir by hand and let it catch up.
