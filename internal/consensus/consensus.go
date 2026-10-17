@@ -30,9 +30,11 @@ var (
 	ErrEmptyCommand    = errors.New("consensus: empty command")
 	ErrNoQuorum        = errors.New("consensus: leadership not confirmed by a majority")
 	ErrCommandTooLarge = errors.New("consensus: command too large for one log record")
+	// ErrLeadershipLost fails a proposal already in the log when its leader steps down: it may still commit.
+	ErrLeadershipLost = errors.New("consensus: leadership lost, outcome unknown")
 )
 
-// NotLeaderError carries the current leader's id, empty if unknown.
+// NotLeaderError carries the current leader's id, empty if unknown. Propose returns it only for a command it never logged.
 type NotLeaderError struct {
 	Leader string
 }
@@ -513,7 +515,7 @@ func (n *Node) checkQuorum() {
 	}
 	n.leader = ""
 	for i, done := range n.waiters {
-		done <- &NotLeaderError{}
+		done <- ErrLeadershipLost
 		delete(n.waiters, i)
 	}
 	close(n.applied)

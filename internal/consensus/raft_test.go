@@ -271,9 +271,8 @@ func TestLeaderWithoutQuorumStopsCommitting(t *testing.T) {
 			t.Fatalf("new leader term %d, want > %d", newTerm, term)
 		}
 		c.mustPropose(id, "majority")
-		var nle *NotLeaderError
-		if err := <-minority; !errors.As(err, &nle) {
-			t.Fatalf("propose on leader without quorum: got %v, want *NotLeaderError", err)
+		if err := <-minority; !errors.Is(err, ErrLeadershipLost) {
+			t.Fatalf("propose on leader without quorum: got %v, want ErrLeadershipLost", err)
 		}
 
 		c.net.heal()
@@ -647,23 +646,30 @@ func TestIsolatedLeaderStepsDown(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		errs := make(chan error, 3)
-		go func() { errs <- n.Propose(ctx, []byte("slow")) }()
+		writes := make(chan error, 2)
+		reads := make(chan error, 1)
+		go func() { writes <- n.Propose(ctx, []byte("slow")) }()
 		waitFor(t, 10*time.Second, "slow to commit", func() bool { return n.Status().CommitIndex > commit })
-		go func() { errs <- n.ReadIndex(ctx) }()
+		go func() { reads <- n.ReadIndex(ctx) }()
 		synctest.Wait()
 
 		start := time.Now()
 		c.net.partition([]string{leader}, slices.DeleteFunc(slices.Clone(c.ids), func(id string) bool { return id == leader }))
-		go func() { errs <- n.Propose(ctx, []byte("p")) }()
-		for range 3 {
-			var nle *NotLeaderError
-			if err := <-errs; !errors.As(err, &nle) || nle.Leader != "" {
-				t.Fatalf("call waiting on an isolated leader: got %v, want NotLeaderError with no leader", err)
+		go func() { writes <- n.Propose(ctx, []byte("p")) }()
+		for range 2 {
+			if err := <-writes; !errors.Is(err, ErrLeadershipLost) {
+				t.Fatalf("write waiting on an isolated leader: got %v, want ErrLeadershipLost", err)
 			}
-			if d := time.Since(start); d > 2*testElection {
-				t.Fatalf("call waiting on an isolated leader failed after %v, want within %v", d, 2*testElection)
-			}
+		}
+		var nle *NotLeaderError
+		if err := <-reads; !errors.As(err, &nle) || nle.Leader != "" {
+			t.Fatalf("read waiting on an isolated leader: got %v, want NotLeaderError with no leader", err)
+		}
+		if d := time.Since(start); d > 2*testElection {
+			t.Fatalf("calls waiting on an isolated leader failed after %v, want within %v", d, 2*testElection)
+		}
+		if err := n.Propose(ctx, []byte("q")); !errors.As(err, &nle) || nle.Leader != "" {
+			t.Fatalf("write on a stepped-down leader: got %v, want NotLeaderError with no leader", err)
 		}
 		if s := n.Status(); s.Role == Leader || s.Leader != "" {
 			t.Fatalf("isolated leader is %v with leader %q, want no leader", s.Role, s.Leader)

@@ -1,6 +1,7 @@
 package node
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -299,5 +300,16 @@ func TestMaxSizeValuesCommitWithoutElection(t *testing.T) {
 	}
 	if s := c.nodes[leader].Status(); s.Role != consensus.Leader || s.Term != term {
 		t.Fatalf("leader %s moved from term %d to %v in term %d", leader, term, s.Role, s.Term)
+	}
+}
+
+func TestOnlyUnloggedWritesAreRedirected(t *testing.T) {
+	s := kvStore{clientAddrs: map[string]string{"node-2": "addr-2"}}
+	var re *network.RedirectError
+	if err := s.redirect(fmt.Errorf("propose: %w", &consensus.NotLeaderError{Leader: "node-2"})); !errors.As(err, &re) || re.Addr != "addr-2" {
+		t.Fatalf("not the leader: got %v, want a redirect to addr-2", err)
+	}
+	if err := s.redirect(fmt.Errorf("propose: %w", consensus.ErrLeadershipLost)); errors.As(err, &re) || !errors.Is(err, consensus.ErrLeadershipLost) {
+		t.Fatalf("leadership lost with the write logged: got %v, want an error the client does not retry", err)
 	}
 }
