@@ -463,7 +463,7 @@ func (c *cluster) shutdown(id string, crashed bool) {
 		return
 	}
 	c.net.register(id, nil)
-	if err := n.Stop(); err != nil && !(crashed && errors.Is(err, vfs.ErrFrozen)) {
+	if err := n.Stop(); err != nil && (!crashed || !errors.Is(err, vfs.ErrFrozen)) {
 		c.t.Errorf("stop %s: %v", id, err)
 	}
 }
