@@ -49,7 +49,7 @@ func singleNode(t *testing.T, dir string) *Node {
 		Peers:             []string{"a", "b", "c"},
 		Dir:               dir,
 		Transport:         memTransport{net: newMemNet(1), from: "a"},
-		Apply:             func(uint64, []byte) {},
+		Apply:             func(uint64, []byte) []byte { return nil },
 		ElectionTimeout:   time.Hour,
 		HeartbeatInterval: time.Minute,
 	})
@@ -203,7 +203,7 @@ func TestVotesFromAnEarlierElectionAreNotCounted(t *testing.T) {
 			Peers:             []string{"a", "b", "c"},
 			Dir:               t.TempDir(),
 			Transport:         tr,
-			Apply:             func(uint64, []byte) {},
+			Apply:             func(uint64, []byte) []byte { return nil },
 			ElectionTimeout:   time.Hour,
 			HeartbeatInterval: time.Minute,
 		})
@@ -563,7 +563,7 @@ func TestProposeRejectsCommandTooLargeForTheLog(t *testing.T) {
 		leader, _ := c.waitLeader()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := c.node(leader).Propose(ctx, make([]byte, wal.MaxRecordSize)); !errors.Is(err, ErrCommandTooLarge) {
+		if _, err := c.node(leader).Propose(ctx, make([]byte, wal.MaxRecordSize)); !errors.Is(err, ErrCommandTooLarge) {
 			t.Fatalf("propose %d bytes: got %v, want ErrCommandTooLarge", wal.MaxRecordSize, err)
 		}
 		c.mustPropose(leader, "still serving")
@@ -603,6 +603,28 @@ func TestLeaderChangeHook(t *testing.T) {
 	})
 }
 
+func TestProposeReturnsItsOwnResult(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+		leader, _ := c.waitLeader()
+		n := c.node(leader)
+		var wg sync.WaitGroup
+		for i := range 50 {
+			wg.Go(func() {
+				cmd := fmt.Sprint("p", i)
+				res, err := n.Propose(context.Background(), []byte(cmd))
+				if err != nil {
+					t.Errorf("propose %s: %v", cmd, err)
+				} else if string(res) != "applied "+cmd {
+					t.Errorf("propose %s returned %q, want the result of applying it", cmd, res)
+				}
+			})
+		}
+		wg.Wait()
+	})
+}
+
 func TestOverwrittenProposalIsDropped(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		tr := heldVotes{release: make(chan struct{})}
@@ -612,7 +634,7 @@ func TestOverwrittenProposalIsDropped(t *testing.T) {
 			Peers:             []string{"a", "b", "c"},
 			Dir:               t.TempDir(),
 			Transport:         tr,
-			Apply:             func(uint64, []byte) {},
+			Apply:             func(uint64, []byte) []byte { return nil },
 			ElectionTimeout:   time.Hour,
 			HeartbeatInterval: time.Minute,
 		})
@@ -628,7 +650,7 @@ func TestOverwrittenProposalIsDropped(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		proposed := make(chan error, 1)
-		go func() { proposed <- n.Propose(ctx, []byte("x")) }()
+		go func() { _, err := n.Propose(ctx, []byte("x")); proposed <- err }()
 		synctest.Wait()
 		appendEntries(t, n, AppendEntriesArgs{Term: 2, Leader: "b", PrevLogIndex: 1, PrevLogTerm: 1, Entries: entries(2, "y")})
 		if err := <-proposed; !errors.Is(err, ErrProposalDropped) {
@@ -652,14 +674,14 @@ func TestIsolatedLeaderStepsDown(t *testing.T) {
 		defer cancel()
 		writes := make(chan error, 2)
 		reads := make(chan error, 1)
-		go func() { writes <- n.Propose(ctx, []byte("slow")) }()
+		go func() { _, err := n.Propose(ctx, []byte("slow")); writes <- err }()
 		waitFor(t, 10*time.Second, "slow to commit", func() bool { return n.Status().CommitIndex > commit })
 		go func() { reads <- n.ReadIndex(ctx) }()
 		synctest.Wait()
 
 		start := time.Now()
 		c.net.partition([]string{leader}, slices.DeleteFunc(slices.Clone(c.ids), func(id string) bool { return id == leader }))
-		go func() { writes <- n.Propose(ctx, []byte("p")) }()
+		go func() { _, err := n.Propose(ctx, []byte("p")); writes <- err }()
 		for range 2 {
 			if err := <-writes; !errors.Is(err, ErrLeadershipLost) {
 				t.Fatalf("write waiting on an isolated leader: got %v, want ErrLeadershipLost", err)
@@ -672,7 +694,7 @@ func TestIsolatedLeaderStepsDown(t *testing.T) {
 		if d := time.Since(start); d > 2*testElection {
 			t.Fatalf("calls waiting on an isolated leader failed after %v, want within %v", d, 2*testElection)
 		}
-		if err := n.Propose(ctx, []byte("q")); !errors.As(err, &nle) || nle.Leader != "" {
+		if _, err := n.Propose(ctx, []byte("q")); !errors.As(err, &nle) || nle.Leader != "" {
 			t.Fatalf("write on a stepped-down leader: got %v, want NotLeaderError with no leader", err)
 		}
 		if s := n.Status(); s.Role == Leader || s.Leader != "" {
@@ -900,7 +922,7 @@ func TestLogWithGapFailsNew(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := New(Config{ID: "a", Peers: []string{"a"}, Dir: dir, Transport: memTransport{net: newMemNet(1), from: "a"}, Apply: func(uint64, []byte) {}})
+	n, err := New(Config{ID: "a", Peers: []string{"a"}, Dir: dir, Transport: memTransport{net: newMemNet(1), from: "a"}, Apply: func(uint64, []byte) []byte { return nil }})
 	if err == nil {
 		mustStop(t, n)
 		t.Fatal("new on a log missing entry 2: want error")
@@ -936,7 +958,7 @@ func TestHigherTermAppendReplyStepsLeaderDown(t *testing.T) {
 					Peers:             []string{"a", "b", "c"},
 					Dir:               t.TempDir(),
 					Transport:         higherTerm{withEntries: withEntries},
-					Apply:             func(uint64, []byte) {},
+					Apply:             func(uint64, []byte) []byte { return nil },
 					ElectionTimeout:   testElection,
 					HeartbeatInterval: testHeartbeat,
 				})

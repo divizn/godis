@@ -291,19 +291,22 @@ func (a *applyLog) applyCalls() []uint64 {
 	return slices.Clone(a.calls)
 }
 
-func (a *applyLog) apply(index uint64, cmd []byte) {
+func (a *applyLog) apply(index uint64, cmd []byte) []byte {
 	if string(cmd) == "slow" {
 		<-a.gate
 	}
+	result := append([]byte("applied "), cmd...)
 	if a.store != nil {
 		if err := a.store.Apply(cmd); err != nil {
 			panic(fmt.Sprintf("apply %d: %v", index, err))
 		}
+		result = nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.entries = append(a.entries, applied{index, string(cmd)})
 	a.calls = append(a.calls, index)
+	return result
 }
 
 func (a *applyLog) snapshot() []applied {
@@ -499,7 +502,8 @@ func (c *cluster) propose(id, cmd string, timeout time.Duration) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return n.Propose(ctx, []byte(cmd))
+	_, err := n.Propose(ctx, []byte(cmd))
+	return err
 }
 
 func (c *cluster) mustPropose(id, cmd string) {

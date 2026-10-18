@@ -180,7 +180,7 @@ func linClient(c *cluster, rec *linRecorder, rng *rand.Rand, client int, end tim
 					op.Value, op.Found = string(v), ok
 				}
 			} else {
-				err = n.Propose(ctx, cmd)
+				_, err = n.Propose(ctx, cmd)
 			}
 			var nle *NotLeaderError
 			if err == nil || ctx.Err() != nil || n != nil && !errors.As(err, &nle) {

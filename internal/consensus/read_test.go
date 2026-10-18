@@ -53,10 +53,11 @@ func TestReadIndexWaitsForApply(t *testing.T) {
 			Peers:     []string{"a"},
 			Dir:       t.TempDir(),
 			Transport: memTransport{net: newMemNet(1), from: "a"},
-			Apply: func(_ uint64, cmd []byte) {
+			Apply: func(_ uint64, cmd []byte) []byte {
 				if string(cmd) == "slow" {
 					<-release
 				}
+				return nil
 			},
 			ElectionTimeout:   testElection,
 			HeartbeatInterval: testHeartbeat,
@@ -75,7 +76,7 @@ func TestReadIndexWaitsForApply(t *testing.T) {
 
 		waitFor(t, 10*time.Second, "leader", func() bool { return n.Status().Role == Leader })
 		proposed := make(chan error, 1)
-		go func() { proposed <- n.Propose(context.Background(), []byte("slow")) }()
+		go func() { _, err := n.Propose(context.Background(), []byte("slow")); proposed <- err }()
 		waitFor(t, 10*time.Second, "slow to commit", func() bool { return n.Status().CommitIndex >= 2 })
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

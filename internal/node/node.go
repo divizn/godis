@@ -94,10 +94,11 @@ func start(cfg Config) (*Node, error) {
 
 		ElectionTimeout:   election,
 		HeartbeatInterval: election / 10,
-		Apply: func(index uint64, cmd []byte) {
+		Apply: func(index uint64, cmd []byte) []byte {
 			if err := store.Apply(cmd); err != nil {
 				panic(fmt.Sprintf("apply committed command %d: %v", index, err))
 			}
+			return nil
 		},
 		Snapshot:        store.Snapshot,
 		Restore:         store.Restore,
@@ -222,7 +223,7 @@ func (s kvStore) get(key string) ([]byte, bool, error) {
 func (s kvStore) propose(cmd []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	if err := s.raft.Propose(ctx, cmd); err != nil {
+	if _, err := s.raft.Propose(ctx, cmd); err != nil {
 		return s.redirect(fmt.Errorf("propose: %w", err))
 	}
 	return nil

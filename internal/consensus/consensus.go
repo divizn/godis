@@ -129,7 +129,8 @@ type Config struct {
 	Dir       string
 	Transport Transport
 	// Apply gets committed commands in order, once per process lifetime: after a restart, every command after the snapshot again.
-	Apply func(index uint64, cmd []byte)
+	// Its result is opaque to Raft: Propose returns it on the leader, followers drop it.
+	Apply func(index uint64, cmd []byte) []byte
 	// Snapshot encodes the state machine as of the last command applied; it is never called during Apply.
 	// Snapshot and Restore are set together; with neither, the log is never compacted.
 	Snapshot func() []byte
@@ -160,7 +161,7 @@ type Node struct {
 	peers          []string
 	dir            string
 	tr             Transport
-	apply          func(uint64, []byte)
+	apply          func(uint64, []byte) []byte
 	snapshot       func() []byte
 	restore        func([]byte) error
 	snapEntries    uint64
@@ -192,7 +193,7 @@ type Node struct {
 	matchIndex  map[string]uint64
 	// contact is when the leader last had a reply in its term from each peer
 	contact map[string]time.Time
-	waiters map[uint64]chan error
+	waiters map[uint64]chan outcome
 	// applied is closed and replaced each time lastApplied advances or the node stops leading
 	applied chan struct{}
 	// pending is an installed snapshot the applier has yet to restore
@@ -264,7 +265,7 @@ func New(cfg Config) (*Node, error) {
 		snapIndex:      snapIndex,
 		commitIndex:    snapIndex,
 		lastApplied:    snapIndex,
-		waiters:        map[uint64]chan error{},
+		waiters:        map[uint64]chan outcome{},
 		applied:        make(chan struct{}),
 	}
 	n.wal, err = wal.Open(filepath.Join(cfg.Dir, "log"), n.replay)
@@ -306,47 +307,53 @@ func (n *Node) replay(rec []byte) error {
 	return nil
 }
 
-// Propose returns once cmd is committed and applied here; if ctx ends first it may still commit later.
-func (n *Node) Propose(ctx context.Context, cmd []byte) error {
+// outcome answers a waiting proposal with the result of applying its entry, or why it has none
+type outcome struct {
+	result []byte
+	err    error
+}
+
+// Propose returns the result of applying cmd once it is committed and applied here; if ctx ends first it may still commit later.
+func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	if len(cmd) == 0 {
-		return ErrEmptyCommand
+		return nil, ErrEmptyCommand
 	}
 	if len(cmd) > maxCommandSize {
-		return fmt.Errorf("%w: %d bytes, limit %d", ErrCommandTooLarge, len(cmd), maxCommandSize)
+		return nil, fmt.Errorf("%w: %d bytes, limit %d", ErrCommandTooLarge, len(cmd), maxCommandSize)
 	}
 	n.mu.Lock()
 	if n.ctx.Err() != nil {
 		n.mu.Unlock()
-		return context.Cause(n.ctx)
+		return nil, context.Cause(n.ctx)
 	}
 	if n.role != Leader {
 		leader := n.leader
 		n.mu.Unlock()
-		return &NotLeaderError{Leader: leader}
+		return nil, &NotLeaderError{Leader: leader}
 	}
 	idx := n.lastIndex() + 1
 	if err := n.appendLog(idx, []Entry{{Term: n.term, Cmd: slices.Clone(cmd)}}); err != nil {
 		n.mu.Unlock()
-		return err
+		return nil, err
 	}
-	done := make(chan error, 1)
+	done := make(chan outcome, 1)
 	n.waiters[idx] = done
 	n.advanceCommit()
 	n.wakeAll()
 	n.mu.Unlock()
 
 	select {
-	case err := <-done:
-		return err
+	case o := <-done:
+		return o.result, o.err
 	case <-ctx.Done():
 		n.mu.Lock()
 		if n.waiters[idx] == done {
 			delete(n.waiters, idx)
 		}
 		n.mu.Unlock()
-		return ctx.Err()
+		return nil, ctx.Err()
 	case <-n.ctx.Done():
-		return context.Cause(n.ctx)
+		return nil, context.Cause(n.ctx)
 	}
 }
 
@@ -499,7 +506,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) (InstallSnapshotR
 	if args.LastIndex > n.lastIndex() || n.termAt(args.LastIndex) != args.LastTerm {
 		for i, done := range n.waiters {
 			if i > args.LastIndex {
-				done <- ErrProposalDropped
+				done <- outcome{err: ErrProposalDropped}
 				delete(n.waiters, i)
 			}
 		}
@@ -580,7 +587,7 @@ func (n *Node) appendLog(start uint64, entries []Entry) error {
 	}
 	for i, done := range n.waiters {
 		if i >= start {
-			done <- ErrProposalDropped
+			done <- outcome{err: ErrProposalDropped}
 			delete(n.waiters, i)
 		}
 	}
@@ -654,7 +661,7 @@ func (n *Node) checkQuorum() {
 	}
 	n.leader = ""
 	for i, done := range n.waiters {
-		done <- ErrLeadershipLost
+		done <- outcome{err: ErrLeadershipLost}
 		delete(n.waiters, i)
 	}
 	close(n.applied)
@@ -953,33 +960,38 @@ func (n *Node) runApplier() {
 				return
 			}
 			n.lastApplied = p.LastIndex
-			n.notifyApplied(ErrLeadershipLost)
+			n.notifyApplied(0, nil, ErrLeadershipLost)
 			continue
 		}
 		start := n.lastApplied + 1
 		entries := slices.Clone(n.log[start-n.snapIndex : n.commitIndex-n.snapIndex+1])
+		results := make([][]byte, len(entries))
 		n.mu.Unlock()
 		for i, e := range entries {
 			if len(e.Cmd) > 0 {
-				n.apply(start+uint64(i), e.Cmd)
+				results[i] = n.apply(start+uint64(i), e.Cmd)
 			}
 		}
 		n.mu.Lock()
 		n.lastApplied = start + uint64(len(entries)) - 1
-		n.notifyApplied(nil)
+		n.notifyApplied(start, results, nil)
 		if n.snapshot != nil && n.pending == nil && n.lastApplied >= n.snapIndex+n.snapEntries {
 			n.takeSnapshot()
 		}
 	}
 }
 
-// notifyApplied wakes readers and answers the waiters up to lastApplied with err; mu must be held
-func (n *Node) notifyApplied(err error) {
+// notifyApplied wakes readers and answers the waiters up to lastApplied with err, or with results of the entries from start; mu must be held
+func (n *Node) notifyApplied(start uint64, results [][]byte, err error) {
 	close(n.applied)
 	n.applied = make(chan struct{})
 	for i, done := range n.waiters {
 		if i <= n.lastApplied {
-			done <- err
+			o := outcome{err: err}
+			if err == nil {
+				o.result = results[i-start]
+			}
+			done <- o
 			delete(n.waiters, i)
 		}
 	}
