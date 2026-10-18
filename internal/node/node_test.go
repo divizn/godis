@@ -23,6 +23,8 @@ type testCluster struct {
 	peers    []Peer
 	nodes    map[string]*Node
 	regs     map[string]*prometheus.Registry
+	// snapEntries is passed to every node started from now on, zero for the default
+	snapEntries uint64
 }
 
 func listen(t testing.TB, addr string) net.Listener {
@@ -69,7 +71,7 @@ func (c *testCluster) peer(id string) Peer {
 func (c *testCluster) startOn(id string, cl, rl net.Listener) {
 	c.t.Helper()
 	reg := prometheus.NewRegistry()
-	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election, Metrics: reg})
+	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election, Metrics: reg, SnapshotEntries: c.snapEntries})
 	if err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
@@ -244,6 +246,44 @@ func TestFullRestartKeepsData(t *testing.T) {
 		waitFor(t, fmt.Sprint("get k", i), func() error {
 			return c.via(c.peers[i%3].ID, get(t, fmt.Sprint("k", i), want, wantOK))
 		})
+	}
+}
+
+func TestFollowerCatchesUpBySnapshotOverTheWire(t *testing.T) {
+	c := newTestCluster(t, 3)
+	c.stopAll()
+	c.snapEntries = 5
+	for _, p := range c.peers {
+		c.start(p.ID)
+	}
+	leader := c.leader()
+	follower := c.other(leader)
+	c.stop(follower)
+	behind := c.nodes[leader].Status().CommitIndex
+	for i := range 30 {
+		if err := c.via(leader, set(fmt.Sprint("k", i%7), fmt.Sprint("v", i))); err != nil {
+			t.Fatalf("set %d: %v", i, err)
+		}
+	}
+	if s := c.nodes[leader].Status(); s.SnapshotIndex <= behind {
+		t.Fatalf("leader snapshot index %d, want past the stopped follower's %d", s.SnapshotIndex, behind)
+	}
+
+	c.start(follower)
+	store := c.nodes[follower].store
+	waitFor(t, follower+" to catch up", func() error {
+		for i := 23; i < 30; i++ {
+			if v, _ := store.Get(fmt.Sprint("k", i%7)); string(v) != fmt.Sprint("v", i) {
+				return fmt.Errorf("k%d = %q", i%7, v)
+			}
+		}
+		return nil
+	})
+	c.stop(leader)
+	for i := 23; i < 30; i++ {
+		if err := c.via(follower, get(t, fmt.Sprint("k", i%7), fmt.Sprint("v", i), true)); err != nil {
+			t.Fatalf("get k%d after the leader stopped: %v", i%7, err)
+		}
 	}
 }
 

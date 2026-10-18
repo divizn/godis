@@ -41,6 +41,14 @@ func (t *transport) AppendEntries(ctx context.Context, to string, args consensus
 	return *reply, nil
 }
 
+func (t *transport) InstallSnapshot(ctx context.Context, to string, args consensus.InstallSnapshotArgs) (consensus.InstallSnapshotReply, error) {
+	reply := new(consensus.InstallSnapshotReply)
+	if err := t.call(ctx, conn{peer: to, entries: true}, "Raft.InstallSnapshot", args, reply); err != nil {
+		return consensus.InstallSnapshotReply{}, err
+	}
+	return *reply, nil
+}
+
 // call must not touch reply after returning an error, since net/rpc may still decode into it
 func (t *transport) call(ctx context.Context, to conn, method string, args, reply any) error {
 	c, err := t.client(ctx, to)
@@ -121,5 +129,10 @@ func (s raftService) RequestVote(args consensus.RequestVoteArgs, reply *consensu
 
 func (s raftService) AppendEntries(args consensus.AppendEntriesArgs, reply *consensus.AppendEntriesReply) (err error) {
 	*reply, err = s.raft.HandleAppendEntries(args)
+	return err
+}
+
+func (s raftService) InstallSnapshot(args consensus.InstallSnapshotArgs, reply *consensus.InstallSnapshotReply) (err error) {
+	*reply, err = s.raft.HandleInstallSnapshot(args)
 	return err
 }

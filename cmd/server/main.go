@@ -28,6 +28,7 @@ func main() {
 	id := flag.String("id", "node-1", "node id")
 	dataDir := flag.String("data-dir", "data", "directory for the raft state and log")
 	election := flag.Duration("election-timeout", time.Second, "raft election timeout, randomized up to twice this; heartbeats are a tenth of it")
+	snapshotEntries := flag.Uint64("snapshot-entries", 10000, "applied log entries that trigger a snapshot and log compaction")
 	cluster := flag.String("cluster", "", "every member as id=raft-addr/client-addr, comma separated; empty means a cluster of one")
 	flag.Parse()
 
@@ -54,7 +55,7 @@ func main() {
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	n, err := node.Start(node.Config{ID: *id, Peers: peers, Dir: *dataDir, ClientListener: cl, RaftListener: rl, ElectionTimeout: *election, Metrics: reg})
+	n, err := node.Start(node.Config{ID: *id, Peers: peers, Dir: *dataDir, ClientListener: cl, RaftListener: rl, ElectionTimeout: *election, Metrics: reg, SnapshotEntries: *snapshotEntries})
 	if err != nil {
 		log.Fatalf("start node: %v", err)
 	}

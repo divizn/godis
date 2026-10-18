@@ -39,6 +39,8 @@ type Config struct {
 	ElectionTimeout time.Duration
 	// Metrics registers the node's metrics; nil means none.
 	Metrics prometheus.Registerer
+	// SnapshotEntries is how many applied entries trigger a snapshot, zero for the consensus default.
+	SnapshotEntries uint64
 }
 
 type Node struct {
@@ -97,7 +99,10 @@ func start(cfg Config) (*Node, error) {
 				panic(fmt.Sprintf("apply committed command %d: %v", index, err))
 			}
 		},
-		OnLeaderChange: func(uint64, string) { m.leaderChanges.Inc() },
+		Snapshot:        store.Snapshot,
+		Restore:         store.Restore,
+		SnapshotEntries: cfg.SnapshotEntries,
+		OnLeaderChange:  func(uint64, string) { m.leaderChanges.Inc() },
 	})
 	if err != nil {
 		return nil, fmt.Errorf("start raft: %w", err)
