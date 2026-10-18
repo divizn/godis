@@ -27,24 +27,24 @@ func TestTTLCommands(t *testing.T) {
 			t.Fatalf("%s: got %q, want %q", line, got, want)
 		}
 	}
-	wantMillis := func(line string, max int) {
+	wantMillis := func(line string, min, max int) {
 		t.Helper()
 		got := do(line)
 		n, err := strconv.Atoi(strings.TrimPrefix(got, "(integer) "))
-		if err != nil || n <= 0 || n > max {
-			t.Fatalf("%s: got %q, want an integer in (0, %d]", line, got, max)
+		if err != nil || n < min || n > max {
+			t.Fatalf("%s: got %q, want an integer in [%d, %d]", line, got, min, max)
 		}
 	}
 
 	want("SET k v PX 60000", "OK")
 	want("GET k", `"v"`)
-	wantMillis("PTTL k", 60000)
+	wantMillis("PTTL k", 50000, 60000)
 	want("set k w", "OK")
 	want("PTTL k", "(integer) -1")
 	want("PTTL missing", "(integer) -2")
 
 	want("PEXPIRE k 90000", "(integer) 1")
-	wantMillis("PTTL k", 90000)
+	wantMillis("PTTL k", 80000, 90000)
 	want("pexpire missing 1000", "(integer) 0")
 	want("PEXPIRE k 0", "(integer) 1")
 	want("GET k", "(nil)")

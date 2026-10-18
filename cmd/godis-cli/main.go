@@ -119,9 +119,6 @@ func run(c *client.Client, args []string) (string, error) {
 		if ttl, err = parseMillis(args[4]); err != nil {
 			return "", err
 		}
-		if ttl <= 0 {
-			return "", errors.New("PX must be positive")
-		}
 		err = c.SetTTL(ctx, args[1], []byte(args[2]), ttl)
 	case "PEXPIRE":
 		var ttl time.Duration
