@@ -403,6 +403,28 @@ func TestOlderInstallSnapshotDoesNotRollBack(t *testing.T) {
 	})
 }
 
+func TestInstallWhileApplyingRestoresAfterTheBatch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		al := &applyLog{gate: make(chan struct{})}
+		n := snapNode(t, t.TempDir(), al)
+		defer mustStop(t, n)
+		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "e1", "slow", "e3"), LeaderCommit: 3})
+		synctest.Wait()
+		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", PrevLogIndex: 3, PrevLogTerm: 1, Entries: entries(1, "e4"), LeaderCommit: 4})
+		install(t, n, InstallSnapshotArgs{Term: 1, Leader: "b", LastIndex: 6, LastTerm: 1, Data: snapshotOf(appliedN(6)...)})
+		close(al.gate)
+		synctest.Wait()
+		if got := al.snapshot(); !slices.Equal(got, appliedN(6)) {
+			t.Fatalf("state after an install during a batch %v, want %v", got, appliedN(6))
+		}
+		appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", PrevLogIndex: 6, PrevLogTerm: 1, Entries: entries(1, "e7"), LeaderCommit: 7})
+		synctest.Wait()
+		if got := al.snapshot(); !slices.Equal(got, appliedN(7)) {
+			t.Fatalf("state after the next entry %v, want %v", got, appliedN(7))
+		}
+	})
+}
+
 func TestAppendBelowSnapshotIsAcceptedPastIt(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		al := &applyLog{}
