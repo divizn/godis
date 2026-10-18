@@ -7,6 +7,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -16,6 +17,8 @@ const (
 	Get Kind = iota + 1
 	Set
 	Del
+	Cas
+	Incr
 )
 
 func (k Kind) String() string {
@@ -26,6 +29,10 @@ func (k Kind) String() string {
 		return "set"
 	case Del:
 		return "del"
+	case Cas:
+		return "cas"
+	case Incr:
+		return "incr"
 	}
 	return fmt.Sprintf("Kind(%d)", uint8(k))
 }
@@ -39,9 +46,15 @@ type Op struct {
 	Client int
 	Kind   Kind
 	Key    string
-	// Value is the value written by a Set, or read by a Get that found the key.
-	Value  string
-	Found  bool
+	// Value is the value written by a Set or a Cas, read by a Get that found the key, or returned by an Incr.
+	Value string
+	// Found is whether a Get found the key, or whether a Cas swapped.
+	Found bool
+	// Expected is the value a Cas swaps from, if ExpectFound; without it the Cas swaps only an absent key.
+	Expected    string
+	ExpectFound bool
+	// Delta is what an Incr adds to the base-10 integer at Key, a missing key counting as 0.
+	Delta  int64
 	Call   int64
 	Return int64
 }
@@ -59,6 +72,14 @@ func (o Op) String() string {
 		s += " -> " + o.Value
 	case o.Kind == Get:
 		s += " -> not found"
+	case o.Kind == Cas:
+		from := "absent"
+		if o.ExpectFound {
+			from = o.Expected
+		}
+		s += fmt.Sprintf(" %s to %s -> swapped %v", from, o.Value, o.Found)
+	case o.Kind == Incr:
+		s += fmt.Sprintf(" %+d -> %s", o.Delta, o.Value)
 	}
 	return s
 }
@@ -96,13 +117,39 @@ type register struct {
 	found bool
 }
 
-// step applies op to r, reporting false if op is a Get that r does not explain
+// step applies op to r, reporting false if r does not explain op's result; a pending op's result is unknown
 func step(r register, op Op) (register, bool) {
+	pending := op.Return == Pending
 	switch op.Kind {
 	case Set:
 		return register{op.Value, true}, true
 	case Del:
 		return register{}, true
+	case Cas:
+		swap := r.found == op.ExpectFound && (!r.found || r.value == op.Expected)
+		if !pending && swap != op.Found {
+			return r, false
+		}
+		if swap {
+			return register{op.Value, true}, true
+		}
+		return r, true
+	case Incr:
+		var n int64
+		if r.found {
+			var err error
+			if n, err = strconv.ParseInt(r.value, 10, 64); err != nil {
+				return r, pending
+			}
+		}
+		if op.Delta > 0 && n > math.MaxInt64-op.Delta || op.Delta < 0 && n < math.MinInt64-op.Delta {
+			return r, pending
+		}
+		next := strconv.FormatInt(n+op.Delta, 10)
+		if !pending && next != op.Value {
+			return r, false
+		}
+		return register{next, true}, true
 	}
 	return r, r.found == op.Found && r.value == op.Value
 }
@@ -121,14 +168,19 @@ type search struct {
 
 func newSearch(ops []Op, budget int) *search {
 	read := map[string]bool{}
+	prune := true
 	for _, op := range ops {
 		if op.Kind == Get && op.Found {
 			read[op.Value] = true
 		}
+		// a cas or incr can observe a value without a get, or depend on it being overwritten
+		if op.Kind == Cas || op.Kind == Incr {
+			prune = false
+		}
 	}
-	// a pending write of a value nobody read never helps explain the history
+	// a pending write of a value nobody read never helps explain a history of sets, dels and gets
 	ops = slices.DeleteFunc(slices.Clone(ops), func(op Op) bool {
-		return op.Kind == Set && op.Return == Pending && !read[op.Value]
+		return prune && op.Kind == Set && op.Return == Pending && !read[op.Value]
 	})
 	s := &search{ops: ops, done: make([]uint64, (len(ops)+63)/64), seen: map[string]struct{}{}, budget: budget}
 	for _, op := range ops {

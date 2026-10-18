@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"testing"
 )
 
@@ -22,6 +23,21 @@ func get(client int, key, value string, call, ret int64) Op {
 func miss(client int, key string, call, ret int64) Op {
 	return Op{Client: client, Kind: Get, Key: key, Call: call, Return: ret}
 }
+
+// cas swaps in value if key holds expected, or is absent when expected is nil; swapped is its result
+func cas(client int, key string, expected *string, value string, swapped bool, call, ret int64) Op {
+	op := Op{Client: client, Kind: Cas, Key: key, Value: value, Found: swapped, Call: call, Return: ret}
+	if expected != nil {
+		op.Expected, op.ExpectFound = *expected, true
+	}
+	return op
+}
+
+func incr(client int, key string, delta int64, result string, call, ret int64) Op {
+	return Op{Client: client, Kind: Incr, Key: key, Delta: delta, Value: result, Call: call, Return: ret}
+}
+
+func ptr(s string) *string { return &s }
 
 func TestCheck(t *testing.T) {
 	tests := []struct {
@@ -60,6 +76,33 @@ func TestCheck(t *testing.T) {
 		{"keys are separate", []Op{set(0, "x", "1", 1, 2), miss(1, "y", 3, 4)}, true},
 		{"value read from the wrong key", []Op{set(0, "x", "1", 1, 2), get(1, "y", "1", 3, 4)}, false},
 		{"failed get is dropped", []Op{set(0, "x", "1", 1, 2), get(1, "x", "9", 3, Pending)}, true},
+
+		{"incrs in sequence", []Op{incr(0, "n", 1, "1", 1, 2), incr(1, "n", 2, "3", 3, 4), get(0, "n", "3", 5, 6)}, true},
+		{"concurrent incrs give distinct results", []Op{incr(0, "n", 1, "1", 1, 4), incr(1, "n", 1, "2", 2, 3)}, true},
+		{"concurrent incrs give the same result", []Op{incr(0, "n", 1, "1", 1, 4), incr(1, "n", 1, "1", 2, 3)}, false},
+		{"incr seen twice", []Op{incr(0, "n", 1, "1", 1, 2), get(1, "n", "2", 3, 4)}, false},
+		{"incr from a set value", []Op{set(0, "n", "40", 1, 2), incr(1, "n", 2, "42", 3, 4)}, true},
+		{"incr after del starts from zero", []Op{set(0, "n", "40", 1, 2), del(0, "n", 3, 4), incr(1, "n", -1, "-1", 5, 6)}, true},
+		{"incr ignores a completed set", []Op{set(0, "n", "40", 1, 2), incr(1, "n", 1, "1", 3, 4)}, false},
+		{"incr on a value that is not an integer", []Op{set(0, "n", "a", 1, 2), incr(1, "n", 1, "1", 3, 4)}, false},
+		{"pending incr seen", []Op{incr(0, "n", 1, "1", 1, 2), incr(0, "n", 5, "", 3, Pending), get(1, "n", "6", 4, 5)}, true},
+		{"pending incr unseen", []Op{incr(0, "n", 1, "1", 1, 2), incr(0, "n", 5, "", 3, Pending), get(1, "n", "1", 4, 5)}, true},
+		{"pending incr seen twice", []Op{incr(0, "n", 5, "", 1, Pending), get(1, "n", "10", 2, 3)}, false},
+		{"incr result explained by a pending incr", []Op{incr(0, "n", 5, "", 1, Pending), incr(1, "n", 1, "6", 2, 3)}, true},
+
+		{"cas on the current value", []Op{set(0, "x", "1", 1, 2), cas(1, "x", ptr("1"), "2", true, 3, 4), get(0, "x", "2", 5, 6)}, true},
+		{"cas succeeds against a stale value", []Op{set(0, "x", "1", 1, 2), set(0, "x", "2", 3, 4), cas(1, "x", ptr("1"), "3", true, 5, 6)}, false},
+		{"cas fails against the current value", []Op{set(0, "x", "1", 1, 2), cas(1, "x", ptr("1"), "3", false, 3, 4)}, false},
+		{"cas fails on a mismatch", []Op{set(0, "x", "1", 1, 2), cas(1, "x", ptr("2"), "3", false, 3, 4), get(0, "x", "1", 5, 6)}, true},
+		{"failed cas has no effect", []Op{set(0, "x", "1", 1, 2), cas(1, "x", ptr("2"), "3", false, 3, 4), get(0, "x", "3", 5, 6)}, false},
+		{"cas expecting absent on absent", []Op{cas(0, "x", nil, "1", true, 1, 2), get(1, "x", "1", 3, 4)}, true},
+		{"cas expecting absent on an empty value", []Op{set(0, "x", "", 1, 2), cas(1, "x", nil, "1", true, 3, 4)}, false},
+		{"cas expecting empty on absent", []Op{cas(0, "x", ptr(""), "1", true, 1, 2)}, false},
+		{"two cas from absent both swap", []Op{cas(0, "x", nil, "1", true, 1, 4), cas(1, "x", nil, "2", true, 2, 3)}, false},
+		{"pending cas seen", []Op{set(0, "x", "1", 1, 2), cas(1, "x", ptr("1"), "2", false, 3, Pending), get(0, "x", "2", 4, 5)}, true},
+		{"pending cas seen without its precondition", []Op{set(0, "x", "3", 1, 2), cas(1, "x", ptr("1"), "2", false, 3, Pending), get(0, "x", "2", 4, 5)}, false},
+		{"pending cas fed by a pending set nobody read", []Op{set(0, "x", "1", 1, Pending), cas(1, "x", ptr("1"), "2", false, 2, Pending), get(2, "x", "2", 3, 4)}, true},
+		{"failed cas explained by a pending set nobody read", []Op{set(0, "x", "1", 1, 2), set(1, "x", "9", 3, Pending), cas(2, "x", ptr("1"), "2", false, 4, 5)}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -123,7 +166,19 @@ func randomHistory(rng *rand.Rand) []Op {
 	for i := range h {
 		a, b := int64(times[2*i]+1), int64(times[2*i+1]+1)
 		op := Op{Client: i, Key: []string{"x", "y"}[rng.IntN(2)], Call: min(a, b), Return: max(a, b)}
-		switch r := rng.IntN(20); {
+		switch r := rng.IntN(28); {
+		case r >= 24:
+			op.Kind = Cas
+			op.ExpectFound = rng.IntN(4) > 0
+			if op.ExpectFound {
+				op.Expected = fmt.Sprint(rng.IntN(3))
+			}
+			op.Value = fmt.Sprint(rng.IntN(3))
+			op.Found = rng.IntN(2) == 0
+		case r >= 20:
+			op.Kind = Incr
+			op.Delta = int64(rng.IntN(3) - 1)
+			op.Value = fmt.Sprint(rng.IntN(5) - 1)
 		case r < 8:
 			op.Kind = Get
 			op.Found = rng.IntN(4) > 0
@@ -192,6 +247,7 @@ func permute(ops []Op, used []bool, state map[string]string) bool {
 			continue
 		}
 		v, found := state[op.Key]
+		pending := op.Return == Pending
 		switch op.Kind {
 		case Get:
 			if found != op.Found || found && v != op.Value {
@@ -201,6 +257,30 @@ func permute(ops []Op, used []bool, state map[string]string) bool {
 			state[op.Key] = op.Value
 		case Del:
 			delete(state, op.Key)
+		case Cas:
+			swap := found == op.ExpectFound && (!found || v == op.Expected)
+			if !pending && swap != op.Found {
+				continue
+			}
+			if swap {
+				state[op.Key] = op.Value
+			}
+		case Incr:
+			n := int64(0)
+			if found {
+				var err error
+				if n, err = strconv.ParseInt(v, 10, 64); err != nil {
+					if !pending {
+						continue
+					}
+					break
+				}
+			}
+			next := strconv.FormatInt(n+op.Delta, 10)
+			if !pending && next != op.Value {
+				continue
+			}
+			state[op.Key] = next
 		}
 		used[i] = true
 		ok := permute(ops, used, state)
