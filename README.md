@@ -2,11 +2,11 @@
 
 A distributed key-value store written from scratch in Go: a Raft-replicated log, an in-memory map as the state machine, and a small binary TCP protocol. Storage, the write-ahead log, consensus and networking use only the standard library; the one dependency is the Prometheus client for metrics. It runs as a 3-node cluster with linearizable reads and writes, applies each write exactly once through client sessions even when the client retries it, and compacts its log with snapshots that it ships to followers that fall behind. No membership changes yet (see Limitations).
 
-Data dirs written before client sessions (the change that added CAS and INCR) can't be read: the log and snapshot formats changed. Wipe them.
+Data dirs written before key expiry (TTL) can't be read: the log and snapshot formats changed again, as they did for client sessions before it. Wipe them.
 
 ## Layout
 
-- `internal/storage`: the in-memory `Store` (map behind an `RWMutex`), its client session table, and the command codec the Raft log carries
+- `internal/storage`: the in-memory `Store` (map behind an `RWMutex`), its client session table, key deadlines, and the command codec the Raft log carries
 - `internal/wal`: append-only log, one fsync per record (`uint32 len | crc32c | payload`), torn-tail truncation on replay
 - `internal/consensus`: Raft (elections, replication, `Propose`, `ReadIndex`, snapshots with log compaction and `InstallSnapshot`), persisted through the WAL and a checksummed snapshot file
 - `client`: the Go client, importable as `github.com/divizn/godis/client`
@@ -31,6 +31,8 @@ Followers never serve reads or writes; they answer REDIRECT with the leader's cl
 - Linearizable writes and reads, from the leader only.
 - A write is acked only once it is fsynced on a majority and applied on the leader.
 - Exactly-once writes through the Go client. Each client picks a random 64-bit id and numbers its writes; every write carries `(client, seq)` through the log, and the store keeps each client's last seq and result, so a write that reaches the log twice takes effect once and the duplicate gets the cached result. The client retries a write with the same seq whenever the outcome is unknown: a lost leadership, a server timeout, a dropped connection, a failed dial. It gives up after 10 seconds, or sooner when the call's context ends, with `ErrOutcomeUnknown`, and the next write uses the next seq, so the abandoned one can still commit at most once. Until one of its writes has applied, a client whose write fails starts a new session instead, because the cluster may hold no session for it yet. A write that returns success took effect exactly once.
+- Expiring keys. Every write in the log carries `now`, the proposing leader's clock in Unix ms. The state machine keeps a clock that is the highest `now` it has applied and runs each command at the later of its own `now` and that clock, so time in the state machine never goes backwards and every replica, and every replay, agrees on which keys are alive at each log position. `SET k v PX ms` (`SetTTL`) sets a deadline `now + ms`; a plain `SET` clears it, as does a swapping `CAS`; `INCR` keeps it; `DEL` drops it. A key is expired at time `t` once its deadline is at or before `t`, and an expired key behaves as missing for every op: `CAS` sees it as absent, `INCR` starts from 0 with no deadline, `PEXPIRE` returns 0. `PEXPIRE k ms` sets a new deadline on a live key (a `ms` of 0 or less deletes it). Reads on the leader, after the ReadIndex round, evaluate at the later of the wall clock and the state machine clock, so a read never returns an expired key. Memory is reclaimed by the leader: once a second it checks for expired keys and, if there are any, proposes a sweep stamped with its clock; applying it deletes every key due at that time on every replica. A retried `SET ... PX` that reaches the log twice keeps the deadline of the first.
+- Known limit of expiry: there is no clock synchronization. After a leader change, keys may live past their deadline by up to the clock skew between the old and new leader (the new leader's clock is behind), and a key can expire early by the same skew if the new leader's clock is ahead. Deadlines are only as accurate as the leaders' clocks.
 - Leader loss: the remaining majority elects a new leader within one to two election timeouts (1s by default) and the client retries through the redirect, or redials the other nodes if the leader is gone.
 - A leader that hasn't heard from a majority for an election timeout steps down instead of timing out its pending requests. Pending reads get a redirect. Pending writes get "outcome unknown" (a write already in the log may still commit), and the client resends them with the same seq.
 - Snapshots: every node snapshots the store after each `--snapshot-entries` applied entries and drops the log before it. The snapshot is fsynced and renamed into place before the log is rewritten, so a crash between the two restarts cleanly, and a follower acks an InstallSnapshot only once both are durable. A restart restores the snapshot and replays only the log after it.
@@ -50,6 +52,9 @@ if err := c.Set(ctx, "k", []byte("v")); err != nil {
 v, ok, err := c.Get(ctx, "k")
 n, err := c.Incr(ctx, "hits", 1)
 swapped, err := c.CAS(ctx, "k", []byte("v"), true, []byte("w"))
+err = c.SetTTL(ctx, "session", []byte("v"), 30*time.Second) // ttl must be positive
+found, err := c.Expire(ctx, "k", time.Minute)                // false if k is missing or expired; ttl <= 0 deletes
+left, ok, err := c.TTL(ctx, "k")                             // left 0 means no deadline; ok false if missing or expired
 ```
 
 A `Client` is safe for concurrent use. It keeps a pool of sessions, each with one connection and one request in flight, so concurrent calls run in parallel and each session's writes still reach the log in order.
@@ -78,12 +83,13 @@ go run ./cmd/godis-cli --addr=localhost:8081,localhost:8082,localhost:8083   # R
 go run ./cmd/godis-cli --addr=localhost:8081 SET k v                         # one-shot
 ```
 
-Commands: `PING`, `GET k`, `SET k v`, `DEL k`, `CAS k expected new` (sets `k` to `new` only if it holds exactly `expected`; an `expected` of `-` means "only if `k` is absent"; prints 1 if it swapped, 0 if not), `INCR k [delta]` (adds `delta`, default 1, to the base-10 int64 at `k`, a missing key counting as 0, and prints the new value; fails without writing on a value that is not an integer or on overflow).
+Commands: `PING`, `GET k`, `SET k v`, `DEL k`, `CAS k expected new` (sets `k` to `new` only if it holds exactly `expected`; an `expected` of `-` means "only if `k` is absent"; prints 1 if it swapped, 0 if not), `INCR k [delta]` (adds `delta`, default 1, to the base-10 int64 at `k`, a missing key counting as 0, and prints the new value; fails without writing on a value that is not an integer or on overflow), `SET k v PX ms` (sets `k` with a deadline `ms` milliseconds from now), `PEXPIRE k ms` (prints 1 if `k` was live, 0 if not; a `ms` of 0 or less deletes it), `PTTL k` (prints -2 if `k` is missing or expired, -1 if it has no deadline, else the milliseconds left).
 
 Metrics are at `http://<node>:2112/metrics`:
 
-- `godis_requests_total{op,result}`: get, set, del, cas, incr by ok, not_found, redirect, unknown, error
+- `godis_requests_total{op,result}`: get, set, del, cas, incr, expire, ttl by ok, not_found, redirect, unknown, error
 - `godis_duplicate_writes_total`: retried writes this node's state machine dropped as already applied, since the process started
+- `godis_expired_keys_total`: keys this node's state machine deleted in sweeps since the process started
 - `godis_request_duration_seconds{op}`: histogram, Raft round trip included
 - `godis_raft_term`, `godis_raft_commit_index`, `godis_raft_leader` (1 on the leader)
 - `godis_raft_snapshot_index`: last log index this node's snapshot covers, 0 if none
@@ -95,8 +101,8 @@ Plus the Go runtime and process collectors. Leadership transitions are also logg
 
 Every message is a frame: `uint32 length | payload`, big endian, payloads up to 16 MiB. One request in flight per connection.
 
-- Request: `op` byte (1 PING, 2 GET, 3 SET, 4 DEL, 5 CAS, 6 INCR). Writes (SET, DEL, CAS, INCR) then carry the session, `uvarint client | uvarint seq` (seq starts at 1). Every op but PING then has the key as `uvarint length | bytes`. SET adds the value the same way; CAS adds a byte (1 if the key must hold the expected value, 0 if it must be absent), the expected value and the new value, both length-prefixed; INCR adds the delta as a signed varint.
-- Response: `status` byte (0 OK, 1 NOT_FOUND, 2 ERROR, 3 REDIRECT, 4 UNKNOWN), then the body. OK: the value for a GET, one byte 1 or 0 for whether a CAS swapped, the new value in decimal for an INCR, empty otherwise. ERROR: the message, for a definite failure (a malformed request, INCR of a non-integer, an expired session): the write did not apply. REDIRECT: the leader's client address, empty when no leader is known (the client waits 100ms and retries); the request never ran. UNKNOWN: the message; the write may or may not apply, and the client resends it with the same seq.
+- Request: `op` byte (1 PING, 2 GET, 3 SET, 4 DEL, 5 CAS, 6 INCR, 7 EXPIRE, 8 TTL). Writes (SET, DEL, CAS, INCR, EXPIRE) then carry the session, `uvarint client | uvarint seq` (seq starts at 1). Every op but PING then has the key as `uvarint length | bytes`. SET adds the value the same way, then a `uvarint` ttl in ms (0 for none; at most about 100 years); EXPIRE adds the ttl in ms as a signed varint (0 or less deletes); CAS adds a byte (1 if the key must hold the expected value, 0 if it must be absent), the expected value and the new value, both length-prefixed; INCR adds the delta as a signed varint.
+- Response: `status` byte (0 OK, 1 NOT_FOUND, 2 ERROR, 3 REDIRECT, 4 UNKNOWN), then the body. OK: the value for a GET, one byte 1 or 0 for whether a CAS swapped, the new value in decimal for an INCR, one byte 1 or 0 for whether an EXPIRE found a live key, for a TTL the `uvarint` milliseconds left (0 for no deadline; NOT_FOUND if the key is missing or expired), empty otherwise. ERROR: the message, for a definite failure (a malformed request, INCR of a non-integer, an expired session): the write did not apply. REDIRECT: the leader's client address, empty when no leader is known (the client waits 100ms and retries); the request never ran. UNKNOWN: the message; the write may or may not apply, and the client resends it with the same seq.
 
 Peers talk to each other over `net/rpc` with gob on the raft port.
 
@@ -127,6 +133,8 @@ Raft is tested deterministically with `testing/synctest` on an in-memory network
 
 ### Linearizability
 
+TTL is not covered by the linearizability checker: it models a register with no notion of time, so the fuzz and the checker never use deadlines, `EXPIRE` or sweeps. Expiry is tested with the store's deterministic unit tests (stamps given by hand) and with real loopback clusters in `internal/node`: expiry on read, the sweep dropping the key from every node, and a deadline surviving a leader kill. The command format still goes through the fuzz, since every write now carries `now`.
+
 `internal/lincheck` is a hand-written linearizability checker: Wing and Gong's search with Lowe's memoization, each key checked as its own register, writes with an unknown outcome allowed to take effect at any point after their call or never. Every test run cross-checks its verdicts against a brute-force search on 20,000 random small histories.
 
 `TestLinearizable` in `internal/consensus` runs 3 or 5 Raft nodes, each feeding a real `storage.Store`, on the in-memory network: 4 clients over 3 keys for 30 to 60 fake seconds, while a seeded nemesis partitions the cluster, deafens the leader (it sends but hears nothing), stops and restarts single nodes or the whole cluster, drops and delays messages, and holds back appends that carry entries. Each run snapshots every 1 to 20 entries (chosen by the seed), so snapshots, log rewrites and InstallSnapshot to stopped or partitioned followers happen throughout. Clients write through sessions: 4 clients mix SET, DEL and CAS over 3 keys and INCR over 2 counter keys, and retry a write whose outcome is unknown with the same `(client, seq)` on other nodes for up to 10 seconds, so an op stays pending only if its client gave up. Each run's history goes through the checker; replaying the applied log through a fresh store must execute each `(client, seq)` once and rebuild exactly the store every node holds (the log itself holds a retried write once per attempt that reached it); and the usual invariants hold (one leader per term, every node applied a prefix of the same log).
@@ -148,6 +156,7 @@ A seed reproduces the fault schedule, not every goroutine interleaving (synctest
 
 ## Limitations
 
+- Expiry trusts the leaders' clocks (see Guarantees); there is no lease or clock sync. Sweeps scan every key with a deadline once a second, a min-heap would be the fix if keys with TTLs get numerous.
 - A snapshot is one in-memory blob sent in a single RPC, with no chunking, so the whole store must fit in memory twice and in one gob message.
 - Taking a snapshot encodes the store under its read lock, which blocks writes to the store (and so applying) for that long.
 - The session table is capped at 100,000 clients. Past the cap it evicts the tenth with the oldest last write, by log index, so every replica evicts the same ones. A write with seq above 1 from a client with no session fails with "session expired", which covers an evicted client's retries except one case: a seq 1 write retried after its client was evicted applies twice. Sessions never expire by time.
