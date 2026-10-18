@@ -283,7 +283,7 @@ func deadline(now uint64, ttl time.Duration) uint64 {
 	return now + uint64(ttl.Milliseconds())
 }
 
-// sweepEvery has the leader propose a sweep whenever a key has expired, until ctx is done
+// sweepEvery proposes a sweep whenever a key has expired, until ctx is done; on a follower the proposal is refused
 func (s kvStore) sweepEvery(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -298,9 +298,6 @@ func (s kvStore) sweepEvery(ctx context.Context, interval time.Duration) {
 }
 
 func (s kvStore) sweep(ctx context.Context) {
-	if s.raft.Status().Role != consensus.Leader {
-		return
-	}
 	now := s.now()
 	if !s.store.AnyDue(now) {
 		return

@@ -27,6 +27,7 @@ func (c *testCluster) restartWithSweep(interval time.Duration) {
 
 func TestSetTTLExpiresAndReportsRemaining(t *testing.T) {
 	c := newTestCluster(t, 3)
+	c.restartWithSweep(time.Hour)
 	leader := c.leader()
 	follower := c.other(leader)
 
