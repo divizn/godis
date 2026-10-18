@@ -133,7 +133,7 @@ func (c *Client) SetTTL(ctx context.Context, key string, value []byte, ttl time.
 // Expire gives key a deadline ttl from now, rounded up to a whole millisecond, and reports whether key was live.
 // A ttl of 0 or less deletes it.
 func (c *Client) Expire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
-	ms, err := ttlMillis(max(ttl, 0))
+	ms, err := ttlMillis(ttl)
 	if err != nil {
 		return false, err
 	}

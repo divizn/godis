@@ -13,8 +13,9 @@ func TestTTLCalls(t *testing.T) {
 	ctx := t.Context()
 
 	for _, ttl := range []time.Duration{0, -time.Second, time.Duration(protocol.MaxTTL+1) * time.Millisecond} {
-		if err := c.SetTTL(ctx, "k", []byte("v"), ttl); err == nil {
-			t.Fatalf("set with ttl %v: want a client-side error", ttl)
+		start := time.Now()
+		if err := c.SetTTL(within(t, 2*time.Second), "k", []byte("v"), ttl); err == nil || time.Since(start) > time.Second {
+			t.Fatalf("set with ttl %v: got %v after %v, want an immediate client-side error", ttl, err, time.Since(start))
 		}
 	}
 	if n := len(f.requests()); n != 0 {
