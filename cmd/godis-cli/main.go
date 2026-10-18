@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/divizn/godis/client"
@@ -74,7 +76,7 @@ func repl(c *client.Client, in io.Reader, out io.Writer, prompt string) error {
 }
 
 // arity is the least and most arguments of each command, its name included
-var arity = map[string][2]int{"PING": {1, 1}, "GET": {2, 2}, "SET": {3, 3}, "DEL": {2, 2}, "CAS": {4, 4}, "INCR": {2, 3}}
+var arity = map[string][2]int{"PING": {1, 1}, "GET": {2, 2}, "SET": {3, 5}, "DEL": {2, 2}, "CAS": {4, 4}, "INCR": {2, 3}, "PEXPIRE": {3, 3}, "PTTL": {2, 2}}
 
 // absent as CAS's expected value means "only if the key does not exist"
 const absent = "-"
@@ -106,7 +108,45 @@ func run(c *client.Client, args []string) (string, error) {
 			return strconv.Quote(string(v)), nil
 		}
 	case "SET":
-		err = c.Set(ctx, args[1], []byte(args[2]))
+		if len(args) == 3 {
+			err = c.Set(ctx, args[1], []byte(args[2]))
+			break
+		}
+		if len(args) != 5 || !strings.EqualFold(args[3], "PX") {
+			return "", errors.New("syntax error, expected SET key value [PX milliseconds]")
+		}
+		var ttl time.Duration
+		if ttl, err = parseMillis(args[4]); err != nil {
+			return "", err
+		}
+		if ttl <= 0 {
+			return "", errors.New("PX must be positive")
+		}
+		err = c.SetTTL(ctx, args[1], []byte(args[2]), ttl)
+	case "PEXPIRE":
+		var ttl time.Duration
+		if ttl, err = parseMillis(args[2]); err != nil {
+			return "", err
+		}
+		var found bool
+		if found, err = c.Expire(ctx, args[1], ttl); err == nil {
+			if found {
+				return "(integer) 1", nil
+			}
+			return "(integer) 0", nil
+		}
+	case "PTTL":
+		var remaining time.Duration
+		var found bool
+		if remaining, found, err = c.TTL(ctx, args[1]); err == nil {
+			switch {
+			case !found:
+				return "(integer) -2", nil
+			case remaining == 0:
+				return "(integer) -1", nil
+			}
+			return fmt.Sprint("(integer) ", remaining.Milliseconds()), nil
+		}
 	case "DEL":
 		err = c.Del(ctx, args[1])
 	case "CAS":
@@ -133,6 +173,15 @@ func run(c *client.Client, args []string) (string, error) {
 		return "", err
 	}
 	return "OK", nil
+}
+
+// parseMillis reads a whole number of milliseconds, refusing one too large for a time.Duration
+func parseMillis(s string) (time.Duration, error) {
+	ms, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || ms > math.MaxInt64/int64(time.Millisecond) || ms < math.MinInt64/int64(time.Millisecond) {
+		return 0, fmt.Errorf("milliseconds %q is not a usable integer", s)
+	}
+	return time.Duration(ms) * time.Millisecond, nil
 }
 
 var errBadQuote = errors.New("invalid quoted argument")

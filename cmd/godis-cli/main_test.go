@@ -32,7 +32,9 @@ func TestSplitArgs(t *testing.T) {
 	}
 }
 
-func TestScriptedSession(t *testing.T) {
+// soloClient runs a one-node cluster for the test and returns a client of it
+func soloClient(t *testing.T) *client.Client {
+	t.Helper()
 	var lns [2]net.Listener
 	for i := range lns {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -51,17 +53,22 @@ func TestScriptedSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		if err := n.Stop(); err != nil {
 			t.Error(err)
 		}
-	}()
+	})
 
 	c, err := client.Dial(lns[0].Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+func TestScriptedSession(t *testing.T) {
+	c := soloClient(t)
 
 	script := strings.Join([]string{
 		"ping",
