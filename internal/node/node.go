@@ -2,9 +2,11 @@
 package node
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/rpc"
 	"strconv"
@@ -21,6 +23,7 @@ import (
 const (
 	requestTimeout         = 5 * time.Second
 	defaultElectionTimeout = time.Second
+	defaultSweepInterval   = time.Second
 )
 
 type Peer struct {
@@ -43,6 +46,8 @@ type Config struct {
 	Metrics prometheus.Registerer
 	// SnapshotEntries is how many applied entries trigger a snapshot, zero for the consensus default.
 	SnapshotEntries uint64
+	// SweepInterval is how often the leader checks for expired keys, defaulting to 1s.
+	SweepInterval time.Duration
 }
 
 type Node struct {
@@ -52,6 +57,7 @@ type Node struct {
 
 	cancel     context.CancelFunc
 	clientDone chan error
+	sweepDone  chan struct{}
 
 	raftLn   net.Listener
 	raftDone chan error
@@ -85,6 +91,7 @@ func start(cfg Config) (*Node, error) {
 	if election == 0 {
 		election = defaultElectionTimeout
 	}
+	sweepEvery := cmp.Or(cfg.SweepInterval, defaultSweepInterval)
 	store := storage.New()
 	m := newMetrics(cfg.Metrics)
 	tr := &transport{addrs: raftAddrs, clients: map[conn]*rpc.Client{}}
@@ -125,6 +132,7 @@ func start(cfg Config) (*Node, error) {
 		tr:         tr,
 		cancel:     cancel,
 		clientDone: make(chan error, 1),
+		sweepDone:  make(chan struct{}),
 		raftLn:     cfg.RaftListener,
 		raftDone:   make(chan error, 1),
 		conns:      map[net.Conn]struct{}{},
@@ -132,6 +140,10 @@ func start(cfg Config) (*Node, error) {
 	go func() { n.raftDone <- n.serveRaft(srv) }()
 	kv := kvStore{raft: raft, store: store, clientAddrs: clientAddrs, metrics: m}
 	go func() { n.clientDone <- network.NewServer(kv).Serve(ctx, cfg.ClientListener) }()
+	go func() {
+		defer close(n.sweepDone)
+		kv.sweepEvery(ctx, sweepEvery)
+	}()
 	return n, nil
 }
 
@@ -151,6 +163,7 @@ func (n *Node) Err() error {
 // Stop lets in-flight client requests finish, then stops Raft and closes every connection.
 func (n *Node) Stop() error {
 	n.cancel()
+	<-n.sweepDone
 	errs := []error{<-n.clientDone, n.raft.Stop()}
 
 	n.raftLn.Close()
@@ -200,23 +213,24 @@ func (s kvStore) Get(key string) ([]byte, bool, error) {
 	return v, ok, err
 }
 
-func (s kvStore) Set(client, seq uint64, key string, value []byte) error {
+func (s kvStore) Set(client, seq uint64, key string, value []byte, ttl time.Duration) error {
 	start := time.Now()
-	_, err := s.write(storage.EncodeSet(client, seq, key, value))
+	now := s.now()
+	_, err := s.write(storage.EncodeSet(client, seq, now, deadline(now, ttl), key, value))
 	s.metrics.observe("set", start, true, err)
 	return err
 }
 
 func (s kvStore) Delete(client, seq uint64, key string) error {
 	start := time.Now()
-	_, err := s.write(storage.EncodeDelete(client, seq, key))
+	_, err := s.write(storage.EncodeDelete(client, seq, s.now(), key))
 	s.metrics.observe("del", start, true, err)
 	return err
 }
 
 func (s kvStore) Cas(client, seq uint64, key string, expected []byte, expectFound bool, value []byte) (bool, error) {
 	start := time.Now()
-	body, err := s.write(storage.EncodeCas(client, seq, key, expected, expectFound, value))
+	body, err := s.write(storage.EncodeCas(client, seq, s.now(), 0, key, expected, expectFound, value))
 	s.metrics.observe("cas", start, true, err)
 	if err != nil {
 		return false, err
@@ -226,7 +240,7 @@ func (s kvStore) Cas(client, seq uint64, key string, expected []byte, expectFoun
 
 func (s kvStore) Incr(client, seq uint64, key string, delta int64) (int64, error) {
 	start := time.Now()
-	body, err := s.write(storage.EncodeIncr(client, seq, key, delta))
+	body, err := s.write(storage.EncodeIncr(client, seq, s.now(), key, delta))
 	s.metrics.observe("incr", start, true, err)
 	if err != nil {
 		return 0, err
@@ -238,14 +252,86 @@ func (s kvStore) Incr(client, seq uint64, key string, delta int64) (int64, error
 	return n, nil
 }
 
+func (s kvStore) Expire(client, seq uint64, key string, ttl time.Duration) (bool, error) {
+	start := time.Now()
+	now := s.now()
+	body, err := s.write(storage.EncodeExpire(client, seq, now, key, deadline(now, ttl)))
+	s.metrics.observe("expire", start, true, err)
+	if err != nil {
+		return false, err
+	}
+	return len(body) == 1 && body[0] == 1, nil
+}
+
+func (s kvStore) TTL(key string) (time.Duration, bool, error) {
+	start := time.Now()
+	remaining, ok, err := s.ttl(key)
+	s.metrics.observe("ttl", start, ok, err)
+	return remaining, ok, err
+}
+
+// now is the time a proposal is stamped with, in Unix ms: the wall clock, but never behind a command this node applied
+func (s kvStore) now() uint64 {
+	return max(uint64(time.Now().UnixMilli()), s.store.Clock())
+}
+
+// deadline is the absolute time ttl from now, 0 for a ttl of 0 or less
+func deadline(now uint64, ttl time.Duration) uint64 {
+	if ttl <= 0 {
+		return 0
+	}
+	return now + uint64(ttl.Milliseconds())
+}
+
+// sweepEvery has the leader propose a sweep whenever a key has expired, until ctx is done
+func (s kvStore) sweepEvery(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.sweep(ctx)
+		}
+	}
+}
+
+func (s kvStore) sweep(ctx context.Context) {
+	if s.raft.Status().Role != consensus.Leader {
+		return
+	}
+	now := s.now()
+	if !s.store.AnyDue(now) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	_, err := s.raft.Propose(ctx, storage.EncodeSweep(now))
+	var nle *consensus.NotLeaderError
+	if err != nil && ctx.Err() == nil && !errors.As(err, &nle) && !errors.Is(err, consensus.ErrStopped) {
+		slog.Warn("propose sweep", "err", err)
+	}
+}
+
 func (s kvStore) get(key string) ([]byte, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 	if err := s.raft.ReadIndex(ctx); err != nil {
 		return nil, false, s.classify(fmt.Errorf("read index: %w", err))
 	}
-	v, ok := s.store.Get(key)
+	v, ok := s.store.Get(key, uint64(time.Now().UnixMilli()))
 	return v, ok, nil
+}
+
+func (s kvStore) ttl(key string) (time.Duration, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	if err := s.raft.ReadIndex(ctx); err != nil {
+		return 0, false, s.classify(fmt.Errorf("read index: %w", err))
+	}
+	ms, ok := s.store.TTL(key, uint64(time.Now().UnixMilli()))
+	return time.Duration(ms) * time.Millisecond, ok, nil
 }
 
 // write proposes cmd and returns the body of its result, or the error of a command that failed

@@ -135,6 +135,19 @@ func (s *Store) TTL(key string, now uint64) (remaining uint64, found bool) {
 	return remaining, true
 }
 
+// AnyDue reports whether a key is expired at the later of now and the store's clock, so a sweep at that time would delete something.
+func (s *Store) AnyDue(now uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t := max(now, s.clock)
+	for _, d := range s.deadlines {
+		if due(d, t) {
+			return true
+		}
+	}
+	return false
+}
+
 // due is whether a key with deadline d, 0 for none, is expired at t
 func due(d, t uint64) bool { return d != 0 && d <= t }
 

@@ -215,7 +215,7 @@ func laggingCluster(t *testing.T) (c *cluster, leader, follower string, set func
 		c.start(id)
 	}
 	set = func(i int) string {
-		return string(storage.EncodeSet(1, uint64(i+1), fmt.Sprint("k", i%7), []byte(fmt.Sprint("v", i))))
+		return string(storage.EncodeSet(1, uint64(i+1), 0, 0, fmt.Sprint("k", i%7), []byte(fmt.Sprint("v", i))))
 	}
 	leader, _ = c.waitLeader()
 	follower = c.ids[0]

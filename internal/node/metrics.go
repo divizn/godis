@@ -59,6 +59,10 @@ func registerStoreCounters(reg prometheus.Registerer, store *storage.Store) {
 		Name: "godis_duplicate_writes_total",
 		Help: "Retried writes this node's state machine dropped as already applied, since it started.",
 	}, func() float64 { return float64(store.Duplicates()) })
+	promauto.With(reg).NewCounterFunc(prometheus.CounterOpts{
+		Name: "godis_expired_keys_total",
+		Help: "Keys this node's state machine deleted after they expired, since it started.",
+	}, func() float64 { return float64(store.Expired()) })
 }
 
 func (m *metrics) observe(op string, start time.Time, found bool, err error) {

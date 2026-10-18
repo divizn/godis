@@ -100,7 +100,7 @@ func linRun(t *testing.T, seed uint64) {
 			c.start(id)
 		}
 	}
-	marker := storage.EncodeSet(0, 1, "end", nil)
+	marker := storage.EncodeSet(0, 1, 0, 0, "end", nil)
 	waitFor(t, 30*time.Second, "the end marker to commit", func() bool {
 		leader, _ := c.waitLeader()
 		return c.propose(leader, string(marker), time.Second) == nil
@@ -203,22 +203,22 @@ func (lc *linClient) run(end time.Time, think time.Duration) {
 		case r < 5:
 			lc.seq++
 			op.Kind, op.Value = lincheck.Set, value
-			cmd = storage.EncodeSet(lc.id, lc.seq, op.Key, []byte(value))
+			cmd = storage.EncodeSet(lc.id, lc.seq, 0, 0, op.Key, []byte(value))
 		case r < 7:
 			lc.seq++
 			op.Kind = lincheck.Del
-			cmd = storage.EncodeDelete(lc.id, lc.seq, op.Key)
+			cmd = storage.EncodeDelete(lc.id, lc.seq, 0, op.Key)
 		case r < 10:
 			lc.seq++
 			op.Kind, op.Value = lincheck.Cas, value
 			if v := lc.seen[op.Key]; v != nil {
 				op.Expected, op.ExpectFound = *v, true
 			}
-			cmd = storage.EncodeCas(lc.id, lc.seq, op.Key, []byte(op.Expected), op.ExpectFound, []byte(value))
+			cmd = storage.EncodeCas(lc.id, lc.seq, 0, 0, op.Key, []byte(op.Expected), op.ExpectFound, []byte(value))
 		case r < 13:
 			lc.seq++
 			op.Kind, op.Key, op.Delta = lincheck.Incr, linCounters[lc.rng.IntN(len(linCounters))], 1+lc.rng.Int64N(3)
-			cmd = storage.EncodeIncr(lc.id, lc.seq, op.Key, op.Delta)
+			cmd = storage.EncodeIncr(lc.id, lc.seq, 0, op.Key, op.Delta)
 		default:
 			op.Kind = lincheck.Get
 			if lc.rng.IntN(3) == 0 {
@@ -280,7 +280,7 @@ func (lc *linClient) send(key string, cmd []byte) (body []byte, found, ok bool) 
 			ctx, cancel := context.WithTimeout(context.Background(), min(linOpWindow, time.Until(deadline)))
 			if cmd == nil {
 				if err = n.ReadIndex(ctx); err == nil {
-					body, found = store.Get(key)
+					body, found = store.Get(key, 0)
 				}
 			} else {
 				var r []byte

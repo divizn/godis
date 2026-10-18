@@ -26,6 +26,8 @@ type testCluster struct {
 	regs     map[string]*prometheus.Registry
 	// snapEntries is passed to every node started from now on, zero for the default
 	snapEntries uint64
+	// sweep is passed to every node started from now on, zero for the default
+	sweep time.Duration
 }
 
 func listen(t testing.TB, addr string) net.Listener {
@@ -72,7 +74,7 @@ func (c *testCluster) peer(id string) Peer {
 func (c *testCluster) startOn(id string, cl, rl net.Listener) {
 	c.t.Helper()
 	reg := prometheus.NewRegistry()
-	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election, Metrics: reg, SnapshotEntries: c.snapEntries})
+	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election, Metrics: reg, SnapshotEntries: c.snapEntries, SweepInterval: c.sweep})
 	if err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
@@ -213,9 +215,9 @@ func TestFailoverAndCatchUp(t *testing.T) {
 	c.start(old)
 	store := c.nodes[old].store
 	waitFor(t, old+" to catch up", func() error {
-		a, _ := store.Get("a")
-		b, _ := store.Get("b")
-		_, gone := store.Get("gone")
+		a, _ := store.Get("a", 0)
+		b, _ := store.Get("b", 0)
+		_, gone := store.Get("gone", 0)
 		if string(a) != "1" || string(b) != "2" || gone {
 			return fmt.Errorf("restarted node has a=%q b=%q gone present=%v", a, b, gone)
 		}
@@ -274,7 +276,7 @@ func TestFollowerCatchesUpBySnapshotOverTheWire(t *testing.T) {
 	store := c.nodes[follower].store
 	waitFor(t, follower+" to catch up", func() error {
 		for i := 23; i < 30; i++ {
-			if v, _ := store.Get(fmt.Sprint("k", i%7)); string(v) != fmt.Sprint("v", i) {
+			if v, _ := store.Get(fmt.Sprint("k", i%7), 0); string(v) != fmt.Sprint("v", i) {
 				return fmt.Errorf("k%d = %q", i%7, v)
 			}
 		}

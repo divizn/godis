@@ -176,6 +176,36 @@ func TestSameCommandsGiveSameSnapshot(t *testing.T) {
 	}
 }
 
+func TestAnyDueTracksTheEarliestDeadline(t *testing.T) {
+	s := newTestStore(t)
+	if s.AnyDue(1 << 40) {
+		t.Fatal("empty store has nothing due")
+	}
+	s.apply(EncodeSet(1, 1, 0, 0, "plain", nil))
+	s.apply(EncodeSet(1, 2, 0, 500, "a", nil))
+	s.apply(EncodeSet(1, 3, 0, 900, "b", nil))
+	for _, tc := range []struct {
+		now  uint64
+		want bool
+	}{{499, false}, {500, true}, {2000, true}} {
+		if got := s.AnyDue(tc.now); got != tc.want {
+			t.Fatalf("AnyDue(%d) = %v, want %v", tc.now, got, tc.want)
+		}
+	}
+	s.apply(EncodeSweep(600))
+	if s.AnyDue(600) || !s.AnyDue(900) {
+		t.Fatal("after a sweep at 600 only b, due at 900, should be left")
+	}
+	s.apply(EncodeSet(1, 4, 0, 650, "d", nil))
+	if s.AnyDue(100) {
+		t.Fatal("d is not due at the clock, 600")
+	}
+	s.apply(EncodeSet(1, 5, 700, 0, "c", nil))
+	if !s.AnyDue(100) {
+		t.Fatal("AnyDue ignored the clock, which is at 700 with d due")
+	}
+}
+
 func TestDuplicateSetTTLKeepsTheFirstDeadline(t *testing.T) {
 	s := newTestStore(t)
 	s.apply(EncodeSet(1, 1, 0, 1000, "k", []byte("v")))
