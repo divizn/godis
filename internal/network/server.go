@@ -4,11 +4,13 @@ package network
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/divizn/godis/internal/protocol"
 )
@@ -18,10 +20,15 @@ import (
 // a *protocol.RedirectError that it never ran.
 type Store interface {
 	Get(key string) ([]byte, bool, error)
-	Set(client, seq uint64, key string, value []byte) error
+	// Set stores value with a deadline ttl from now, or none if ttl is 0.
+	Set(client, seq uint64, key string, value []byte, ttl time.Duration) error
 	Delete(client, seq uint64, key string) error
 	Cas(client, seq uint64, key string, expected []byte, expectFound bool, value []byte) (swapped bool, err error)
 	Incr(client, seq uint64, key string, delta int64) (int64, error)
+	// Expire gives a live key a deadline ttl from now, deleting it if ttl is 0 or less, and reports whether the key was live.
+	Expire(client, seq uint64, key string, ttl time.Duration) (found bool, err error)
+	// TTL reports the time left on a key, 0 for no deadline, found false if the key is missing or expired.
+	TTL(key string) (remaining time.Duration, found bool, err error)
 }
 
 type Server struct {
@@ -130,7 +137,7 @@ func (s *Server) exec(p []byte) []byte {
 		}
 		body = v
 	case protocol.OpSet:
-		err = s.store.Set(req.Client, req.Seq, req.Key, req.Value)
+		err = s.store.Set(req.Client, req.Seq, req.Key, req.Value, time.Duration(req.TTL)*time.Millisecond)
 	case protocol.OpDel:
 		err = s.store.Delete(req.Client, req.Seq, req.Key)
 	case protocol.OpCas:
@@ -140,6 +147,22 @@ func (s *Server) exec(p []byte) []byte {
 		if swapped {
 			body[0] = 1
 		}
+	case protocol.OpExpire:
+		var found bool
+		found, err = s.store.Expire(req.Client, req.Seq, req.Key, time.Duration(req.TTL)*time.Millisecond)
+		body = []byte{0}
+		if found {
+			body[0] = 1
+		}
+	case protocol.OpTTL:
+		remaining, found, err := s.store.TTL(req.Key)
+		if err != nil {
+			return errorResponse(err)
+		}
+		if !found {
+			return []byte{protocol.StatusNotFound}
+		}
+		body = binary.AppendUvarint(nil, uint64(remaining.Milliseconds()))
 	case protocol.OpIncr:
 		var n int64
 		n, err = s.store.Incr(req.Client, req.Seq, req.Key, req.Delta)

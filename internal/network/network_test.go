@@ -32,9 +32,32 @@ type memStore struct {
 
 func newMemStore() *memStore { return &memStore{s: storage.New()} }
 
+func now() uint64 { return uint64(time.Now().UnixMilli()) }
+
+func deadline(ttl time.Duration) uint64 {
+	if ttl == 0 {
+		return 0
+	}
+	return now() + uint64(ttl.Milliseconds())
+}
+
 func (m *memStore) Get(key string) ([]byte, bool, error) {
-	v, ok := m.s.Get(key)
+	v, ok := m.s.Get(key, now())
 	return v, ok, nil
+}
+
+func (m *memStore) Expire(client, seq uint64, key string, ttl time.Duration) (bool, error) {
+	d := now()
+	if ttl > 0 {
+		d += uint64(ttl.Milliseconds())
+	}
+	r, err := m.apply(storage.EncodeExpire(client, seq, now(), key, d))
+	return len(r) == 1 && r[0] == 1, err
+}
+
+func (m *memStore) TTL(key string) (time.Duration, bool, error) {
+	ms, ok := m.s.TTL(key, now())
+	return time.Duration(ms) * time.Millisecond, ok, nil
 }
 
 func (m *memStore) apply(cmd []byte) ([]byte, error) {
@@ -48,23 +71,23 @@ func (m *memStore) apply(cmd []byte) ([]byte, error) {
 	return storage.ParseResult(r)
 }
 
-func (m *memStore) Set(client, seq uint64, key string, value []byte) error {
-	_, err := m.apply(storage.EncodeSet(client, seq, key, value))
+func (m *memStore) Set(client, seq uint64, key string, value []byte, ttl time.Duration) error {
+	_, err := m.apply(storage.EncodeSet(client, seq, now(), deadline(ttl), key, value))
 	return err
 }
 
 func (m *memStore) Delete(client, seq uint64, key string) error {
-	_, err := m.apply(storage.EncodeDelete(client, seq, key))
+	_, err := m.apply(storage.EncodeDelete(client, seq, now(), key))
 	return err
 }
 
 func (m *memStore) Cas(client, seq uint64, key string, expected []byte, expectFound bool, value []byte) (bool, error) {
-	r, err := m.apply(storage.EncodeCas(client, seq, key, expected, expectFound, value))
+	r, err := m.apply(storage.EncodeCas(client, seq, now(), 0, key, expected, expectFound, value))
 	return len(r) == 1 && r[0] == 1, err
 }
 
 func (m *memStore) Incr(client, seq uint64, key string, delta int64) (int64, error) {
-	r, err := m.apply(storage.EncodeIncr(client, seq, key, delta))
+	r, err := m.apply(storage.EncodeIncr(client, seq, now(), key, delta))
 	if err != nil {
 		return 0, err
 	}
@@ -79,6 +102,10 @@ func (nopWrites) Cas(uint64, uint64, string, []byte, bool, []byte) (bool, error)
 	return false, nil
 }
 func (nopWrites) Incr(uint64, uint64, string, int64) (int64, error) { return 0, nil }
+func (nopWrites) Expire(uint64, uint64, string, time.Duration) (bool, error) {
+	return false, nil
+}
+func (nopWrites) TTL(string) (time.Duration, bool, error) { return 0, false, nil }
 
 func listen(t testing.TB) net.Listener {
 	t.Helper()
@@ -264,6 +291,63 @@ func TestConcurrentClients(t *testing.T) {
 	}
 }
 
+func TestTTLOps(t *testing.T) {
+	addr, _ := serve(t, newMemStore())
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	do := func(req protocol.Request) []byte {
+		t.Helper()
+		if err := protocol.WriteFrame(conn, req.Append(nil)); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := protocol.ReadFrame(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	remaining := func(resp []byte) uint64 {
+		t.Helper()
+		if resp[0] != protocol.StatusOK {
+			t.Fatalf("ttl answered status %d %q", resp[0], resp[1:])
+		}
+		ms, n := binary.Uvarint(resp[1:])
+		if n != len(resp)-1 {
+			t.Fatalf("ttl body %v is not one uvarint", resp[1:])
+		}
+		return ms
+	}
+
+	if resp := do(protocol.Request{Op: protocol.OpTTL, Key: "k"}); resp[0] != protocol.StatusNotFound {
+		t.Fatalf("ttl of a missing key: status %d", resp[0])
+	}
+	if resp := do(protocol.Request{Op: protocol.OpExpire, Client: 1, Seq: 1, Key: "k", TTL: 5000}); !bytes.Equal(resp, []byte{protocol.StatusOK, 0}) {
+		t.Fatalf("expire of a missing key: %v", resp)
+	}
+	do(protocol.Request{Op: protocol.OpSet, Client: 1, Seq: 2, Key: "k", Value: []byte("v"), TTL: 60_000})
+	if ms := remaining(do(protocol.Request{Op: protocol.OpTTL, Key: "k"})); ms == 0 || ms > 60_000 {
+		t.Fatalf("ttl after set with 60s: %d ms", ms)
+	}
+	if resp := do(protocol.Request{Op: protocol.OpExpire, Client: 1, Seq: 3, Key: "k", TTL: 120_000}); !bytes.Equal(resp, []byte{protocol.StatusOK, 1}) {
+		t.Fatalf("expire of a live key: %v", resp)
+	}
+	if ms := remaining(do(protocol.Request{Op: protocol.OpTTL, Key: "k"})); ms <= 60_000 || ms > 120_000 {
+		t.Fatalf("ttl after expire with 120s: %d ms", ms)
+	}
+	do(protocol.Request{Op: protocol.OpSet, Client: 1, Seq: 4, Key: "k", Value: []byte("v")})
+	if ms := remaining(do(protocol.Request{Op: protocol.OpTTL, Key: "k"})); ms != 0 {
+		t.Fatalf("ttl of a key with no deadline: %d", ms)
+	}
+	do(protocol.Request{Op: protocol.OpExpire, Client: 1, Seq: 5, Key: "k", TTL: 0})
+	if resp := do(protocol.Request{Op: protocol.OpGet, Key: "k"}); resp[0] != protocol.StatusNotFound {
+		t.Fatalf("get after expire with ttl 0: status %d", resp[0])
+	}
+}
+
 func TestMalformedRequests(t *testing.T) {
 	addr, _ := serve(t, newMemStore())
 	good := dial(t, addr)
@@ -295,6 +379,9 @@ func TestMalformedRequests(t *testing.T) {
 		"incr bad delta":       {protocol.OpIncr, 1, 1, 1, 'k', 0xff},
 		"incr trailing bytes":  {protocol.OpIncr, 1, 1, 1, 'k', 2, 0},
 		"incr without session": {protocol.OpIncr, 1, 'k', 2},
+		"set without ttl":      {protocol.OpSet, 1, 1, 1, 'k', 1, 'v'},
+		"expire without ttl":   {protocol.OpExpire, 1, 1, 1, 'k'},
+		"ttl trailing bytes":   {protocol.OpTTL, 1, 'k', 0},
 	}
 	for name, payload := range bad {
 		if err := protocol.WriteFrame(conn, payload); err != nil {
@@ -357,7 +444,7 @@ type blockingStore struct {
 }
 
 func (s *blockingStore) Get(string) ([]byte, bool, error) { return nil, false, nil }
-func (s *blockingStore) Set(uint64, uint64, string, []byte) error {
+func (s *blockingStore) Set(uint64, uint64, string, []byte, time.Duration) error {
 	close(s.entered)
 	<-s.release
 	return nil
@@ -400,7 +487,7 @@ type failingStore struct {
 }
 
 func (*failingStore) Get(string) ([]byte, bool, error) { return nil, false, nil }
-func (s *failingStore) Set(uint64, uint64, string, []byte) error {
+func (s *failingStore) Set(uint64, uint64, string, []byte, time.Duration) error {
 	s.calls.Add(1)
 	return errors.New("disk on fire")
 }
@@ -448,11 +535,25 @@ func (r *redirectStore) Get(key string) ([]byte, bool, error) {
 	return r.next.Get(key)
 }
 
-func (r *redirectStore) Set(client, seq uint64, key string, value []byte) error {
+func (r *redirectStore) Set(client, seq uint64, key string, value []byte, ttl time.Duration) error {
 	if err := r.redirect(); err != nil || r.next == nil {
 		return err
 	}
-	return r.next.Set(client, seq, key, value)
+	return r.next.Set(client, seq, key, value, ttl)
+}
+
+func (r *redirectStore) Expire(client, seq uint64, key string, ttl time.Duration) (bool, error) {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return false, err
+	}
+	return r.next.Expire(client, seq, key, ttl)
+}
+
+func (r *redirectStore) TTL(key string) (time.Duration, bool, error) {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return 0, false, err
+	}
+	return r.next.TTL(key)
 }
 
 func (r *redirectStore) Delete(client, seq uint64, key string) error {
@@ -764,7 +865,7 @@ func TestClientRedialsTheSeeds(t *testing.T) {
 	if err := c.Set(t.Context(), "k", []byte("v")); err != nil {
 		t.Fatalf("set after the connected server stopped: %v", err)
 	}
-	if v, ok := store.s.Get("k"); !ok || string(v) != "v" {
+	if v, ok := store.s.Get("k", now()); !ok || string(v) != "v" {
 		t.Fatalf("second seed has k = %q, %v; want the retried write", v, ok)
 	}
 }
@@ -784,11 +885,11 @@ type unknownStore struct {
 	fail atomic.Bool
 }
 
-func (s *unknownStore) Set(client, seq uint64, key string, value []byte) error {
+func (s *unknownStore) Set(client, seq uint64, key string, value []byte, ttl time.Duration) error {
 	if s.fail.Load() {
 		return fmt.Errorf("propose: %w", protocol.ErrOutcomeUnknown)
 	}
-	return s.memStore.Set(client, seq, key, value)
+	return s.memStore.Set(client, seq, key, value, ttl)
 }
 
 func TestWriteAfterAnAbandonedFirstWriteSucceeds(t *testing.T) {

@@ -13,7 +13,8 @@ import (
 const MaxFrameSize = 16 << 20
 
 // Request payload: op | session (writes only: uvarint client | uvarint seq) | uvarint-length-prefixed key | rest
-// set rest: value field; cas rest: byte expectFound | expected field | value field; incr rest: varint delta
+// set rest: value field | uvarint ttl ms, 0 for none; cas rest: byte expectFound | expected field | value field
+// incr rest: varint delta; expire rest: varint ttl ms; ttl has no rest
 const (
 	OpPing byte = iota + 1
 	OpGet
@@ -21,10 +22,16 @@ const (
 	OpDel
 	OpCas
 	OpIncr
+	OpExpire
+	OpTTL
 )
 
+// MaxTTL is the longest ttl a request may carry, in ms: about 100 years
+const MaxTTL = 100 * 365 * 24 * 3600 * 1000
+
 // response payload: status | body
-// OK bodies: the value for get, 1 or 0 for whether a cas swapped, the new value in decimal for incr
+// OK bodies: the value for get, 1 or 0 for whether a cas swapped or an expire found a live key, the new value in decimal
+// for incr, the uvarint ms left for ttl with 0 for no deadline (NotFound if the key is missing or expired)
 const (
 	StatusOK byte = iota
 	StatusNotFound
@@ -92,10 +99,12 @@ type Request struct {
 	Expected    []byte
 	ExpectFound bool
 	Delta       int64
+	// TTL is in ms: for a set 0 means none, for an expire a value at or below 0 deletes the key
+	TTL int64
 }
 
 func (r Request) IsWrite() bool {
-	return r.Op == OpSet || r.Op == OpDel || r.Op == OpCas || r.Op == OpIncr
+	return r.Op == OpSet || r.Op == OpDel || r.Op == OpCas || r.Op == OpIncr || r.Op == OpExpire
 }
 
 func (r Request) Append(b []byte) []byte {
@@ -110,7 +119,9 @@ func (r Request) Append(b []byte) []byte {
 	b = appendField(b, []byte(r.Key))
 	switch r.Op {
 	case OpSet:
-		b = appendField(b, r.Value)
+		b = binary.AppendUvarint(appendField(b, r.Value), uint64(r.TTL))
+	case OpExpire:
+		b = binary.AppendVarint(b, r.TTL)
 	case OpCas:
 		flag := byte(0)
 		if r.ExpectFound {
@@ -135,7 +146,7 @@ func ParseRequest(p []byte) (Request, error) {
 	}
 	r.Op = p[0]
 	rest := p[1:]
-	if r.Op < OpPing || r.Op > OpIncr {
+	if r.Op < OpPing || r.Op > OpTTL {
 		return r, fmt.Errorf("unknown op %d", r.Op)
 	}
 	if r.Op == OpPing {
@@ -170,6 +181,17 @@ func ParseRequest(p []byte) (Request, error) {
 		if r.Value, rest, err = cutField(rest); err != nil {
 			return r, fmt.Errorf("value: %w", err)
 		}
+		ttl, w := binary.Uvarint(rest)
+		if w <= 0 || ttl > MaxTTL {
+			return r, fmt.Errorf("ttl: missing, malformed or over %d", MaxTTL)
+		}
+		r.TTL, rest = int64(ttl), rest[w:]
+	case OpExpire:
+		ttl, w := binary.Varint(rest)
+		if w <= 0 || ttl > MaxTTL || ttl < -MaxTTL {
+			return r, fmt.Errorf("ttl: missing, malformed or beyond %d", MaxTTL)
+		}
+		r.TTL, rest = ttl, rest[w:]
 	case OpCas:
 		if len(rest) == 0 || rest[0] > 1 {
 			return r, errors.New("expect flag: missing or not 0 or 1")
