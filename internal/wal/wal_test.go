@@ -138,6 +138,34 @@ func TestReplayErrorFailsOpen(t *testing.T) {
 	}
 }
 
+func TestRewriteReplacesContents(t *testing.T) {
+	for name, recs := range map[string][]string{"records": {"c", "dd"}, "none": nil} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "wal")
+			l, _ := open(t, path)
+			appendAll(t, l, "a", "b")
+			mustClose(t, l)
+
+			var raw [][]byte
+			for _, r := range recs {
+				raw = append(raw, []byte(r))
+			}
+			l, err := Rewrite(path, raw)
+			if err != nil {
+				t.Fatalf("rewrite: %v", err)
+			}
+			appendAll(t, l, "e")
+			mustClose(t, l)
+
+			l, got := open(t, path)
+			defer mustClose(t, l)
+			if want := append(slices.Clone(recs), "e"); !slices.Equal(got, want) {
+				t.Fatalf("replay after rewrite: got %v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestAppendRejectsEmptyRecord(t *testing.T) {
 	l, _ := open(t, filepath.Join(t.TempDir(), "wal"))
 	defer mustClose(t, l)

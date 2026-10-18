@@ -48,18 +48,10 @@ func Open(path string, replay func(record []byte) error) (*Log, error) {
 
 // Append writes record and fsyncs before returning.
 func (l *Log) Append(record []byte) error {
-	if len(record) == 0 {
-		return errors.New("wal record is empty")
+	buf, err := frame(nil, record)
+	if err != nil {
+		return err
 	}
-	if len(record) > MaxRecordSize {
-		return fmt.Errorf("wal record of %d bytes exceeds limit of %d", len(record), MaxRecordSize)
-	}
-
-	buf := make([]byte, headerSize+len(record))
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(record)))
-	binary.LittleEndian.PutUint32(buf[4:8], crc32.Checksum(record, crcTable))
-	copy(buf[headerSize:], record)
-
 	if _, err := l.f.Write(buf); err != nil {
 		return fmt.Errorf("write wal record: %w", err)
 	}
@@ -67,6 +59,59 @@ func (l *Log) Append(record []byte) error {
 		return fmt.Errorf("sync wal: %w", err)
 	}
 	return nil
+}
+
+// Rewrite atomically replaces the log at path with records and opens it for appending.
+// Close any Log open on path first.
+func Rewrite(path string, records [][]byte) (*Log, error) {
+	var buf []byte
+	for _, rec := range records {
+		var err error
+		if buf, err = frame(buf, rec); err != nil {
+			return nil, err
+		}
+	}
+	tmp := path + ".tmp"
+	if err := writeSync(tmp, buf); err != nil {
+		return nil, fmt.Errorf("write rewritten wal: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("rename rewritten wal: %w", err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("sync wal dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open rewritten wal: %w", err)
+	}
+	return &Log{f: f}, nil
+}
+
+func frame(buf, record []byte) ([]byte, error) {
+	if len(record) == 0 {
+		return nil, errors.New("wal record is empty")
+	}
+	if len(record) > MaxRecordSize {
+		return nil, fmt.Errorf("wal record of %d bytes exceeds limit of %d", len(record), MaxRecordSize)
+	}
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(record)))
+	buf = binary.LittleEndian.AppendUint32(buf, crc32.Checksum(record, crcTable))
+	return append(buf, record...), nil
+}
+
+func writeSync(path string, b []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		return errors.Join(err, f.Close())
+	}
+	if err := f.Sync(); err != nil {
+		return errors.Join(err, f.Close())
+	}
+	return f.Close()
 }
 
 func (l *Log) Close() error {
