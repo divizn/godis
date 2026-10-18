@@ -800,8 +800,9 @@ func TestWriteGivesUpWithOutcomeUnknown(t *testing.T) {
 	if err := c.Set("k", []byte("w")); !errors.Is(err, ErrOutcomeUnknown) {
 		t.Fatalf("second write: got %v", err)
 	}
-	if last := f.requests(); last[len(last)-1].seq != reqs[0].seq+1 {
-		t.Fatalf("write after giving up sent seq %d, want %d", last[len(last)-1].seq, reqs[0].seq+1)
+	// nothing applied yet, so a new session rather than seq 2
+	if last := f.requests()[len(f.requests())-1]; last.client == reqs[0].client || last.seq != 1 {
+		t.Fatalf("write after giving up sent session (%d, %d) after (%d, %d), want a new client at seq 1", last.client, last.seq, reqs[0].client, reqs[0].seq)
 	}
 }
 
@@ -839,5 +840,36 @@ func TestOutcomeUnknownSentAsStatusUnknown(t *testing.T) {
 	}
 	if resp := errorResponse(errors.New("value is not an integer")); resp[0] != statusError {
 		t.Fatalf("a failed write was answered with status %d, want ERROR", resp[0])
+	}
+}
+
+// unknownStore answers writes with an unknown outcome without applying them while fail is positive
+type unknownStore struct {
+	*memStore
+	fail atomic.Bool
+}
+
+func (s *unknownStore) Set(client, seq uint64, key string, value []byte) error {
+	if s.fail.Load() {
+		return fmt.Errorf("propose: %w", ErrOutcomeUnknown)
+	}
+	return s.memStore.Set(client, seq, key, value)
+}
+
+func TestWriteAfterAnAbandonedFirstWriteSucceeds(t *testing.T) {
+	store := &unknownStore{memStore: newMemStore()}
+	store.fail.Store(true)
+	addr, _ := serve(t, store)
+	c := dial(t, addr)
+	c.retryFor = 200 * time.Millisecond
+	if err := c.Set("k", []byte("lost")); !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("first write: got %v, want ErrOutcomeUnknown", err)
+	}
+	store.fail.Store(false)
+	if err := c.Set("k", []byte("v")); err != nil {
+		t.Fatalf("write after the first was abandoned without applying: %v", err)
+	}
+	if err := c.Set("k", []byte("w")); err != nil {
+		t.Fatalf("third write: %v", err)
 	}
 }

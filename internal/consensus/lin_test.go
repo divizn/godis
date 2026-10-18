@@ -177,15 +177,19 @@ type linClient struct {
 	rec    *linRecorder
 	rng    *rand.Rand
 	client int
-	seq    uint64
-	target string
+	// id is the session's client id, the client in its low byte and a new session number above it each time
+	// a write fails before any under id applied, as the network client does
+	id, seq   uint64
+	sessions  uint64
+	confirmed bool
+	target    string
 	// seen is the last value this client saw at each key, nil for absent, so a cas often expects the current value
 	seen map[string]*string
 }
 
 func (lc *linClient) run(end time.Time, think time.Duration) {
 	lc.target = lc.c.ids[lc.rng.IntN(len(lc.c.ids))]
-	id := uint64(lc.client + 1)
+	lc.id = uint64(lc.client + 1)
 	for n := 0; ; n++ {
 		time.Sleep(time.Duration(lc.rng.Int64N(int64(2 * think))))
 		if time.Now().After(end) {
@@ -198,22 +202,22 @@ func (lc *linClient) run(end time.Time, think time.Duration) {
 		case r < 5:
 			lc.seq++
 			op.Kind, op.Value = lincheck.Set, value
-			cmd = storage.EncodeSet(id, lc.seq, op.Key, []byte(value))
+			cmd = storage.EncodeSet(lc.id, lc.seq, op.Key, []byte(value))
 		case r < 7:
 			lc.seq++
 			op.Kind = lincheck.Del
-			cmd = storage.EncodeDelete(id, lc.seq, op.Key)
+			cmd = storage.EncodeDelete(lc.id, lc.seq, op.Key)
 		case r < 10:
 			lc.seq++
 			op.Kind, op.Value = lincheck.Cas, value
 			if v := lc.seen[op.Key]; v != nil {
 				op.Expected, op.ExpectFound = *v, true
 			}
-			cmd = storage.EncodeCas(id, lc.seq, op.Key, []byte(op.Expected), op.ExpectFound, []byte(value))
+			cmd = storage.EncodeCas(lc.id, lc.seq, op.Key, []byte(op.Expected), op.ExpectFound, []byte(value))
 		case r < 13:
 			lc.seq++
 			op.Kind, op.Key, op.Delta = lincheck.Incr, linCounters[lc.rng.IntN(len(linCounters))], 1+lc.rng.Int64N(3)
-			cmd = storage.EncodeIncr(id, lc.seq, op.Key, op.Delta)
+			cmd = storage.EncodeIncr(lc.id, lc.seq, op.Key, op.Delta)
 		default:
 			op.Kind = lincheck.Get
 			if lc.rng.IntN(3) == 0 {
@@ -223,6 +227,13 @@ func (lc *linClient) run(end time.Time, think time.Duration) {
 
 		op.Call = lc.rec.clock.Add(1)
 		body, found, ok := lc.send(op.Key, cmd)
+		if cmd != nil && !ok && !lc.confirmed {
+			lc.sessions++
+			lc.id, lc.seq = uint64(lc.client+1)|lc.sessions<<8, 0
+		}
+		if cmd != nil && ok {
+			lc.confirmed = true
+		}
 		if !ok {
 			if op.Kind != lincheck.Get {
 				op.Return = lincheck.Pending
@@ -275,6 +286,8 @@ func (lc *linClient) send(key string, cmd []byte) (body []byte, found, ok bool) 
 				if r, err = n.Propose(ctx, cmd); err == nil {
 					if body, err = storage.ParseResult(r); err != nil {
 						lc.t.Errorf("write %q failed: %v", cmd, err)
+						cancel()
+						return nil, false, false
 					}
 				}
 			}

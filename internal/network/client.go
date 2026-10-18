@@ -35,6 +35,8 @@ type Client struct {
 	r      *bufio.Reader
 	id     uint64
 	seq    uint64
+	// confirmed is whether a write under id has applied, so the cluster holds a session for it
+	confirmed bool
 	// retryFor is how long a request is retried, retryTimeout outside tests
 	retryFor time.Duration
 }
@@ -44,11 +46,10 @@ func Dial(addrs ...string) (*Client, error) {
 	if len(addrs) == 0 {
 		return nil, errors.New("connect to godis: no address")
 	}
-	var id [8]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		return nil, fmt.Errorf("pick client id: %w", err)
+	c := &Client{seeds: addrs, retryFor: retryTimeout}
+	if err := c.newSession(); err != nil {
+		return nil, err
 	}
-	c := &Client{seeds: addrs, id: binary.LittleEndian.Uint64(id[:]), retryFor: retryTimeout}
 	if err := c.connectAny(); err != nil {
 		return nil, fmt.Errorf("connect to godis: %w", err)
 	}
@@ -108,11 +109,28 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// write sends req with the session's next seq, the same on every retry
+// newSession picks a random client id and starts its seqs at 1
+func (c *Client) newSession() error {
+	var id [8]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return fmt.Errorf("pick client id: %w", err)
+	}
+	c.id, c.seq, c.confirmed = binary.LittleEndian.Uint64(id[:]), 0, false
+	return nil
+}
+
+// write sends req with the next seq, the same on every retry; until one applies, a write that fails starts a new session, since the cluster would refuse seq 2 from a client it has no session for
 func (c *Client) write(req request) (byte, []byte, error) {
 	c.seq++
 	req.client, req.seq = c.id, c.seq
 	status, body, err := c.do(req)
+	if err == nil {
+		c.confirmed = true
+	} else if !c.confirmed {
+		if serr := c.newSession(); serr != nil {
+			err = errors.Join(err, serr)
+		}
+	}
 	var se *serverError
 	if err != nil && !errors.As(err, &se) {
 		return 0, nil, fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
