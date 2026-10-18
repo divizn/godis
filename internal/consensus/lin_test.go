@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -29,9 +30,13 @@ const (
 	linOps      = 200
 	linOpWindow = 2 * time.Second
 	linBudget   = 1 << 20
+	linRetryFor = 10 * time.Second
 )
 
-var linKeys = []string{"x", "y", "z"}
+var (
+	linKeys     = []string{"x", "y", "z"}
+	linCounters = []string{"n1", "n2"}
+)
 
 // TestLinearizable runs clients against a Raft cluster with a storage.Store state machine under a seeded
 // fault schedule, then checks the recorded history for linearizability
@@ -52,9 +57,9 @@ func TestLinearizable(t *testing.T) {
 
 type linRecorder struct {
 	clock   atomic.Int64
+	retries atomic.Int64
 	mu      sync.Mutex
 	history []lincheck.Op
-	sets    []string
 }
 
 func (r *linRecorder) record(op lincheck.Op) {
@@ -79,8 +84,8 @@ func linRun(t *testing.T, seed uint64) {
 	var rec linRecorder
 	var wg sync.WaitGroup
 	for i := range linClients {
-		crng := rand.New(rand.NewPCG(rng.Uint64(), uint64(i)))
-		wg.Go(func() { linClient(c, &rec, crng, i, end, think) })
+		lc := &linClient{t: t, c: c, rec: &rec, rng: rand.New(rand.NewPCG(rng.Uint64(), uint64(i))), client: i, seen: map[string]*string{}}
+		wg.Go(func() { lc.run(end, think) })
 	}
 	nrng := rand.New(rand.NewPCG(rng.Uint64(), rng.Uint64()))
 	wg.Go(func() { nemesis(c, nrng, end) })
@@ -100,27 +105,46 @@ func linRun(t *testing.T, seed uint64) {
 		return c.propose(leader, string(marker), time.Second) == nil
 	})
 	c.waitApplied(string(marker))
-	// a client retries only a write that never ran, and values are unique, so each set applies at most once
-	sets := map[string]bool{}
-	for _, cmd := range rec.sets {
-		sets[cmd] = true
-	}
-	applied := map[string]bool{}
+
+	// the log holds a retried write once per attempt that reached it; replaying it must execute each (client, seq) once
+	// and rebuild exactly the stores the nodes have
+	replay := storage.New()
+	executed := map[string]bool{}
+	writes := 0
 	for _, e := range c.checkSame() {
-		if sets[e.cmd] && applied[e.cmd] {
-			t.Errorf("seed %d: write %q applied twice; replay with -lin.seed=%d", seed, e.cmd, seed)
+		dups := replay.Duplicates()
+		if _, err := replay.Apply(e.index, []byte(e.cmd)); err != nil {
+			t.Fatalf("seed %d: replay entry %d: %v", seed, e.index, err)
 		}
-		applied[e.cmd] = true
+		if replay.Duplicates() != dups {
+			continue
+		}
+		if executed[e.cmd] {
+			t.Errorf("seed %d: write %q took effect twice; replay with -lin.seed=%d", seed, e.cmd, seed)
+		}
+		executed[e.cmd] = true
+		if e.cmd != string(marker) {
+			writes++
+		}
+	}
+	for _, id := range c.live() {
+		if _, store := c.nodeStore(id); !bytes.Equal(store.Snapshot(), replay.Snapshot()) {
+			t.Errorf("seed %d: %s store differs from a replay of the log that applies each write once; replay with -lin.seed=%d", seed, id, seed)
+		}
 	}
 
-	pending := 0
+	pending, ops := 0, 0
 	for _, op := range rec.history {
+		if op.Kind != lincheck.Get {
+			ops++
+		}
 		if op.Return == lincheck.Pending {
 			pending++
 		}
 	}
-	t.Logf("%d nodes, %v, %d ops (%d pending), %d leader terms, snapshots every %d entries: %d taken, %d installed",
-		len(c.ids), duration.Round(time.Second), len(rec.history), pending, c.net.leaderTerms(), c.snapEntries, c.snapshots(), c.net.installCount())
+	t.Logf("%d nodes, %v, %d ops, %d writes (%d pending), %d applied, %d retries, %d duplicates dropped, %d leader terms, snapshots every %d entries: %d taken, %d installed",
+		len(c.ids), duration.Round(time.Second), len(rec.history), ops, pending, writes, rec.retries.Load(), replay.Duplicates(),
+		c.net.leaderTerms(), c.snapEntries, c.snapshots(), c.net.installCount())
 	res := lincheck.Check(rec.history, linBudget)
 	if !res.Linearizable {
 		slices.SortFunc(res.Ops, func(a, b lincheck.Op) int { return cmp.Compare(a.Call, b.Call) })
@@ -145,69 +169,133 @@ func (c *cluster) nodeStore(id string) (*Node, *storage.Store) {
 	return nil, nil
 }
 
-// linClient runs operations until end, retrying an operation only on NotLeaderError, which means it never ran
-func linClient(c *cluster, rec *linRecorder, rng *rand.Rand, client int, end time.Time, think time.Duration) {
-	target := c.ids[rng.IntN(len(c.ids))]
-	var seq uint64
+// linClient is one client session: it retries a write whose outcome is unknown with the same (client, seq),
+// on whichever node it tries next, until linRetryFor passes, as the network client does
+type linClient struct {
+	t      *testing.T
+	c      *cluster
+	rec    *linRecorder
+	rng    *rand.Rand
+	client int
+	seq    uint64
+	target string
+	// seen is the last value this client saw at each key, nil for absent, so a cas often expects the current value
+	seen map[string]*string
+}
+
+func (lc *linClient) run(end time.Time, think time.Duration) {
+	lc.target = lc.c.ids[lc.rng.IntN(len(lc.c.ids))]
+	id := uint64(lc.client + 1)
 	for n := 0; ; n++ {
-		time.Sleep(time.Duration(rng.Int64N(int64(2 * think))))
+		time.Sleep(time.Duration(lc.rng.Int64N(int64(2 * think))))
 		if time.Now().After(end) {
 			return
 		}
-		op := lincheck.Op{Client: client, Key: linKeys[rng.IntN(len(linKeys))]}
+		op := lincheck.Op{Client: lc.client, Key: linKeys[lc.rng.IntN(len(linKeys))]}
+		value := fmt.Sprintf("c%d-%d", lc.client, n)
 		var cmd []byte
-		switch r := rng.IntN(10); {
-		case r < 4:
-			seq++
-			op.Kind, op.Value = lincheck.Set, fmt.Sprintf("c%d-%d", client, n)
-			cmd = storage.EncodeSet(uint64(client+1), seq, op.Key, []byte(op.Value))
-			rec.mu.Lock()
-			rec.sets = append(rec.sets, string(cmd))
-			rec.mu.Unlock()
+		switch r := lc.rng.IntN(20); {
 		case r < 5:
-			seq++
+			lc.seq++
+			op.Kind, op.Value = lincheck.Set, value
+			cmd = storage.EncodeSet(id, lc.seq, op.Key, []byte(value))
+		case r < 7:
+			lc.seq++
 			op.Kind = lincheck.Del
-			cmd = storage.EncodeDelete(uint64(client+1), seq, op.Key)
+			cmd = storage.EncodeDelete(id, lc.seq, op.Key)
+		case r < 10:
+			lc.seq++
+			op.Kind, op.Value = lincheck.Cas, value
+			if v := lc.seen[op.Key]; v != nil {
+				op.Expected, op.ExpectFound = *v, true
+			}
+			cmd = storage.EncodeCas(id, lc.seq, op.Key, []byte(op.Expected), op.ExpectFound, []byte(value))
+		case r < 13:
+			lc.seq++
+			op.Kind, op.Key, op.Delta = lincheck.Incr, linCounters[lc.rng.IntN(len(linCounters))], 1+lc.rng.Int64N(3)
+			cmd = storage.EncodeIncr(id, lc.seq, op.Key, op.Delta)
 		default:
 			op.Kind = lincheck.Get
+			if lc.rng.IntN(3) == 0 {
+				op.Key = linCounters[lc.rng.IntN(len(linCounters))]
+			}
 		}
 
-		op.Call = rec.clock.Add(1)
-		ctx, cancel := context.WithTimeout(context.Background(), linOpWindow)
-		var err error
-		for {
-			n, store := c.nodeStore(target)
-			if n == nil {
-				err = ErrStopped
-			} else if op.Kind == lincheck.Get {
+		op.Call = lc.rec.clock.Add(1)
+		body, found, ok := lc.send(op.Key, cmd)
+		if !ok {
+			if op.Kind != lincheck.Get {
+				op.Return = lincheck.Pending
+				lc.rec.record(op)
+			}
+			continue
+		}
+		op.Return = lc.rec.clock.Add(1)
+		switch op.Kind {
+		case lincheck.Get:
+			op.Value, op.Found = string(body), found
+		case lincheck.Cas:
+			op.Found = len(body) == 1 && body[0] == 1
+		case lincheck.Incr:
+			op.Value = string(body)
+		}
+		lc.see(op)
+		lc.rec.record(op)
+	}
+}
+
+// see records the value op leaves at its key, as far as this client can tell
+func (lc *linClient) see(op lincheck.Op) {
+	v := op.Value
+	switch {
+	case op.Kind == lincheck.Del, op.Kind == lincheck.Get && !op.Found:
+		lc.seen[op.Key] = nil
+	case op.Kind == lincheck.Cas && !op.Found:
+		delete(lc.seen, op.Key)
+	default:
+		lc.seen[op.Key] = &v
+	}
+}
+
+// send runs a write of cmd, or with no cmd a read of key, until it has a definite answer, reporting false if it
+// gave up; a NotLeaderError means it never ran, any other error that it may have, so it is resent unchanged
+func (lc *linClient) send(key string, cmd []byte) (body []byte, found, ok bool) {
+	deadline := time.Now().Add(linRetryFor)
+	for {
+		n, store := lc.c.nodeStore(lc.target)
+		err := ErrStopped
+		if n != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), min(linOpWindow, time.Until(deadline)))
+			if cmd == nil {
 				if err = n.ReadIndex(ctx); err == nil {
-					v, ok := store.Get(op.Key)
-					op.Value, op.Found = string(v), ok
+					body, found = store.Get(key)
 				}
 			} else {
-				_, err = n.Propose(ctx, cmd)
+				var r []byte
+				if r, err = n.Propose(ctx, cmd); err == nil {
+					if body, err = storage.ParseResult(r); err != nil {
+						lc.t.Errorf("write %q failed: %v", cmd, err)
+					}
+				}
 			}
-			var nle *NotLeaderError
-			if err == nil || ctx.Err() != nil || n != nil && !errors.As(err, &nle) {
-				break
-			}
-			if n != nil && nle.Leader != "" {
-				target = nle.Leader
-			} else {
-				target = c.ids[rng.IntN(len(c.ids))]
-				time.Sleep(10 * time.Millisecond)
+			cancel()
+			if err == nil {
+				return body, found, true
 			}
 		}
-		cancel()
-		switch {
-		case err == nil:
-			op.Return = rec.clock.Add(1)
-		case op.Kind == lincheck.Get:
+		if time.Now().After(deadline) {
+			return nil, false, false
+		}
+		var nle *NotLeaderError
+		if n != nil && errors.As(err, &nle) && nle.Leader != "" {
+			lc.target = nle.Leader
 			continue
-		default:
-			op.Return = lincheck.Pending
 		}
-		rec.record(op)
+		if n != nil && cmd != nil && nle == nil {
+			lc.rec.retries.Add(1)
+		}
+		lc.target = lc.c.ids[lc.rng.IntN(len(lc.c.ids))]
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
