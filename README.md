@@ -122,7 +122,7 @@ A seed reproduces the fault schedule, not every goroutine interleaving (synctest
 - Taking a snapshot encodes the store under its read lock, which blocks writes to the store (and so applying) for that long.
 - No client dedupe: a write that timed out, or failed because its leader stepped down, may still commit, and a retry applies it again.
 - One heartbeat round per read; concurrent reads are not batched.
-- A follower holds the Raft mutex across the fsync of a big append, so a heartbeat arriving meanwhile waits for it.
+- A follower holds the Raft mutex across the fsync of a big append or a received snapshot, so a heartbeat arriving meanwhile waits for it.
 - A corrupt log is not repaired: wipe that node's data dir by hand and let it catch up.
 - No membership changes: the cluster is fixed at startup.
 - No pre-vote, so a node rejoining after a partition bumps the term and forces an election.
