@@ -66,6 +66,7 @@ func linRun(t *testing.T, seed uint64) {
 	rng := rand.New(rand.NewPCG(seed, seed))
 	c := newStoppedCluster(t, []int{3, 5}[rng.IntN(2)], rng.Uint64())
 	c.kv = true
+	c.snapEntries = 1 + seed%20
 	for _, id := range c.ids {
 		c.start(id)
 	}
@@ -119,7 +120,8 @@ func linRun(t *testing.T, seed uint64) {
 			pending++
 		}
 	}
-	t.Logf("%d nodes, %v, %d ops (%d pending), %d leader terms", len(c.ids), duration.Round(time.Second), len(rec.history), pending, c.net.leaderTerms())
+	t.Logf("%d nodes, %v, %d ops (%d pending), %d leader terms, snapshots every %d entries: %d taken, %d installed",
+		len(c.ids), duration.Round(time.Second), len(rec.history), pending, c.net.leaderTerms(), c.snapEntries, c.snapshots(), c.net.installCount())
 	res := lincheck.Check(rec.history, linBudget)
 	if !res.Linearizable {
 		slices.SortFunc(res.Ops, func(a, b lincheck.Op) int { return cmp.Compare(a.Call, b.Call) })

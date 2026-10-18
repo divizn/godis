@@ -101,10 +101,25 @@ type AppendEntriesReply struct {
 	ConflictTerm  uint64
 }
 
-// Transport sends Raft RPCs to a peer, served there by HandleRequestVote and HandleAppendEntries.
+// InstallSnapshotArgs carries a leader's whole snapshot, covering the log up to LastIndex.
+// ponytail: one RPC, no chunking, so a snapshot must fit in memory and one gob message; chunk it if the store outgrows that
+type InstallSnapshotArgs struct {
+	Term      uint64
+	Leader    string
+	LastIndex uint64
+	LastTerm  uint64
+	Data      []byte
+}
+
+type InstallSnapshotReply struct {
+	Term uint64
+}
+
+// Transport sends Raft RPCs to a peer, served there by HandleRequestVote, HandleAppendEntries and HandleInstallSnapshot.
 type Transport interface {
 	RequestVote(ctx context.Context, to string, args RequestVoteArgs) (RequestVoteReply, error)
 	AppendEntries(ctx context.Context, to string, args AppendEntriesArgs) (AppendEntriesReply, error)
+	InstallSnapshot(ctx context.Context, to string, args InstallSnapshotArgs) (InstallSnapshotReply, error)
 }
 
 type Config struct {
@@ -113,8 +128,15 @@ type Config struct {
 	Peers     []string
 	Dir       string
 	Transport Transport
-	// Apply gets committed commands in order, once per process lifetime (the whole log again after a restart).
+	// Apply gets committed commands in order, once per process lifetime: after a restart, every command after the snapshot again.
 	Apply func(index uint64, cmd []byte)
+	// Snapshot encodes the state machine as of the last command applied; it is never called during Apply.
+	// Snapshot and Restore are set together; with neither, the log is never compacted.
+	Snapshot func() []byte
+	// Restore replaces the state machine with one a Snapshot encoded, here or on the leader.
+	Restore func([]byte) error
+	// SnapshotEntries is how many entries applied since the last snapshot trigger the next, default 10000.
+	SnapshotEntries uint64
 	// ElectionTimeout is randomized up to twice its value, default 150ms.
 	ElectionTimeout time.Duration
 	// HeartbeatInterval defaults to 50ms and must be below ElectionTimeout.
@@ -125,11 +147,12 @@ type Config struct {
 }
 
 type Status struct {
-	ID          string
-	Role        Role
-	Term        uint64
-	Leader      string
-	CommitIndex uint64
+	ID            string
+	Role          Role
+	Term          uint64
+	Leader        string
+	CommitIndex   uint64
+	SnapshotIndex uint64
 }
 
 type Node struct {
@@ -138,6 +161,9 @@ type Node struct {
 	dir            string
 	tr             Transport
 	apply          func(uint64, []byte)
+	snapshot       func() []byte
+	restore        func([]byte) error
+	snapEntries    uint64
 	onLeaderChange func(uint64, string)
 	election       time.Duration
 	heartbeat      time.Duration
@@ -148,14 +174,16 @@ type Node struct {
 	wg     sync.WaitGroup
 
 	// ponytail: one lock over all state, held across fsyncs; split it and add group commit if a benchmark asks
-	mu          sync.Mutex
-	applyCond   *sync.Cond
-	wal         *wal.Log
-	role        Role
-	term        uint64
-	votedFor    string
-	leader      string
+	mu        sync.Mutex
+	applyCond *sync.Cond
+	wal       *wal.Log
+	role      Role
+	term      uint64
+	votedFor  string
+	leader    string
+	// log[0] stands for the snapshot, holding its last term; entry i is log[i-snapIndex]
 	log         []Entry
+	snapIndex   uint64
 	commitIndex uint64
 	lastApplied uint64
 	deadline    time.Time
@@ -167,6 +195,8 @@ type Node struct {
 	waiters map[uint64]chan error
 	// applied is closed and replaced each time lastApplied advances or the node stops leading
 	applied chan struct{}
+	// pending is an installed snapshot the applier has yet to restore
+	pending *InstallSnapshotArgs
 }
 
 // New restores the node's term, vote and log from cfg.Dir and starts it as a follower.
@@ -189,12 +219,30 @@ func New(cfg Config) (*Node, error) {
 	if cfg.HeartbeatInterval >= cfg.ElectionTimeout {
 		return nil, fmt.Errorf("consensus: heartbeat %v must be below election timeout %v", cfg.HeartbeatInterval, cfg.ElectionTimeout)
 	}
+	if (cfg.Snapshot == nil) != (cfg.Restore == nil) {
+		return nil, errors.New("consensus: Snapshot and Restore must be set together")
+	}
+	if cfg.SnapshotEntries == 0 {
+		cfg.SnapshotEntries = 10000
+	}
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create raft dir: %w", err)
 	}
 	term, vote, err := readState(cfg.Dir)
 	if err != nil {
 		return nil, err
+	}
+	snapIndex, snapTerm, data, err := readSnapshot(cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	if snapIndex > 0 {
+		if cfg.Restore == nil {
+			return nil, errors.New("consensus: raft dir holds a snapshot but Restore is not set")
+		}
+		if err := cfg.Restore(data); err != nil {
+			return nil, fmt.Errorf("restore raft snapshot at %d: %w", snapIndex, err)
+		}
 	}
 
 	n := &Node{
@@ -203,13 +251,19 @@ func New(cfg Config) (*Node, error) {
 		dir:            cfg.Dir,
 		tr:             cfg.Transport,
 		apply:          cfg.Apply,
+		snapshot:       cfg.Snapshot,
+		restore:        cfg.Restore,
+		snapEntries:    cfg.SnapshotEntries,
 		onLeaderChange: cfg.OnLeaderChange,
 		election:       cfg.ElectionTimeout,
 		heartbeat:      cfg.HeartbeatInterval,
 		wake:           map[string]chan struct{}{},
 		term:           term,
 		votedFor:       vote,
-		log:            []Entry{{}},
+		log:            []Entry{{Term: snapTerm}},
+		snapIndex:      snapIndex,
+		commitIndex:    snapIndex,
+		lastApplied:    snapIndex,
 		waiters:        map[uint64]chan error{},
 		applied:        make(chan struct{}),
 	}
@@ -232,16 +286,23 @@ func New(cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// ponytail: no snapshots, so the log file, memory and restart replay grow with all history; add compaction when that hurts
 func (n *Node) replay(rec []byte) error {
 	start, entries, err := decodeBatch(rec)
 	if err != nil {
 		return fmt.Errorf("decode raft log batch: %w", err)
 	}
-	if start == 0 || start > uint64(len(n.log)) {
-		return fmt.Errorf("raft log batch starts at %d but log ends at %d", start, len(n.log)-1)
+	if start == 0 || start > n.lastIndex()+1 {
+		return fmt.Errorf("raft log batch starts at %d but log ends at %d", start, n.lastIndex())
 	}
-	n.log = append(n.log[:start], entries...)
+	// entries the snapshot covers are committed, left over from a crash before the log was rewritten
+	if start <= n.snapIndex {
+		skip := n.snapIndex + 1 - start
+		if skip >= uint64(len(entries)) {
+			return nil
+		}
+		start, entries = n.snapIndex+1, entries[skip:]
+	}
+	n.log = append(n.log[:start-n.snapIndex], entries...)
 	return nil
 }
 
@@ -292,7 +353,7 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) error {
 func (n *Node) Status() Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, CommitIndex: n.commitIndex}
+	return Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, CommitIndex: n.commitIndex, SnapshotIndex: n.snapIndex}
 }
 
 // Stop halts the node and closes its log, returning the persistence error that halted it, if any.
@@ -343,8 +404,8 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) (RequestVoteReply, error)
 		}
 	}
 	last := n.lastIndex()
-	upToDate := args.LastLogTerm > n.log[last].Term ||
-		args.LastLogTerm == n.log[last].Term && args.LastLogIndex >= last
+	upToDate := args.LastLogTerm > n.termAt(last) ||
+		args.LastLogTerm == n.termAt(last) && args.LastLogIndex >= last
 	if (n.votedFor != "" && n.votedFor != args.Candidate) || !upToDate {
 		return RequestVoteReply{Term: n.term}, nil
 	}
@@ -376,18 +437,21 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesReply, 
 		reply.ConflictIndex = last + 1
 		return reply, nil
 	}
-	if t := n.log[args.PrevLogIndex].Term; t != args.PrevLogTerm {
-		i := args.PrevLogIndex
-		for i > 1 && n.log[i-1].Term == t {
-			i--
+	// entries the snapshot covers are committed, so they match whatever the leader sends for them
+	if args.PrevLogIndex >= n.snapIndex {
+		if t := n.termAt(args.PrevLogIndex); t != args.PrevLogTerm {
+			i := args.PrevLogIndex
+			for i > n.snapIndex+1 && n.termAt(i-1) == t {
+				i--
+			}
+			reply.ConflictTerm, reply.ConflictIndex = t, i
+			return reply, nil
 		}
-		reply.ConflictTerm, reply.ConflictIndex = t, i
-		return reply, nil
 	}
 
 	for i, e := range args.Entries {
 		idx := args.PrevLogIndex + 1 + uint64(i)
-		if idx <= n.lastIndex() && n.log[idx].Term == e.Term {
+		if idx <= n.snapIndex || idx <= n.lastIndex() && n.termAt(idx) == e.Term {
 			continue
 		}
 		if err := n.appendLog(idx, args.Entries[i:]); err != nil {
@@ -403,7 +467,82 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesReply, 
 	return reply, nil
 }
 
-func (n *Node) lastIndex() uint64 { return uint64(len(n.log) - 1) }
+// HandleInstallSnapshot serves an InstallSnapshot RPC, replying once the snapshot is durable. An error means no reply must be sent.
+func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.ctx.Err() != nil {
+		return InstallSnapshotReply{}, context.Cause(n.ctx)
+	}
+	if args.Term < n.term {
+		return InstallSnapshotReply{Term: n.term}, nil
+	}
+	if n.restore == nil {
+		return InstallSnapshotReply{}, errors.New("consensus: snapshot sent to a node without Restore")
+	}
+	if err := n.becomeFollower(args.Term); err != nil {
+		return InstallSnapshotReply{}, err
+	}
+	n.setLeader(args.Leader)
+	n.resetDeadline()
+
+	reply := InstallSnapshotReply{Term: n.term}
+	if args.LastIndex <= n.commitIndex {
+		return reply, nil
+	}
+	tmp := filepath.Join(n.dir, "snapshot.recv.tmp")
+	if err := writeSnapshot(tmp, args.LastIndex, args.LastTerm, args.Data); err != nil {
+		err = fmt.Errorf("write received raft snapshot: %w", err)
+		n.halt(err)
+		return InstallSnapshotReply{}, err
+	}
+	if args.LastIndex > n.lastIndex() || n.termAt(args.LastIndex) != args.LastTerm {
+		for i, done := range n.waiters {
+			if i > args.LastIndex {
+				done <- ErrProposalDropped
+				delete(n.waiters, i)
+			}
+		}
+	}
+	if err := n.compact(tmp, args.LastIndex, args.LastTerm); err != nil {
+		return InstallSnapshotReply{}, err
+	}
+	n.commitIndex = args.LastIndex
+	n.pending = &args
+	n.applyCond.Broadcast()
+	return reply, nil
+}
+
+// compact durably makes the snapshot written to tmp this node's, keeping the log after it only if the log holds its last entry; mu must be held
+func (n *Node) compact(tmp string, index, term uint64) error {
+	if err := renameSnapshot(n.dir, tmp); err != nil {
+		n.halt(err)
+		return err
+	}
+	var tail []Entry
+	if index <= n.lastIndex() && n.termAt(index) == term {
+		tail = n.log[index-n.snapIndex+1:]
+	}
+	n.log = append([]Entry{{Term: term}}, tail...)
+	n.snapIndex = index
+
+	err := n.wal.Close()
+	n.wal = nil
+	if err == nil {
+		n.wal, err = wal.Rewrite(filepath.Join(n.dir, "log"), logRecords(n.snapIndex+1, n.log[1:]))
+	}
+	if err != nil {
+		err = fmt.Errorf("rewrite raft log: %w", err)
+		n.halt(err)
+		return err
+	}
+	return nil
+}
+
+func (n *Node) lastIndex() uint64 { return n.snapIndex + uint64(len(n.log)-1) }
+
+// termAt is the term of entry i, from snapIndex to lastIndex; mu must be held
+func (n *Node) termAt(i uint64) uint64 { return n.log[i-n.snapIndex].Term }
 
 func (n *Node) majority() int { return (len(n.peers)+1)/2 + 1 }
 
@@ -445,7 +584,7 @@ func (n *Node) appendLog(start uint64, entries []Entry) error {
 			delete(n.waiters, i)
 		}
 	}
-	n.log = append(n.log[:start], entries...)
+	n.log = append(n.log[:start-n.snapIndex], entries...)
 	return nil
 }
 
@@ -535,7 +674,7 @@ func (n *Node) startElection() {
 		return
 	}
 	last := n.lastIndex()
-	args := RequestVoteArgs{Term: n.term, Candidate: n.id, LastLogIndex: last, LastLogTerm: n.log[last].Term}
+	args := RequestVoteArgs{Term: n.term, Candidate: n.id, LastLogIndex: last, LastLogTerm: n.termAt(last)}
 	for _, p := range n.peers {
 		n.wg.Go(func() { n.requestVote(p, args) })
 	}
@@ -599,7 +738,7 @@ func (n *Node) wakeup(peer string) {
 
 // advanceCommit commits by counting replicas only for entries of the current term (figure 8)
 func (n *Node) advanceCommit() {
-	for i := n.lastIndex(); i > n.commitIndex && n.log[i].Term == n.term; i-- {
+	for i := n.lastIndex(); i > n.commitIndex && n.termAt(i) == n.term; i-- {
 		count := 1
 		for _, p := range n.peers {
 			if n.matchIndex[p] >= i {
@@ -629,11 +768,17 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 			continue
 		}
 		next := n.nextIndex[peer]
+		if next <= n.snapIndex {
+			term, dir := n.term, n.dir
+			n.mu.Unlock()
+			n.sendSnapshot(peer, term, dir)
+			continue
+		}
 		args := AppendEntriesArgs{
 			Term:         n.term,
 			Leader:       n.id,
 			PrevLogIndex: next - 1,
-			PrevLogTerm:  n.log[next-1].Term,
+			PrevLogTerm:  n.termAt(next - 1),
 			Entries:      slices.Clone(n.batch(next)),
 			LeaderCommit: n.commitIndex,
 		}
@@ -650,6 +795,38 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 		n.mu.Lock()
 		n.handleAppendReply(peer, args, reply)
 		n.mu.Unlock()
+	}
+}
+
+// sendSnapshot sends the snapshot on disk to a peer whose next entry it covers, as leader of term
+func (n *Node) sendSnapshot(peer string, term uint64, dir string) {
+	index, lastTerm, data, err := readSnapshot(dir)
+	if err != nil {
+		n.mu.Lock()
+		n.halt(fmt.Errorf("read raft snapshot to send: %w", err))
+		n.mu.Unlock()
+		return
+	}
+	args := InstallSnapshotArgs{Term: term, Leader: n.id, LastIndex: index, LastTerm: lastTerm, Data: data}
+	ctx, cancel := context.WithTimeout(n.ctx, 10*n.election)
+	reply, err := n.tr.InstallSnapshot(ctx, peer, args)
+	cancel()
+	if err != nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !n.recordReply(peer, term, reply.Term) {
+		return
+	}
+	if index > n.matchIndex[peer] {
+		n.matchIndex[peer] = index
+		n.advanceCommit()
+	}
+	n.nextIndex[peer] = index + 1
+	if n.nextIndex[peer] <= n.lastIndex() {
+		n.wakeup(peer)
 	}
 }
 
@@ -670,11 +847,13 @@ func (n *Node) heartbeats(peer string) {
 			continue
 		}
 		match := n.matchIndex[peer]
+		// a peer behind the snapshot fails the check but still resets its election timer
+		prev := max(match, n.snapIndex)
 		args := AppendEntriesArgs{
 			Term:         n.term,
 			Leader:       n.id,
-			PrevLogIndex: match,
-			PrevLogTerm:  n.log[match].Term,
+			PrevLogIndex: prev,
+			PrevLogTerm:  n.termAt(prev),
 			LeaderCommit: min(match, n.commitIndex),
 		}
 		n.mu.Unlock()
@@ -687,7 +866,7 @@ func (n *Node) heartbeats(peer string) {
 		}
 
 		n.mu.Lock()
-		if n.recordReply(peer, args, reply) && (!reply.Success || n.matchIndex[peer] < n.lastIndex()) {
+		if n.recordReply(peer, args.Term, reply.Term) && (!reply.Success || n.matchIndex[peer] < n.lastIndex()) {
 			n.wakeup(peer)
 		}
 		n.mu.Unlock()
@@ -698,26 +877,26 @@ func (n *Node) heartbeats(peer string) {
 func (n *Node) batch(next uint64) []Entry {
 	end, size := next, 0
 	for end <= n.lastIndex() && end-next < maxBatch {
-		size += len(n.log[end].Cmd)
+		size += len(n.log[end-n.snapIndex].Cmd)
 		if end > next && size > maxBatchBytes {
 			break
 		}
 		end++
 	}
-	return n.log[next:end]
+	return n.log[next-n.snapIndex : end-n.snapIndex]
 }
 
-// recordReply steps down on a higher term and records contact, reporting whether the reply answers this leadership; mu must be held
-func (n *Node) recordReply(peer string, args AppendEntriesArgs, reply AppendEntriesReply) bool {
+// recordReply steps down on a higher term and records contact, reporting whether a reply to a request sent in term answers this leadership; mu must be held
+func (n *Node) recordReply(peer string, term, replyTerm uint64) bool {
 	if n.ctx.Err() != nil {
 		return false
 	}
-	if reply.Term > n.term {
-		if err := n.becomeFollower(reply.Term); err != nil {
+	if replyTerm > n.term {
+		if err := n.becomeFollower(replyTerm); err != nil {
 			return false
 		}
 	}
-	if n.role != Leader || n.term != args.Term {
+	if n.role != Leader || n.term != term {
 		return false
 	}
 	n.contact[peer] = time.Now()
@@ -725,7 +904,7 @@ func (n *Node) recordReply(peer string, args AppendEntriesArgs, reply AppendEntr
 }
 
 func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply AppendEntriesReply) {
-	if !n.recordReply(peer, args, reply) {
+	if !n.recordReply(peer, args.Term, reply.Term) {
 		return
 	}
 	if reply.Success {
@@ -745,8 +924,8 @@ func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply Appe
 
 func (n *Node) nextAfterConflict(r AppendEntriesReply) uint64 {
 	if r.ConflictTerm != 0 {
-		for i := n.lastIndex(); i > 0 && n.log[i].Term >= r.ConflictTerm; i-- {
-			if n.log[i].Term == r.ConflictTerm {
+		for i := n.lastIndex(); i > n.snapIndex && n.termAt(i) >= r.ConflictTerm; i-- {
+			if n.termAt(i) == r.ConflictTerm {
 				return i + 1
 			}
 		}
@@ -758,14 +937,27 @@ func (n *Node) runApplier() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for {
-		for n.ctx.Err() == nil && n.lastApplied >= n.commitIndex {
+		for n.ctx.Err() == nil && n.pending == nil && n.lastApplied >= n.commitIndex {
 			n.applyCond.Wait()
 		}
 		if n.ctx.Err() != nil {
 			return
 		}
+		if p := n.pending; p != nil {
+			n.pending = nil
+			n.mu.Unlock()
+			err := n.restore(p.Data)
+			n.mu.Lock()
+			if err != nil {
+				n.halt(fmt.Errorf("restore raft snapshot at %d: %w", p.LastIndex, err))
+				return
+			}
+			n.lastApplied = p.LastIndex
+			n.notifyApplied(ErrLeadershipLost)
+			continue
+		}
 		start := n.lastApplied + 1
-		entries := slices.Clone(n.log[start : n.commitIndex+1])
+		entries := slices.Clone(n.log[start-n.snapIndex : n.commitIndex-n.snapIndex+1])
 		n.mu.Unlock()
 		for i, e := range entries {
 			if len(e.Cmd) > 0 {
@@ -774,15 +966,40 @@ func (n *Node) runApplier() {
 		}
 		n.mu.Lock()
 		n.lastApplied = start + uint64(len(entries)) - 1
-		close(n.applied)
-		n.applied = make(chan struct{})
-		for i, done := range n.waiters {
-			if i <= n.lastApplied {
-				done <- nil
-				delete(n.waiters, i)
-			}
+		n.notifyApplied(nil)
+		if n.snapshot != nil && n.pending == nil && n.lastApplied >= n.snapIndex+n.snapEntries {
+			n.takeSnapshot()
 		}
 	}
+}
+
+// notifyApplied wakes readers and answers the waiters up to lastApplied with err; mu must be held
+func (n *Node) notifyApplied(err error) {
+	close(n.applied)
+	n.applied = make(chan struct{})
+	for i, done := range n.waiters {
+		if i <= n.lastApplied {
+			done <- err
+			delete(n.waiters, i)
+		}
+	}
+}
+
+// takeSnapshot snapshots the state machine at lastApplied and compacts the log, encoding and writing it without mu; mu must be held
+func (n *Node) takeSnapshot() {
+	index, term := n.lastApplied, n.termAt(n.lastApplied)
+	tmp := filepath.Join(n.dir, "snapshot.tmp")
+	n.mu.Unlock()
+	err := writeSnapshot(tmp, index, term, n.snapshot())
+	n.mu.Lock()
+	if err != nil {
+		n.halt(fmt.Errorf("write raft snapshot: %w", err))
+		return
+	}
+	if n.ctx.Err() != nil || n.snapIndex >= index {
+		return
+	}
+	_ = n.compact(tmp, index, term)
 }
 
 // ReadIndex returns once a majority has confirmed this node still leads and everything committed
@@ -852,7 +1069,7 @@ func (n *Node) ReadIndex(ctx context.Context) error {
 
 // readIndex is the commit index, or the last index until the leader has committed in its own term; mu must be held
 func (n *Node) readIndex() uint64 {
-	if n.log[n.commitIndex].Term == n.term {
+	if n.termAt(n.commitIndex) == n.term {
 		return n.commitIndex
 	}
 	return n.lastIndex()

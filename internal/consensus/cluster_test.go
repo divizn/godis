@@ -1,7 +1,9 @@
 package consensus
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -30,8 +32,9 @@ type memNet struct {
 	deaf  string
 	drop  float64
 	delay time.Duration
-	// slowAppend delays every AppendEntries that carries entries
+	// slowAppend delays every AppendEntries that carries entries, and every InstallSnapshot
 	slowAppend time.Duration
+	installs   int
 
 	leaders   map[uint64]string
 	violation string
@@ -153,17 +156,33 @@ func (t memTransport) RequestVote(ctx context.Context, to string, args RequestVo
 	return r, nil
 }
 
+func (m *memNet) holdBack(ctx context.Context) error {
+	m.mu.Lock()
+	slow := m.slowAppend
+	m.mu.Unlock()
+	if slow == 0 {
+		return nil
+	}
+	select {
+	case <-time.After(slow):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *memNet) installCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.installs
+}
+
 func (t memTransport) AppendEntries(ctx context.Context, to string, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	t.net.sawLeader(args.Term, args.Leader)
 	t.net.sawBatch(args.Entries)
-	t.net.mu.Lock()
-	slow := t.net.slowAppend
-	t.net.mu.Unlock()
-	if len(args.Entries) > 0 && slow > 0 {
-		select {
-		case <-time.After(slow):
-		case <-ctx.Done():
-			return AppendEntriesReply{}, ctx.Err()
+	if len(args.Entries) > 0 {
+		if err := t.net.holdBack(ctx); err != nil {
+			return AppendEntriesReply{}, err
 		}
 	}
 	n, err := t.net.hop(ctx, t.from, to)
@@ -180,6 +199,28 @@ func (t memTransport) AppendEntries(ctx context.Context, to string, args AppendE
 	return r, nil
 }
 
+func (t memTransport) InstallSnapshot(ctx context.Context, to string, args InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	t.net.sawLeader(args.Term, args.Leader)
+	if err := t.net.holdBack(ctx); err != nil {
+		return InstallSnapshotReply{}, err
+	}
+	n, err := t.net.hop(ctx, t.from, to)
+	if err != nil {
+		return InstallSnapshotReply{}, err
+	}
+	r, err := n.HandleInstallSnapshot(args)
+	if err != nil {
+		return InstallSnapshotReply{}, err
+	}
+	t.net.mu.Lock()
+	t.net.installs++
+	t.net.mu.Unlock()
+	if _, err := t.net.hop(ctx, to, t.from); err != nil {
+		return InstallSnapshotReply{}, err
+	}
+	return r, nil
+}
+
 type applied struct {
 	index uint64
 	cmd   string
@@ -192,6 +233,62 @@ type applyLog struct {
 	store   *storage.Store
 	mu      sync.Mutex
 	entries []applied
+	// calls lists the indexes Apply got in this incarnation, restored entries excluded
+	calls    []uint64
+	saves    int
+	restores int
+}
+
+// appliedState is an applyLog's snapshot: every entry it has applied, so histories stay comparable across installs
+type appliedState struct {
+	Index []uint64
+	Cmd   [][]byte
+	KV    []byte
+}
+
+func (a *applyLog) save() []byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var s appliedState
+	for _, e := range a.entries {
+		s.Index = append(s.Index, e.index)
+		s.Cmd = append(s.Cmd, []byte(e.cmd))
+	}
+	if a.store != nil {
+		s.KV = a.store.Snapshot()
+	}
+	a.saves++
+	var b bytes.Buffer
+	if err := gob.NewEncoder(&b).Encode(s); err != nil {
+		panic(fmt.Sprintf("encode snapshot: %v", err))
+	}
+	return b.Bytes()
+}
+
+func (a *applyLog) restore(b []byte) error {
+	var s appliedState
+	if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&s); err != nil {
+		return fmt.Errorf("decode snapshot: %w", err)
+	}
+	if a.store != nil {
+		if err := a.store.Restore(s.KV); err != nil {
+			return err
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.entries = a.entries[:0]
+	for i, idx := range s.Index {
+		a.entries = append(a.entries, applied{idx, string(s.Cmd[i])})
+	}
+	a.restores++
+	return nil
+}
+
+func (a *applyLog) applyCalls() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.calls)
 }
 
 func (a *applyLog) apply(index uint64, cmd []byte) {
@@ -206,6 +303,7 @@ func (a *applyLog) apply(index uint64, cmd []byte) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.entries = append(a.entries, applied{index, string(cmd)})
+	a.calls = append(a.calls, index)
 }
 
 func (a *applyLog) snapshot() []applied {
@@ -235,6 +333,8 @@ type cluster struct {
 	attempt int
 	// kv gives each node incarnation a storage.Store fed by its applied commands
 	kv bool
+	// snapEntries, if set, turns on snapshots every snapEntries applied entries
+	snapEntries uint64
 }
 
 type leaderChange struct {
@@ -276,7 +376,7 @@ func (c *cluster) start(id string) {
 	if c.kv {
 		al.store = storage.New()
 	}
-	n, err := New(Config{
+	cfg := Config{
 		ID:                id,
 		Peers:             c.ids,
 		Dir:               filepath.Join(c.root, id),
@@ -289,7 +389,11 @@ func (c *cluster) start(id string) {
 			defer c.mu.Unlock()
 			c.changes[id] = append(c.changes[id], leaderChange{term, leader})
 		},
-	})
+	}
+	if c.snapEntries > 0 {
+		cfg.Snapshot, cfg.Restore, cfg.SnapshotEntries = al.save, al.restore, c.snapEntries
+	}
+	n, err := New(cfg)
 	if err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
@@ -469,6 +573,27 @@ func cmds(entries []applied) []string {
 		out = append(out, e.cmd)
 	}
 	return out
+}
+
+// snapshots counts the snapshots every incarnation of every node took
+func (c *cluster) snapshots() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	total := 0
+	count := func(al *applyLog) {
+		al.mu.Lock()
+		defer al.mu.Unlock()
+		total += al.saves
+	}
+	for _, al := range c.logs {
+		count(al)
+	}
+	for _, logs := range c.past {
+		for _, al := range logs {
+			count(al)
+		}
+	}
+	return total
 }
 
 func (c *cluster) leaderChanges(id string) []leaderChange {

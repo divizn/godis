@@ -191,6 +191,10 @@ func (heldVotes) AppendEntries(context.Context, string, AppendEntriesArgs) (Appe
 	return AppendEntriesReply{}, errUnreachable
 }
 
+func (heldVotes) InstallSnapshot(context.Context, string, InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	return InstallSnapshotReply{}, errUnreachable
+}
+
 func TestVotesFromAnEarlierElectionAreNotCounted(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		tr := heldVotes{release: make(chan struct{})}
@@ -916,6 +920,11 @@ func (h higherTerm) AppendEntries(ctx context.Context, _ string, args AppendEntr
 	}
 	<-ctx.Done()
 	return AppendEntriesReply{}, ctx.Err()
+}
+
+func (higherTerm) InstallSnapshot(ctx context.Context, _ string, _ InstallSnapshotArgs) (InstallSnapshotReply, error) {
+	<-ctx.Done()
+	return InstallSnapshotReply{}, ctx.Err()
 }
 
 func TestHigherTermAppendReplyStepsLeaderDown(t *testing.T) {

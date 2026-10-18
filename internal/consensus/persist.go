@@ -4,10 +4,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
+
+	"github.com/divizn/godis/internal/wal"
 )
 
 // state file: uint64 term little endian | votedFor
@@ -64,6 +67,73 @@ func syncDir(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// snapshot file: uvarint index | uvarint term | data | uint32 crc32c of everything before it, little endian
+func writeSnapshot(path string, index, term uint64, data []byte) error {
+	b := binary.AppendUvarint(nil, index)
+	b = binary.AppendUvarint(b, term)
+	b = append(b, data...)
+	b = binary.LittleEndian.AppendUint32(b, crc32.Checksum(b, crcTable))
+	return writeFileSync(path, b)
+}
+
+// readSnapshot returns index 0 when dir holds no snapshot
+func readSnapshot(dir string) (index, term uint64, data []byte, err error) {
+	b, err := os.ReadFile(filepath.Join(dir, "snapshot"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, 0, nil, nil
+	}
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("read raft snapshot: %w", err)
+	}
+	if len(b) < 4 || crc32.Checksum(b[:len(b)-4], crcTable) != binary.LittleEndian.Uint32(b[len(b)-4:]) {
+		return 0, 0, nil, errors.New("raft snapshot: checksum mismatch")
+	}
+	b = b[:len(b)-4]
+	index, n := binary.Uvarint(b)
+	if n <= 0 || index == 0 {
+		return 0, 0, nil, errors.New("raft snapshot: bad index")
+	}
+	b = b[n:]
+	term, n = binary.Uvarint(b)
+	if n <= 0 {
+		return 0, 0, nil, errors.New("raft snapshot: bad term")
+	}
+	return index, term, b[n:], nil
+}
+
+// renameSnapshot durably makes the snapshot written to tmp dir's snapshot
+func renameSnapshot(dir, tmp string) error {
+	if err := os.Rename(tmp, filepath.Join(dir, "snapshot")); err != nil {
+		return fmt.Errorf("rename raft snapshot: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("sync raft snapshot dir: %w", err)
+	}
+	return nil
+}
+
+// logRecords encodes entries from index start as batches that each fit in one wal record
+func logRecords(start uint64, entries []Entry) [][]byte {
+	var recs [][]byte
+	for len(entries) > 0 {
+		i, size := 0, binary.MaxVarintLen64
+		for i < len(entries) {
+			s := 2*binary.MaxVarintLen64 + len(entries[i].Cmd)
+			if i > 0 && size+s > wal.MaxRecordSize {
+				break
+			}
+			size += s
+			i++
+		}
+		recs = append(recs, encodeBatch(start, entries[:i]))
+		start += uint64(i)
+		entries = entries[i:]
+	}
+	return recs
 }
 
 // log record: uvarint start index | (uvarint term | uvarint cmd length | cmd)*
