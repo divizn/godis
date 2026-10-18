@@ -73,6 +73,7 @@ func linRun(t *testing.T, seed uint64) {
 	c := newStoppedCluster(t, []int{3, 5}[rng.IntN(2)], rng.Uint64())
 	c.kv = true
 	c.snapEntries = 1 + seed%20
+	c.fsSeed = rng.Uint64() | 1
 	for _, id := range c.ids {
 		c.start(id)
 	}
@@ -142,9 +143,9 @@ func linRun(t *testing.T, seed uint64) {
 			pending++
 		}
 	}
-	t.Logf("%d nodes, %v, %d ops, %d writes (%d pending), %d applied, %d retries, %d duplicates dropped, %d leader terms, snapshots every %d entries: %d taken, %d installed",
+	t.Logf("%d nodes, %v, %d ops, %d writes (%d pending), %d applied, %d retries, %d duplicates dropped, %d leader terms, %d crashes, snapshots every %d entries: %d taken, %d installed",
 		len(c.ids), duration.Round(time.Second), len(rec.history), ops, pending, writes, rec.retries.Load(), replay.Duplicates(),
-		c.net.leaderTerms(), c.snapEntries, c.snapshots(), c.net.installCount())
+		c.net.leaderTerms(), c.crashes, c.snapEntries, c.snapshots(), c.net.installCount())
 	res := lincheck.Check(rec.history, linBudget)
 	if !res.Linearizable {
 		slices.SortFunc(res.Ops, func(a, b lincheck.Op) int { return cmp.Compare(a.Call, b.Call) })
@@ -312,8 +313,8 @@ func (lc *linClient) send(key string, cmd []byte) (body []byte, found, ok bool) 
 	}
 }
 
-// nemesis injects faults from rng until end: partitions, node stops and restarts, message loss and delay,
-// and appends with entries held back while empty ones pass
+// nemesis injects faults from rng until end: partitions, node stops and restarts, node crashes that lose
+// whatever was not fsynced, message loss and delay, and appends with entries held back while empty ones pass
 func nemesis(c *cluster, rng *rand.Rand, end time.Time) {
 	shuffled := func() []string {
 		ids := slices.Clone(c.ids)
@@ -326,7 +327,7 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time) {
 	for time.Now().Before(end) {
 		time.Sleep(200*time.Millisecond + time.Duration(rng.Int64N(int64(time.Second))))
 		leader, _ := c.leaderAmong(c.live()...)
-		switch r := rng.IntN(14); {
+		switch r := rng.IntN(17); {
 		case r < 2:
 			ids := shuffled()
 			cut := 1 + rng.IntN(len(ids)-1)
@@ -363,11 +364,24 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time) {
 			} else {
 				c.net.setFaults(rng.Float64()/5, time.Duration(rng.Int64N(int64(10*time.Millisecond))))
 			}
-		default:
+		case r < 14:
 			if rng.IntN(3) == 0 {
 				c.net.setSlowAppend(0)
 			} else {
 				c.net.setSlowAppend(testElection + time.Duration(rng.Int64N(int64(3*testElection))))
+			}
+		case r < 15:
+			if live := c.live(); len(live) > 0 {
+				c.crash(live[rng.IntN(len(live))])
+			}
+		case r < 16:
+			if leader != "" {
+				c.crash(leader)
+			}
+		default:
+			c.crash(c.live()...)
+			for _, id := range c.ids {
+				c.start(id)
 			}
 		}
 	}

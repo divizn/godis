@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/divizn/godis/internal/storage"
+	"github.com/divizn/godis/internal/vfs"
 )
 
 const (
@@ -338,6 +339,10 @@ type cluster struct {
 	kv bool
 	// snapEntries, if set, turns on snapshots every snapEntries applied entries
 	snapEntries uint64
+	// fsSeed, if set, gives each node a vfs.StrictMem seeded from it instead of the real filesystem, so crash can lose unsynced data
+	fsSeed  uint64
+	fsys    map[string]*vfs.StrictMem
+	crashes int
 }
 
 type leaderChange struct {
@@ -396,6 +401,17 @@ func (c *cluster) start(id string) {
 	if c.snapEntries > 0 {
 		cfg.Snapshot, cfg.Restore, cfg.SnapshotEntries = al.save, al.restore, c.snapEntries
 	}
+	if c.fsSeed != 0 {
+		c.mu.Lock()
+		if c.fsys == nil {
+			c.fsys = map[string]*vfs.StrictMem{}
+		}
+		if c.fsys[id] == nil {
+			c.fsys[id] = vfs.NewStrictMem(c.fsSeed + uint64(len(c.fsys)))
+		}
+		cfg.FS = c.fsys[id]
+		c.mu.Unlock()
+	}
 	n, err := New(cfg)
 	if err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
@@ -407,6 +423,33 @@ func (c *cluster) start(id string) {
 }
 
 func (c *cluster) stop(id string) {
+	c.t.Helper()
+	c.shutdown(id, false)
+}
+
+// crash freezes the nodes' filesystems, stops them, and reverts the filesystems to what they had synced, so the nodes
+// can be started again. The halt a frozen filesystem causes is expected, any other Stop error is not.
+func (c *cluster) crash(ids ...string) {
+	c.t.Helper()
+	c.mu.Lock()
+	fss := make([]*vfs.StrictMem, len(ids))
+	for i, id := range ids {
+		fss[i] = c.fsys[id]
+	}
+	c.crashes += len(ids)
+	c.mu.Unlock()
+	for _, f := range fss {
+		f.Freeze()
+	}
+	for _, id := range ids {
+		c.shutdown(id, true)
+	}
+	for _, f := range fss {
+		f.Crash()
+	}
+}
+
+func (c *cluster) shutdown(id string, crashed bool) {
 	c.t.Helper()
 	c.mu.Lock()
 	n := c.nodes[id]
@@ -420,7 +463,7 @@ func (c *cluster) stop(id string) {
 		return
 	}
 	c.net.register(id, nil)
-	if err := n.Stop(); err != nil {
+	if err := n.Stop(); err != nil && !(crashed && errors.Is(err, vfs.ErrFrozen)) {
 		c.t.Errorf("stop %s: %v", id, err)
 	}
 }
