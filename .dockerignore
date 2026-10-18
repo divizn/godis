@@ -2,3 +2,6 @@
 .github
 data
 .claude
+go.work
+go.work.sum
+examples
