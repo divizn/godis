@@ -1,10 +1,12 @@
 # godis
 
-A distributed key-value store written from scratch in Go: a Raft-replicated log, an in-memory map as the state machine, and a small binary TCP protocol. Storage, the write-ahead log, consensus and networking use only the standard library; the one dependency is the Prometheus client for metrics. It runs as a 3-node cluster with linearizable reads and writes, and compacts its log with snapshots that it ships to followers that fall behind. No membership changes or client dedupe yet (see Limitations).
+A distributed key-value store written from scratch in Go: a Raft-replicated log, an in-memory map as the state machine, and a small binary TCP protocol. Storage, the write-ahead log, consensus and networking use only the standard library; the one dependency is the Prometheus client for metrics. It runs as a 3-node cluster with linearizable reads and writes, applies each write exactly once through client sessions even when the client retries it, and compacts its log with snapshots that it ships to followers that fall behind. No membership changes yet (see Limitations).
+
+Data dirs written before client sessions (the change that added CAS and INCR) can't be read: the log and snapshot formats changed. Wipe them.
 
 ## Layout
 
-- `internal/storage`: the in-memory `Store` (map behind an `RWMutex`) and the command codec the Raft log carries
+- `internal/storage`: the in-memory `Store` (map behind an `RWMutex`), its client session table, and the command codec the Raft log carries
 - `internal/wal`: append-only log, one fsync per record (`uint32 len | crc32c | payload`), torn-tail truncation on replay
 - `internal/consensus`: Raft (elections, replication, `Propose`, `ReadIndex`, snapshots with log compaction and `InstallSnapshot`), persisted through the WAL and a checksummed snapshot file
 - `internal/network`: the client protocol, its server and the Go client
@@ -26,8 +28,9 @@ Followers never serve reads or writes; they answer REDIRECT with the leader's cl
 
 - Linearizable writes and reads, from the leader only.
 - A write is acked only once it is fsynced on a majority and applied on the leader.
-- Leader loss: the remaining majority elects a new leader within one to two election timeouts (1s by default) and the client retries through the redirect. A write that timed out may still have committed, and a retry applies it twice (no dedupe).
-- A leader that hasn't heard from a majority for an election timeout steps down instead of timing out its pending requests. Pending reads get a redirect. Pending writes get an error, not a redirect: a write already in the log may still commit, and a redirected client would send it again.
+- Exactly-once writes through the Go client. Each client picks a random 64-bit id and numbers its writes; every write carries `(client, seq)` through the log, and the store keeps each client's last seq and result, so a write that reaches the log twice takes effect once and the duplicate gets the cached result. The client retries a write with the same seq whenever the outcome is unknown: a lost leadership, a server timeout, a dropped connection, a failed dial. It gives up after 10 seconds with `ErrOutcomeUnknown`, and the next write uses the next seq, so the abandoned one can still commit at most once. Until one of its writes has applied, a client whose write fails starts a new session instead, because the cluster may hold no session for it yet. A write that returns success took effect exactly once.
+- Leader loss: the remaining majority elects a new leader within one to two election timeouts (1s by default) and the client retries through the redirect, or redials the other nodes if the leader is gone.
+- A leader that hasn't heard from a majority for an election timeout steps down instead of timing out its pending requests. Pending reads get a redirect. Pending writes get "outcome unknown" (a write already in the log may still commit), and the client resends them with the same seq.
 - Snapshots: every node snapshots the store after each `--snapshot-entries` applied entries and drops the log before it. The snapshot is fsynced and renamed into place before the log is rewritten, so a crash between the two restarts cleanly, and a follower acks an InstallSnapshot only once both are durable. A restart restores the snapshot and replays only the log after it.
 - A node that can no longer persist its log or term halts and the process exits non-zero, rather than serve from a state it can't make durable.
 
@@ -51,13 +54,16 @@ Server flags: `--id`, `--port` (8080), `--raft-port` (7000), `--metrics-port` (2
 Client:
 
 ```sh
-go run ./cmd/godis-cli --addr=localhost:8081             # REPL: PING, GET k, SET k v, DEL k
-go run ./cmd/godis-cli --addr=localhost:8081 SET k v     # one-shot
+go run ./cmd/godis-cli --addr=localhost:8081,localhost:8082,localhost:8083   # REPL
+go run ./cmd/godis-cli --addr=localhost:8081 SET k v                         # one-shot
 ```
+
+Commands: `PING`, `GET k`, `SET k v`, `DEL k`, `CAS k expected new` (sets `k` to `new` only if it holds exactly `expected`; an `expected` of `-` means "only if `k` is absent"; prints 1 if it swapped, 0 if not), `INCR k [delta]` (adds `delta`, default 1, to the base-10 int64 at `k`, a missing key counting as 0, and prints the new value; fails without writing on a value that is not an integer or on overflow).
 
 Metrics are at `http://<node>:2112/metrics`:
 
-- `godis_requests_total{op,result}`: get, set, del by ok, not_found, redirect, error
+- `godis_requests_total{op,result}`: get, set, del, cas, incr by ok, not_found, redirect, unknown, error
+- `godis_duplicate_writes_total`: retried writes this node's state machine dropped as already applied, since the process started
 - `godis_request_duration_seconds{op}`: histogram, Raft round trip included
 - `godis_raft_term`, `godis_raft_commit_index`, `godis_raft_leader` (1 on the leader)
 - `godis_raft_snapshot_index`: last log index this node's snapshot covers, 0 if none
@@ -69,8 +75,8 @@ Plus the Go runtime and process collectors. Leadership transitions are also logg
 
 Every message is a frame: `uint32 length | payload`, big endian, payloads up to 16 MiB. One request in flight per connection.
 
-- Request: `op` byte (1 PING, 2 GET, 3 SET, 4 DEL), then for GET, SET and DEL the key as `uvarint length | bytes`, then for SET the value the same way.
-- Response: `status` byte (0 OK, 1 NOT_FOUND, 2 ERROR, 3 REDIRECT), then the body: the value for a GET, the error message for ERROR, the leader's client address for REDIRECT (empty when no leader is known; the client waits 100ms and retries).
+- Request: `op` byte (1 PING, 2 GET, 3 SET, 4 DEL, 5 CAS, 6 INCR). Writes (SET, DEL, CAS, INCR) then carry the session, `uvarint client | uvarint seq` (seq starts at 1). Every op but PING then has the key as `uvarint length | bytes`. SET adds the value the same way; CAS adds a byte (1 if the key must hold the expected value, 0 if it must be absent), the expected value and the new value, both length-prefixed; INCR adds the delta as a signed varint.
+- Response: `status` byte (0 OK, 1 NOT_FOUND, 2 ERROR, 3 REDIRECT, 4 UNKNOWN), then the body. OK: the value for a GET, one byte 1 or 0 for whether a CAS swapped, the new value in decimal for an INCR, empty otherwise. ERROR: the message, for a definite failure (a malformed request, INCR of a non-integer, an expired session): the write did not apply. REDIRECT: the leader's client address, empty when no leader is known (the client waits 100ms and retries); the request never ran. UNKNOWN: the message; the write may or may not apply, and the client resends it with the same seq.
 
 Peers talk to each other over `net/rpc` with gob on the raft port.
 
@@ -103,7 +109,7 @@ Raft is tested deterministically with `testing/synctest` on an in-memory network
 
 `internal/lincheck` is a hand-written linearizability checker: Wing and Gong's search with Lowe's memoization, each key checked as its own register, writes with an unknown outcome allowed to take effect at any point after their call or never. Every test run cross-checks its verdicts against a brute-force search on 20,000 random small histories.
 
-`TestLinearizable` in `internal/consensus` runs 3 or 5 Raft nodes, each feeding a real `storage.Store`, on the in-memory network: 4 clients over 3 keys for 30 to 60 fake seconds, while a seeded nemesis partitions the cluster, deafens the leader (it sends but hears nothing), stops and restarts single nodes or the whole cluster, drops and delays messages, and holds back appends that carry entries. Each run snapshots every 1 to 20 entries (chosen by the seed), so snapshots, log rewrites and InstallSnapshot to stopped or partitioned followers happen throughout. Each run's history goes through the checker, every write must apply at most once, and the usual invariants hold (one leader per term, every node applied a prefix of the same log).
+`TestLinearizable` in `internal/consensus` runs 3 or 5 Raft nodes, each feeding a real `storage.Store`, on the in-memory network: 4 clients over 3 keys for 30 to 60 fake seconds, while a seeded nemesis partitions the cluster, deafens the leader (it sends but hears nothing), stops and restarts single nodes or the whole cluster, drops and delays messages, and holds back appends that carry entries. Each run snapshots every 1 to 20 entries (chosen by the seed), so snapshots, log rewrites and InstallSnapshot to stopped or partitioned followers happen throughout. Clients write through sessions: 4 clients mix SET, DEL and CAS over 3 keys and INCR over 2 counter keys, and retry a write whose outcome is unknown with the same `(client, seq)` on other nodes for up to 10 seconds, so an op stays pending only if its client gave up. Each run's history goes through the checker; replaying the applied log through a fresh store must execute each `(client, seq)` once and rebuild exactly the store every node holds (the log itself holds a retried write once per attempt that reached it); and the usual invariants hold (one leader per term, every node applied a prefix of the same log).
 
 ```sh
 go test -run TestLinearizable ./internal/consensus/ -lin.runs=500   # 3 runs by default
@@ -114,13 +120,16 @@ On 2026-10-17, 2000 runs passed with no failures, about 265,000 operations and 5
 
 On 2026-10-18, with snapshots on, 500 runs passed: about 67,000 operations, 19,500 snapshots and 5,000 InstallSnapshots in 20 minutes. The fuzz exercises snapshots but does not by itself catch snapshot bugs reintroduced on purpose (it never crashes a node mid-write, and reads go only to the leader); unit tests in `internal/consensus/snapshot_test.go` catch each of them (one, a leader that never advances past the snapshot it sent, only by hanging until the test timeout).
 
-A seed reproduces the fault schedule, not every goroutine interleaving (synctest fixes time, not scheduling), so a replay usually but not always fails the same way. `TestLinearizableAcrossRestarts` in `internal/node` checks the real stack the same way (TCP client with its redirects, net/rpc, fsync) for 15 seconds while nodes, the leader included, are stopped and restarted; it is skipped under `-short`.
+On 2026-10-19, with client sessions, CAS and INCR, 500 runs passed in 20 minutes: about 64,000 operations, 41,000 writes, 8,000 retries of writes whose outcome was unknown, 3,600 duplicates dropped by the state machine, 15,000 leader terms, 24,000 snapshots and 6,000 InstallSnapshots. 0.6% of writes ended pending (their client gave up after 10 seconds), down from about 10% before clients retried. With the duplicate check removed from the store, every one of 20 runs at the CI default of 3 seeds fails (60 of 60 seeds: the replay check finds a write that took effect twice, and the checker also rejects 50 of the histories). Comparing seq with `<` instead of `<=` fails 20 of 20 (58 of 60 seeds). Caching an empty result instead of the real one fails 18 of 20 (41 of 60 seeds), caught by the checker only: it shows only when a retried CAS or INCR gets the cached answer.
+
+A seed reproduces the fault schedule, not every goroutine interleaving (synctest fixes time, not scheduling), so a replay usually but not always fails the same way. `TestLinearizableAcrossRestarts` in `internal/node` checks the real stack the same way (TCP client with its sessions and retries, net/rpc, fsync, all five ops) for 15 seconds while nodes, the leader included, are stopped and restarted; it is skipped under `-short`. It rarely produces a retried write, so it does not catch dedupe being switched off; `TestWriteRetriedAcrossALeaderKillAppliesOnce` does, by killing a leader that has logged an INCR it cannot commit.
 
 ## Limitations
 
 - A snapshot is one in-memory blob sent in a single RPC, with no chunking, so the whole store must fit in memory twice and in one gob message.
 - Taking a snapshot encodes the store under its read lock, which blocks writes to the store (and so applying) for that long.
-- No client dedupe: a write that timed out, or failed because its leader stepped down, may still commit, and a retry applies it again.
+- The session table is capped at 100,000 clients. Past the cap it evicts the tenth with the oldest last write, by log index, so every replica evicts the same ones. A write with seq above 1 from a client with no session fails with "session expired", which covers an evicted client's retries except one case: a seq 1 write retried after its client was evicted applies twice. Sessions never expire by time.
+- Exactly-once holds only for writes sent through the Go client, one at a time per client; a client that crashes and restarts is a new session.
 - One heartbeat round per read; concurrent reads are not batched.
 - A follower holds the Raft mutex across the fsync of a big append or a received snapshot, so a heartbeat arriving meanwhile waits for it.
 - A corrupt log is not repaired: wipe that node's data dir by hand and let it catch up.
