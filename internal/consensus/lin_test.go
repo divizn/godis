@@ -324,6 +324,14 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time) {
 	without := func(id string) []string {
 		return slices.DeleteFunc(slices.Clone(c.ids), func(x string) bool { return x == id })
 	}
+	// crashNode half the time lets the node run until its filesystem freezes itself a few writes from now
+	crashNode := func(id string) {
+		if rng.IntN(2) == 0 {
+			c.fsys[id].FreezeAfter(1 + rng.IntN(12))
+			time.Sleep(testElection + time.Duration(rng.Int64N(int64(4*testElection))))
+		}
+		c.crash(id)
+	}
 	for time.Now().Before(end) {
 		time.Sleep(200*time.Millisecond + time.Duration(rng.Int64N(int64(time.Second))))
 		leader, _ := c.leaderAmong(c.live()...)
@@ -372,11 +380,11 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time) {
 			}
 		case r < 15:
 			if live := c.live(); len(live) > 0 {
-				c.crash(live[rng.IntN(len(live))])
+				crashNode(live[rng.IntN(len(live))])
 			}
 		case r < 16:
 			if leader != "" {
-				c.crash(leader)
+				crashNode(leader)
 			}
 		default:
 			c.crash(c.live()...)

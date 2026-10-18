@@ -28,6 +28,8 @@ type StrictMem struct {
 	mu     sync.Mutex
 	rng    *rand.Rand
 	frozen bool
+	armed  bool
+	budget int
 	epoch  int
 	dirs   map[string]bool
 	cur    map[string]*inode
@@ -50,13 +52,20 @@ func (m *StrictMem) Freeze() {
 	m.frozen = true
 }
 
+// FreezeAfter lets n more operations that change the filesystem succeed, then freezes it as Freeze does.
+func (m *StrictMem) FreezeAfter(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.armed, m.budget = true, n
+}
+
 // Crash reverts to what is durable, each file keeping a random prefix of the bytes appended since its last Sync,
 // then thaws the filesystem and invalidates every file open before it.
 func (m *StrictMem) Crash() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.epoch++
-	m.frozen = false
+	m.frozen, m.armed = false, false
 	m.cur = maps.Clone(m.dur)
 	for _, ino := range m.cur {
 		if bytes.HasPrefix(ino.data, ino.durable) {
@@ -69,6 +78,16 @@ func (m *StrictMem) Crash() {
 }
 
 func (m *StrictMem) check(op, name string) error {
+	if m.armed && !m.frozen {
+		if m.budget == 0 {
+			m.frozen = true
+		}
+		m.budget--
+	}
+	return m.checkRead(op, name)
+}
+
+func (m *StrictMem) checkRead(op, name string) error {
 	if m.frozen {
 		return &fs.PathError{Op: op, Path: name, Err: ErrFrozen}
 	}
@@ -100,7 +119,7 @@ func (m *StrictMem) ReadFile(name string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	name = filepath.Clean(name)
-	if err := m.check("read", name); err != nil {
+	if err := m.checkRead("read", name); err != nil {
 		return nil, err
 	}
 	ino := m.cur[name]
@@ -193,6 +212,9 @@ type memFile struct {
 func (f *memFile) check(op string) error {
 	if f.epoch != f.m.epoch {
 		return &fs.PathError{Op: op, Path: f.name, Err: ErrFrozen}
+	}
+	if op == "read" {
+		return f.m.checkRead(op, f.name)
 	}
 	return f.m.check(op, f.name)
 }

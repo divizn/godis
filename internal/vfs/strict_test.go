@@ -155,3 +155,30 @@ func TestFrozenFailsEverythingUntilCrash(t *testing.T) {
 		t.Errorf("open after crash: %v", err)
 	}
 }
+
+func TestFreezeAfterAllowsExactlyNOperations(t *testing.T) {
+	m := newDir(t, 1)
+	f, err := m.OpenFile("d/f", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.FreezeAfter(2)
+	if _, err := f.Write([]byte("a")); err != nil {
+		t.Fatalf("first op: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("second op: %v", err)
+	}
+	if err := m.SyncDir("d"); !errors.Is(err, ErrFrozen) {
+		t.Fatalf("third op: %v, want ErrFrozen", err)
+	}
+	if _, err := m.ReadFile("d/f"); !errors.Is(err, ErrFrozen) {
+		t.Fatalf("read after the freeze: %v, want ErrFrozen", err)
+	}
+	m.Crash()
+	for range 5 {
+		if err := m.SyncDir("d"); err != nil {
+			t.Fatalf("after crash: %v, want the filesystem thawed and disarmed", err)
+		}
+	}
+}
