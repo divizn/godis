@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"net"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/divizn/godis/client"
+	"github.com/divizn/godis/internal/protocol"
 	"github.com/divizn/godis/internal/storage"
 )
 
@@ -112,9 +113,9 @@ func serveOn(t testing.TB, ln net.Listener, store Store) (string, func()) {
 	return ln.Addr().String(), stop
 }
 
-func dial(t testing.TB, addrs ...string) *Client {
+func dial(t testing.TB, addrs ...string) *client.Client {
 	t.Helper()
-	c, err := Dial(addrs...)
+	c, err := client.Dial(addrs...)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -122,9 +123,16 @@ func dial(t testing.TB, addrs ...string) *Client {
 	return c
 }
 
-func mustGet(t *testing.T, c *Client, key string) ([]byte, bool) {
+// within is a context that ends after d, bounding the client's retries
+func within(t *testing.T, d time.Duration) context.Context {
+	ctx, cancel := context.WithTimeout(t.Context(), d)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func mustGet(t *testing.T, c *client.Client, key string) ([]byte, bool) {
 	t.Helper()
-	v, ok, err := c.Get(key)
+	v, ok, err := c.Get(t.Context(), key)
 	if err != nil {
 		t.Fatalf("get %q: %v", key, err)
 	}
@@ -143,7 +151,7 @@ func TestRoundTripValues(t *testing.T) {
 		"":              []byte("empty key"),
 	}
 	for k, v := range cases {
-		if err := c.Set(k, v); err != nil {
+		if err := c.Set(t.Context(), k, v); err != nil {
 			t.Fatalf("set %q: %v", k, err)
 		}
 	}
@@ -155,69 +163,19 @@ func TestRoundTripValues(t *testing.T) {
 	}
 }
 
-func TestOversizeFrameRejectedWithoutAllocating(t *testing.T) {
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], 0xFFFFFFFF)
-	r := io.MultiReader(bytes.NewReader(hdr[:]), bytes.NewReader(make([]byte, 64)))
-
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	_, err := readFrame(r)
-	runtime.ReadMemStats(&after)
-
-	if !errors.Is(err, errFrameTooLarge) {
-		t.Fatalf("got %v, want errFrameTooLarge", err)
-	}
-	if n := after.TotalAlloc - before.TotalAlloc; n > 1<<20 {
-		t.Fatalf("allocated %d bytes rejecting an oversize frame", n)
-	}
-}
-
-func TestTruncatedFrame(t *testing.T) {
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], maxFrameSize)
-	r := io.MultiReader(bytes.NewReader(hdr[:]), strings.NewReader("only a few bytes"))
-
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	_, err := readFrame(r)
-	runtime.ReadMemStats(&after)
-
-	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("got %v, want io.ErrUnexpectedEOF", err)
-	}
-	if n := after.TotalAlloc - before.TotalAlloc; n > 1<<20 {
-		t.Fatalf("allocated %d bytes for a frame that sent 16", n)
-	}
-
-	if _, err := readFrame(bytes.NewReader(hdr[:2])); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("truncated header: got %v, want io.ErrUnexpectedEOF", err)
-	}
-}
-
-func TestWriteFrameRefusesOversize(t *testing.T) {
-	var buf bytes.Buffer
-	if err := writeFrame(&buf, make([]byte, maxFrameSize+1)); err == nil {
-		t.Fatal("want error writing an oversize frame")
-	}
-	if buf.Len() != 0 {
-		t.Fatalf("wrote %d bytes of an oversize frame", buf.Len())
-	}
-}
-
 func TestEndToEnd(t *testing.T) {
 	addr, _ := serve(t, newMemStore())
 	c := dial(t, addr)
 
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(t.Context()); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
 	for _, kv := range [][2]string{{"a", "1"}, {"b", "2"}, {"a", "3"}} {
-		if err := c.Set(kv[0], []byte(kv[1])); err != nil {
+		if err := c.Set(t.Context(), kv[0], []byte(kv[1])); err != nil {
 			t.Fatalf("set %s: %v", kv[0], err)
 		}
 	}
-	if err := c.Del("b"); err != nil {
+	if err := c.Del(t.Context(), "b"); err != nil {
 		t.Fatalf("del: %v", err)
 	}
 	if v, ok := mustGet(t, c, "a"); !ok || string(v) != "3" {
@@ -242,11 +200,11 @@ func TestPipelinedRequestsAnsweredInOrder(t *testing.T) {
 	const n = 50
 	var out bytes.Buffer
 	for i := range n {
-		set := request{op: opSet, client: 1, seq: uint64(i + 1), key: "k", value: fmt.Appendf(nil, "%d", i)}.append(nil)
-		if err := writeFrame(&out, set); err != nil {
+		set := protocol.Request{Op: protocol.OpSet, Client: 1, Seq: uint64(i + 1), Key: "k", Value: fmt.Appendf(nil, "%d", i)}.Append(nil)
+		if err := protocol.WriteFrame(&out, set); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeFrame(&out, request{op: opGet, key: "k"}.append(nil)); err != nil {
+		if err := protocol.WriteFrame(&out, protocol.Request{Op: protocol.OpGet, Key: "k"}.Append(nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -259,11 +217,11 @@ func TestPipelinedRequestsAnsweredInOrder(t *testing.T) {
 	r := bufio.NewReader(conn)
 	for i := range n {
 		for _, want := range []string{"", fmt.Sprint(i)} {
-			resp, err := readFrame(r)
+			resp, err := protocol.ReadFrame(r)
 			if err != nil {
 				t.Fatalf("request %d: %v", i, err)
 			}
-			if resp[0] != statusOK || string(resp[1:]) != want {
+			if resp[0] != protocol.StatusOK || string(resp[1:]) != want {
 				t.Fatalf("request %d: got status %d body %q, want OK %q", i, resp[0], resp[1:], want)
 			}
 		}
@@ -278,7 +236,7 @@ func TestConcurrentClients(t *testing.T) {
 	errs := make(chan error, clients)
 	for i := range clients {
 		wg.Go(func() {
-			c, err := Dial(addr)
+			c, err := client.Dial(addr)
 			if err != nil {
 				errs <- err
 				return
@@ -287,11 +245,11 @@ func TestConcurrentClients(t *testing.T) {
 			for j := range ops {
 				key := fmt.Sprintf("c%d-%d", i, j)
 				want := strings.Repeat(key, j+1)
-				if err := c.Set(key, []byte(want)); err != nil {
+				if err := c.Set(t.Context(), key, []byte(want)); err != nil {
 					errs <- err
 					return
 				}
-				got, ok, err := c.Get(key)
+				got, ok, err := c.Get(t.Context(), key)
 				if err != nil || !ok || string(got) != want {
 					errs <- fmt.Errorf("get %s: got %q, %v, %v; want %q", key, got, ok, err, want)
 					return
@@ -320,48 +278,48 @@ func TestMalformedRequests(t *testing.T) {
 	bad := map[string][]byte{
 		"empty payload":        {},
 		"unknown op":           {0xee, 1, 'k'},
-		"missing key":          {opGet},
-		"field past end":       {opSet, 1, 1, 1, 'k', 9, 'v'},
-		"bad uvarint":          {opGet, 0xff},
-		"missing value":        {opSet, 1, 1, 1, 'k'},
-		"trailing bytes":       {opGet, 1, 'k', 'x'},
-		"ping with field":      {opPing, 0},
-		"set without session":  {opSet, 1, 'k', 1, 'v'},
-		"del without seq":      {opDel, 1},
-		"seq zero":             {opDel, 1, 0, 1, 'k'},
-		"cas without flag":     {opCas, 1, 1, 1, 'k'},
-		"cas bad flag":         {opCas, 1, 1, 1, 'k', 2, 0, 0},
-		"cas without value":    {opCas, 1, 1, 1, 'k', 1, 1, 'v'},
-		"cas trailing bytes":   {opCas, 1, 1, 1, 'k', 0, 0, 0, 'x'},
-		"incr without delta":   {opIncr, 1, 1, 1, 'k'},
-		"incr bad delta":       {opIncr, 1, 1, 1, 'k', 0xff},
-		"incr trailing bytes":  {opIncr, 1, 1, 1, 'k', 2, 0},
-		"incr without session": {opIncr, 1, 'k', 2},
+		"missing key":          {protocol.OpGet},
+		"field past end":       {protocol.OpSet, 1, 1, 1, 'k', 9, 'v'},
+		"bad uvarint":          {protocol.OpGet, 0xff},
+		"missing value":        {protocol.OpSet, 1, 1, 1, 'k'},
+		"trailing bytes":       {protocol.OpGet, 1, 'k', 'x'},
+		"ping with field":      {protocol.OpPing, 0},
+		"set without session":  {protocol.OpSet, 1, 'k', 1, 'v'},
+		"del without seq":      {protocol.OpDel, 1},
+		"seq zero":             {protocol.OpDel, 1, 0, 1, 'k'},
+		"cas without flag":     {protocol.OpCas, 1, 1, 1, 'k'},
+		"cas bad flag":         {protocol.OpCas, 1, 1, 1, 'k', 2, 0, 0},
+		"cas without value":    {protocol.OpCas, 1, 1, 1, 'k', 1, 1, 'v'},
+		"cas trailing bytes":   {protocol.OpCas, 1, 1, 1, 'k', 0, 0, 0, 'x'},
+		"incr without delta":   {protocol.OpIncr, 1, 1, 1, 'k'},
+		"incr bad delta":       {protocol.OpIncr, 1, 1, 1, 'k', 0xff},
+		"incr trailing bytes":  {protocol.OpIncr, 1, 1, 1, 'k', 2, 0},
+		"incr without session": {protocol.OpIncr, 1, 'k', 2},
 	}
 	for name, payload := range bad {
-		if err := writeFrame(conn, payload); err != nil {
+		if err := protocol.WriteFrame(conn, payload); err != nil {
 			t.Fatalf("%s: write: %v", name, err)
 		}
-		resp, err := readFrame(r)
+		resp, err := protocol.ReadFrame(r)
 		if err != nil {
 			t.Fatalf("%s: read: %v", name, err)
 		}
-		if resp[0] != statusError || len(resp) == 1 {
+		if resp[0] != protocol.StatusError || len(resp) == 1 {
 			t.Fatalf("%s: got status %d body %q, want ERROR with a message", name, resp[0], resp[1:])
 		}
-		if err := good.Ping(); err != nil {
+		if err := good.Ping(t.Context()); err != nil {
 			t.Fatalf("%s: other client: %v", name, err)
 		}
 	}
-	if err := writeFrame(conn, []byte{opPing}); err != nil {
+	if err := protocol.WriteFrame(conn, []byte{protocol.OpPing}); err != nil {
 		t.Fatal(err)
 	}
-	if resp, err := readFrame(r); err != nil || resp[0] != statusOK {
+	if resp, err := protocol.ReadFrame(r); err != nil || resp[0] != protocol.StatusOK {
 		t.Fatalf("ping after malformed requests: %v, %v", resp, err)
 	}
 
 	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], maxFrameSize+1)
+	binary.BigEndian.PutUint32(hdr[:], protocol.MaxFrameSize+1)
 	if _, err := conn.Write(hdr[:]); err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +329,7 @@ func TestMalformedRequests(t *testing.T) {
 	if _, err := r.ReadByte(); !errors.Is(err, io.EOF) {
 		t.Fatalf("after oversize frame: got %v, want connection closed", err)
 	}
-	if err := good.Set("still", []byte("alive")); err != nil {
+	if err := good.Set(t.Context(), "still", []byte("alive")); err != nil {
 		t.Fatalf("other client after oversize frame: %v", err)
 	}
 }
@@ -379,7 +337,7 @@ func TestMalformedRequests(t *testing.T) {
 func TestShutdownClosesIdleConnections(t *testing.T) {
 	addr, stop := serve(t, newMemStore())
 	for range 5 {
-		if err := dial(t, addr).Ping(); err != nil {
+		if err := dial(t, addr).Ping(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -410,7 +368,7 @@ func TestShutdownWaitsForInFlightRequest(t *testing.T) {
 	addr, stop := serve(t, store)
 	c := dial(t, addr)
 	setDone := make(chan error, 1)
-	go func() { setDone <- c.Set("k", []byte("v")) }()
+	go func() { setDone <- c.Set(t.Context(), "k", []byte("v")) }()
 	<-store.entered
 
 	done := make(chan struct{})
@@ -451,14 +409,14 @@ func TestStoreErrorReachesClient(t *testing.T) {
 	store := &failingStore{}
 	addr, _ := serve(t, store)
 	c := dial(t, addr)
-	err := c.Set("k", []byte("v"))
-	if err == nil || !strings.Contains(err.Error(), "disk on fire") || errors.Is(err, ErrOutcomeUnknown) {
+	err := c.Set(t.Context(), "k", []byte("v"))
+	if err == nil || !strings.Contains(err.Error(), "disk on fire") || errors.Is(err, protocol.ErrOutcomeUnknown) {
 		t.Fatalf("got %v, want the store's error as a definite failure", err)
 	}
 	if n := store.calls.Load(); n != 1 {
 		t.Fatalf("store saw %d attempts, want 1: a definite error is not retried", n)
 	}
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(t.Context()); err != nil {
 		t.Fatalf("connection unusable after server error: %v", err)
 	}
 }
@@ -475,12 +433,12 @@ type redirectStore struct {
 func (r *redirectStore) redirect() error {
 	n := r.calls.Add(1)
 	if n <= r.unknown {
-		return &RedirectError{}
+		return &protocol.RedirectError{}
 	}
 	if r.next != nil && n > r.unknown+r.stale {
 		return nil
 	}
-	return &RedirectError{Addr: r.addr}
+	return &protocol.RedirectError{Addr: r.addr}
 }
 
 func (r *redirectStore) Get(key string) ([]byte, bool, error) {
@@ -524,13 +482,13 @@ func TestClientFollowsRedirect(t *testing.T) {
 	addr, _ := serve(t, follower)
 	c := dial(t, addr)
 
-	if err := c.Set("k", []byte("v")); err != nil {
+	if err := c.Set(t.Context(), "k", []byte("v")); err != nil {
 		t.Fatalf("set via follower: %v", err)
 	}
 	if v, ok := mustGet(t, c, "k"); !ok || string(v) != "v" {
 		t.Fatalf("get after redirected set: got %q, %v", v, ok)
 	}
-	if err := c.Del("k"); err != nil {
+	if err := c.Del(t.Context(), "k"); err != nil {
 		t.Fatalf("del: %v", err)
 	}
 	if _, ok := mustGet(t, c, "k"); ok {
@@ -548,8 +506,8 @@ func TestRedirectLoopIsBounded(t *testing.T) {
 	serveOn(t, lnB, b)
 	c := dial(t, lnA.Addr().String())
 
-	var re *RedirectError
-	if err := c.Set("k", []byte("v")); !errors.As(err, &re) {
+	var re *protocol.RedirectError
+	if err := c.Set(t.Context(), "k", []byte("v")); !errors.As(err, &re) {
 		t.Fatalf("set in a redirect loop: got %v, want a *RedirectError", err)
 	}
 	if n := a.calls.Load() + b.calls.Load(); n != 11 {
@@ -562,7 +520,7 @@ func TestUnknownLeaderIsRetriedThroughAnElection(t *testing.T) {
 	addr, _ := serve(t, store)
 	c := dial(t, addr)
 
-	if err := c.Set("k", []byte("v")); err != nil {
+	if err := c.Set(t.Context(), "k", []byte("v")); err != nil {
 		t.Fatalf("set while the leader is unknown for 1.5s: %v", err)
 	}
 	if n := store.calls.Load(); n != 16 {
@@ -580,7 +538,7 @@ func TestRedirectToDeadLeaderIsRetried(t *testing.T) {
 	addr, _ := serve(t, store)
 	c := dial(t, addr)
 
-	if err := c.Set("k", []byte("v")); err != nil {
+	if err := c.Set(t.Context(), "k", []byte("v")); err != nil {
 		t.Fatalf("set while followers still point at a dead leader: %v", err)
 	}
 	if n := store.calls.Load(); n != 4 {
@@ -591,10 +549,9 @@ func TestRedirectToDeadLeaderIsRetried(t *testing.T) {
 func TestNeverElectedLeaderGivesUp(t *testing.T) {
 	addr, _ := serve(t, &redirectStore{unknown: math.MaxInt64})
 	c := dial(t, addr)
-	c.retryFor = 500 * time.Millisecond
 
-	var re *RedirectError
-	if err := c.Set("k", []byte("v")); !errors.As(err, &re) || re.Addr != "" {
+	var re *protocol.RedirectError
+	if err := c.Set(within(t, 500*time.Millisecond), "k", []byte("v")); !errors.As(err, &re) || re.Addr != "" {
 		t.Fatalf("set with no leader ever elected: got %v, want a *RedirectError with no address", err)
 	}
 }
@@ -602,11 +559,11 @@ func TestNeverElectedLeaderGivesUp(t *testing.T) {
 func BenchmarkGet(b *testing.B) {
 	addr, _ := serve(b, newMemStore())
 	c := dial(b, addr)
-	if err := c.Set("k", bytes.Repeat([]byte("v"), 128)); err != nil {
+	if err := c.Set(b.Context(), "k", bytes.Repeat([]byte("v"), 128)); err != nil {
 		b.Fatal(err)
 	}
 	for b.Loop() {
-		if _, _, err := c.Get("k"); err != nil {
+		if _, _, err := c.Get(b.Context(), "k"); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -617,29 +574,8 @@ func BenchmarkSet(b *testing.B) {
 	c := dial(b, addr)
 	v := bytes.Repeat([]byte("v"), 128)
 	for b.Loop() {
-		if err := c.Set("k", v); err != nil {
+		if err := c.Set(b.Context(), "k", v); err != nil {
 			b.Fatal(err)
-		}
-	}
-}
-
-func TestRequestRoundTrip(t *testing.T) {
-	for _, r := range []request{
-		{op: opPing},
-		{op: opGet, key: "k"},
-		{op: opSet, client: 1 << 63, seq: 7, key: "k", value: []byte("v\x00")},
-		{op: opDel, client: 3, seq: 1, key: ""},
-		{op: opCas, client: 3, seq: 2, key: "k", expected: []byte("old"), expectFound: true, value: []byte("new")},
-		{op: opCas, client: 3, seq: 3, key: "k", value: []byte("new")},
-		{op: opIncr, client: 3, seq: 4, key: "n", delta: -1 << 62},
-	} {
-		got, err := parseRequest(r.append(nil))
-		if err != nil {
-			t.Fatalf("parse %+v: %v", r, err)
-		}
-		if got.op != r.op || got.client != r.client || got.seq != r.seq || got.key != r.key || !bytes.Equal(got.value, r.value) ||
-			!bytes.Equal(got.expected, r.expected) || got.expectFound != r.expectFound || got.delta != r.delta {
-			t.Fatalf("round trip of %+v gave %+v", r, got)
 		}
 	}
 }
@@ -662,7 +598,7 @@ func TestCasAndIncr(t *testing.T) {
 		{"", false, "c", false},
 		{"", true, "c", true},
 	} {
-		swapped, err := c.CAS("k", []byte(step.expected), step.expectFound, []byte(step.value))
+		swapped, err := c.CAS(t.Context(), "k", []byte(step.expected), step.expectFound, []byte(step.value))
 		if err != nil || swapped != step.want {
 			t.Fatalf("cas %+v: got %v, %v; want %v", step, swapped, err, step.want)
 		}
@@ -672,11 +608,11 @@ func TestCasAndIncr(t *testing.T) {
 	}
 
 	for _, step := range []struct{ delta, want int64 }{{1, 1}, {41, 42}, {-50, -8}} {
-		if n, err := c.Incr("n", step.delta); err != nil || n != step.want {
+		if n, err := c.Incr(t.Context(), "n", step.delta); err != nil || n != step.want {
 			t.Fatalf("incr %d: got %d, %v; want %d", step.delta, n, err, step.want)
 		}
 	}
-	if _, err := c.Incr("k", 1); err == nil || errors.Is(err, ErrOutcomeUnknown) {
+	if _, err := c.Incr(t.Context(), "k", 1); err == nil || errors.Is(err, protocol.ErrOutcomeUnknown) {
 		t.Fatalf("incr of a non-integer: got %v, want a definite error", err)
 	}
 }
@@ -687,7 +623,7 @@ type flakyServer struct {
 	srv   *Server
 	fail  func(n int) (cut, unknown bool)
 	mu    sync.Mutex
-	reqs  []request
+	reqs  []protocol.Request
 	conns sync.WaitGroup
 }
 
@@ -715,11 +651,11 @@ func (f *flakyServer) handle(conn net.Conn) {
 	defer conn.Close()
 	r := bufio.NewReader(conn)
 	for {
-		p, err := readFrame(r)
+		p, err := protocol.ReadFrame(r)
 		if err != nil {
 			return
 		}
-		req, err := parseRequest(p)
+		req, err := protocol.ParseRequest(p)
 		if err != nil {
 			return
 		}
@@ -733,15 +669,15 @@ func (f *flakyServer) handle(conn net.Conn) {
 			return
 		}
 		if unknown {
-			resp = append([]byte{statusUnknown}, "leadership lost"...)
+			resp = append([]byte{protocol.StatusUnknown}, "leadership lost"...)
 		}
-		if err := writeFrame(conn, resp); err != nil {
+		if err := protocol.WriteFrame(conn, resp); err != nil {
 			return
 		}
 	}
 }
 
-func (f *flakyServer) requests() []request {
+func (f *flakyServer) requests() []protocol.Request {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.reqs)
@@ -755,21 +691,21 @@ func TestWriteRetriedWithTheSameSeq(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			addr, f := serveFlaky(t, newMemStore(), fail)
 			c := dial(t, addr)
-			if n, err := c.Incr("n", 1); err != nil || n != 1 {
+			if n, err := c.Incr(t.Context(), "n", 1); err != nil || n != 1 {
 				t.Fatalf("incr whose first attempt applied but failed: got %d, %v; want 1", n, err)
 			}
-			if n, err := c.Incr("n", 1); err != nil || n != 2 {
+			if n, err := c.Incr(t.Context(), "n", 1); err != nil || n != 2 {
 				t.Fatalf("next incr: got %d, %v; want 2", n, err)
 			}
 			reqs := f.requests()
 			if len(reqs) != 3 {
 				t.Fatalf("server saw %d requests, want 3", len(reqs))
 			}
-			if reqs[0].client != reqs[1].client || reqs[0].seq != reqs[1].seq {
-				t.Fatalf("retry sent session (%d, %d), first attempt (%d, %d)", reqs[1].client, reqs[1].seq, reqs[0].client, reqs[0].seq)
+			if reqs[0].Client != reqs[1].Client || reqs[0].Seq != reqs[1].Seq {
+				t.Fatalf("retry sent session (%d, %d), first attempt (%d, %d)", reqs[1].Client, reqs[1].Seq, reqs[0].Client, reqs[0].Seq)
 			}
-			if reqs[2].client != reqs[0].client || reqs[2].seq != reqs[0].seq+1 {
-				t.Fatalf("next write sent session (%d, %d) after (%d, %d)", reqs[2].client, reqs[2].seq, reqs[0].client, reqs[0].seq)
+			if reqs[2].Client != reqs[0].Client || reqs[2].Seq != reqs[0].Seq+1 {
+				t.Fatalf("next write sent session (%d, %d) after (%d, %d)", reqs[2].Client, reqs[2].Seq, reqs[0].Client, reqs[0].Seq)
 			}
 		})
 	}
@@ -778,40 +714,39 @@ func TestWriteRetriedWithTheSameSeq(t *testing.T) {
 func TestWriteGivesUpWithOutcomeUnknown(t *testing.T) {
 	addr, f := serveFlaky(t, newMemStore(), func(int) (bool, bool) { return false, true })
 	c := dial(t, addr)
-	c.retryFor = 500 * time.Millisecond
+	const limit = 500 * time.Millisecond
 	start := time.Now()
-	err := c.Set("k", []byte("v"))
-	if !errors.Is(err, ErrOutcomeUnknown) {
+	err := c.Set(within(t, limit), "k", []byte("v"))
+	if !errors.Is(err, protocol.ErrOutcomeUnknown) {
 		t.Fatalf("write never answered definitely: got %v, want ErrOutcomeUnknown", err)
 	}
-	if d := time.Since(start); d < c.retryFor-retryWait || d > c.retryFor+time.Second {
-		t.Fatalf("gave up after %v, want just past %v", d, c.retryFor)
+	if d := time.Since(start); d < limit-200*time.Millisecond || d > limit+time.Second {
+		t.Fatalf("gave up after %v, want about %v", d, limit)
 	}
 	reqs := f.requests()
 	if len(reqs) < 2 {
 		t.Fatalf("server saw %d attempts, want retries", len(reqs))
 	}
 	for _, r := range reqs {
-		if r.seq != reqs[0].seq {
-			t.Fatalf("retries sent seqs %d and %d", reqs[0].seq, r.seq)
+		if r.Seq != reqs[0].Seq {
+			t.Fatalf("retries sent seqs %d and %d", reqs[0].Seq, r.Seq)
 		}
 	}
 
-	if err := c.Set("k", []byte("w")); !errors.Is(err, ErrOutcomeUnknown) {
+	if err := c.Set(within(t, limit), "k", []byte("w")); !errors.Is(err, protocol.ErrOutcomeUnknown) {
 		t.Fatalf("second write: got %v", err)
 	}
 	// nothing applied yet, so a new session rather than seq 2
-	if last := f.requests()[len(f.requests())-1]; last.client == reqs[0].client || last.seq != 1 {
-		t.Fatalf("write after giving up sent session (%d, %d) after (%d, %d), want a new client at seq 1", last.client, last.seq, reqs[0].client, reqs[0].seq)
+	if last := f.requests()[len(f.requests())-1]; last.Client == reqs[0].Client || last.Seq != 1 {
+		t.Fatalf("write after giving up sent session (%d, %d) after (%d, %d), want a new client at seq 1", last.Client, last.Seq, reqs[0].Client, reqs[0].Seq)
 	}
 }
 
 func TestReadGivesUpWithTheLastError(t *testing.T) {
 	addr, _ := serve(t, &redirectStore{unknown: math.MaxInt64})
 	c := dial(t, addr)
-	c.retryFor = 300 * time.Millisecond
-	var re *RedirectError
-	if _, _, err := c.Get("k"); !errors.As(err, &re) || errors.Is(err, ErrOutcomeUnknown) {
+	var re *protocol.RedirectError
+	if _, _, err := c.Get(within(t, 300*time.Millisecond), "k"); !errors.As(err, &re) || errors.Is(err, protocol.ErrOutcomeUnknown) {
 		t.Fatalf("get with no leader: got %v, want the redirect, not an unknown outcome", err)
 	}
 }
@@ -821,12 +756,12 @@ func TestClientRedialsTheSeeds(t *testing.T) {
 	store := newMemStore()
 	second, _ := serve(t, store)
 	c := dial(t, first, second)
-	if err := c.Ping(); err != nil {
+	if err := c.Ping(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
 	stopFirst()
-	if err := c.Set("k", []byte("v")); err != nil {
+	if err := c.Set(t.Context(), "k", []byte("v")); err != nil {
 		t.Fatalf("set after the connected server stopped: %v", err)
 	}
 	if v, ok := store.s.Get("k"); !ok || string(v) != "v" {
@@ -835,10 +770,10 @@ func TestClientRedialsTheSeeds(t *testing.T) {
 }
 
 func TestOutcomeUnknownSentAsStatusUnknown(t *testing.T) {
-	if resp := errorResponse(fmt.Errorf("propose: %w", ErrOutcomeUnknown)); resp[0] != statusUnknown {
-		t.Fatalf("an unknown outcome was answered with status %d, want statusUnknown", resp[0])
+	if resp := errorResponse(fmt.Errorf("propose: %w", protocol.ErrOutcomeUnknown)); resp[0] != protocol.StatusUnknown {
+		t.Fatalf("an unknown outcome was answered with status %d, want protocol.StatusUnknown", resp[0])
 	}
-	if resp := errorResponse(errors.New("value is not an integer")); resp[0] != statusError {
+	if resp := errorResponse(errors.New("value is not an integer")); resp[0] != protocol.StatusError {
 		t.Fatalf("a failed write was answered with status %d, want ERROR", resp[0])
 	}
 }
@@ -851,7 +786,7 @@ type unknownStore struct {
 
 func (s *unknownStore) Set(client, seq uint64, key string, value []byte) error {
 	if s.fail.Load() {
-		return fmt.Errorf("propose: %w", ErrOutcomeUnknown)
+		return fmt.Errorf("propose: %w", protocol.ErrOutcomeUnknown)
 	}
 	return s.memStore.Set(client, seq, key, value)
 }
@@ -861,15 +796,14 @@ func TestWriteAfterAnAbandonedFirstWriteSucceeds(t *testing.T) {
 	store.fail.Store(true)
 	addr, _ := serve(t, store)
 	c := dial(t, addr)
-	c.retryFor = 200 * time.Millisecond
-	if err := c.Set("k", []byte("lost")); !errors.Is(err, ErrOutcomeUnknown) {
+	if err := c.Set(within(t, 200*time.Millisecond), "k", []byte("lost")); !errors.Is(err, protocol.ErrOutcomeUnknown) {
 		t.Fatalf("first write: got %v, want ErrOutcomeUnknown", err)
 	}
 	store.fail.Store(false)
-	if err := c.Set("k", []byte("v")); err != nil {
+	if err := c.Set(t.Context(), "k", []byte("v")); err != nil {
 		t.Fatalf("write after the first was abandoned without applying: %v", err)
 	}
-	if err := c.Set("k", []byte("w")); err != nil {
+	if err := c.Set(t.Context(), "k", []byte("w")); err != nil {
 		t.Fatalf("third write: %v", err)
 	}
 }

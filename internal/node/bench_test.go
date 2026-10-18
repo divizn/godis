@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/divizn/godis/internal/network"
+	"github.com/divizn/godis/client"
 )
 
 var benchValue = bytes.Repeat([]byte("v"), 128)
@@ -21,9 +21,9 @@ func leaderAddr(b *testing.B) string {
 	return c.peer(c.leader()).ClientAddr
 }
 
-func dial(b *testing.B, addr string) *network.Client {
+func dial(b *testing.B, addr string) *client.Client {
 	b.Helper()
-	cl, err := network.Dial(addr)
+	cl, err := client.Dial(addr)
 	if err != nil {
 		b.Fatalf("dial %s: %v", addr, err)
 	}
@@ -38,7 +38,7 @@ func reportOpsPerSec(b *testing.B) {
 func BenchmarkSet(b *testing.B) {
 	cl := dial(b, leaderAddr(b))
 	for b.Loop() {
-		if err := cl.Set("k", benchValue); err != nil {
+		if err := cl.Set(b.Context(), "k", benchValue); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -49,14 +49,14 @@ func BenchmarkSetParallel(b *testing.B) {
 	addr := leaderAddr(b)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		cl, err := network.Dial(addr)
+		cl, err := client.Dial(addr)
 		if err != nil {
 			b.Error(err)
 			return
 		}
 		defer cl.Close()
 		for pb.Next() {
-			if err := cl.Set("k", benchValue); err != nil {
+			if err := cl.Set(b.Context(), "k", benchValue); err != nil {
 				b.Error(err)
 				return
 			}
@@ -67,11 +67,11 @@ func BenchmarkSetParallel(b *testing.B) {
 
 func BenchmarkGet(b *testing.B) {
 	cl := dial(b, leaderAddr(b))
-	if err := cl.Set("k", benchValue); err != nil {
+	if err := cl.Set(b.Context(), "k", benchValue); err != nil {
 		b.Fatal(err)
 	}
 	for b.Loop() {
-		if _, _, err := cl.Get("k"); err != nil {
+		if _, _, err := cl.Get(b.Context(), "k"); err != nil {
 			b.Fatal(err)
 		}
 	}

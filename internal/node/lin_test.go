@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/divizn/godis/client"
 	"github.com/divizn/godis/internal/consensus"
 	"github.com/divizn/godis/internal/lincheck"
-	"github.com/divizn/godis/internal/network"
 )
 
 // TestLinearizableAcrossRestarts runs clients through the real client and TCP stack while nodes,
@@ -90,13 +90,13 @@ func TestLinearizableAcrossRestarts(t *testing.T) {
 
 // linClient runs operations through one client session, which retries unknown outcomes itself; an op is
 // pending only if the client gave up on it
-func linClient(t *testing.T, c *testCluster, clock *atomic.Int64, client int, end time.Time) []lincheck.Op {
+func linClient(t *testing.T, c *testCluster, clock *atomic.Int64, id int, end time.Time) []lincheck.Op {
 	var addrs []string
 	for _, p := range c.peers {
 		addrs = append(addrs, p.ClientAddr)
 	}
 	rand.Shuffle(len(addrs), func(i, j int) { addrs[i], addrs[j] = addrs[j], addrs[i] })
-	cl, err := network.Dial(addrs...)
+	cl, err := client.Dial(addrs...)
 	if err != nil {
 		t.Errorf("dial: %v", err)
 		return nil
@@ -106,29 +106,29 @@ func linClient(t *testing.T, c *testCluster, clock *atomic.Int64, client int, en
 	var ops []lincheck.Op
 	for n := 0; time.Now().Before(end); n++ {
 		time.Sleep(rand.N(50 * time.Millisecond))
-		op := lincheck.Op{Client: client, Key: []string{"x", "y"}[rand.IntN(2)]}
-		value := fmt.Sprintf("c%d-%d", client, n)
+		op := lincheck.Op{Client: id, Key: []string{"x", "y"}[rand.IntN(2)]}
+		value := fmt.Sprintf("c%d-%d", id, n)
 		op.Call = clock.Add(1)
 		var err error
 		switch r := rand.IntN(20); {
 		case r < 5:
 			op.Kind, op.Value = lincheck.Set, value
-			err = cl.Set(op.Key, []byte(value))
+			err = cl.Set(t.Context(), op.Key, []byte(value))
 		case r < 7:
 			op.Kind = lincheck.Del
-			err = cl.Del(op.Key)
+			err = cl.Del(t.Context(), op.Key)
 		case r < 10:
 			op.Kind, op.Value = lincheck.Cas, value
 			var v []byte
-			if v, op.ExpectFound, err = cl.Get(op.Key); err != nil {
+			if v, op.ExpectFound, err = cl.Get(t.Context(), op.Key); err != nil {
 				continue
 			}
 			op.Call, op.Expected = clock.Add(1), string(v)
-			op.Found, err = cl.CAS(op.Key, v, op.ExpectFound, []byte(value))
+			op.Found, err = cl.CAS(t.Context(), op.Key, v, op.ExpectFound, []byte(value))
 		case r < 13:
 			op.Kind, op.Key, op.Delta = lincheck.Incr, "n", 1+rand.Int64N(3)
 			var v int64
-			v, err = cl.Incr(op.Key, op.Delta)
+			v, err = cl.Incr(t.Context(), op.Key, op.Delta)
 			op.Value = fmt.Sprint(v)
 		default:
 			op.Kind = lincheck.Get
@@ -136,7 +136,7 @@ func linClient(t *testing.T, c *testCluster, clock *atomic.Int64, client int, en
 				op.Key = "n"
 			}
 			var v []byte
-			v, op.Found, err = cl.Get(op.Key)
+			v, op.Found, err = cl.Get(t.Context(), op.Key)
 			op.Value = string(v)
 		}
 		switch {
@@ -144,7 +144,7 @@ func linClient(t *testing.T, c *testCluster, clock *atomic.Int64, client int, en
 			op.Return = clock.Add(1)
 		case op.Kind == lincheck.Get:
 			continue
-		case errors.Is(err, network.ErrOutcomeUnknown):
+		case errors.Is(err, client.ErrOutcomeUnknown):
 			op.Return = lincheck.Pending
 		default:
 			t.Errorf("%s %s: definite error %v", op.Kind, op.Key, err)

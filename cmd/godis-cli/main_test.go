@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/divizn/godis/internal/network"
+	"github.com/divizn/godis/client"
 	"github.com/divizn/godis/internal/node"
 )
 
@@ -57,7 +57,7 @@ func TestScriptedSession(t *testing.T) {
 		}
 	}()
 
-	c, err := network.Dial(lns[0].Addr().String())
+	c, err := client.Dial(lns[0].Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

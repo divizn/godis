@@ -9,7 +9,9 @@ Data dirs written before client sessions (the change that added CAS and INCR) ca
 - `internal/storage`: the in-memory `Store` (map behind an `RWMutex`), its client session table, and the command codec the Raft log carries
 - `internal/wal`: append-only log, one fsync per record (`uint32 len | crc32c | payload`), torn-tail truncation on replay
 - `internal/consensus`: Raft (elections, replication, `Propose`, `ReadIndex`, snapshots with log compaction and `InstallSnapshot`), persisted through the WAL and a checksummed snapshot file
-- `internal/network`: the client protocol, its server and the Go client
+- `client`: the Go client, importable as `github.com/divizn/godis/client`
+- `internal/protocol`: the client protocol's framing and request encoding
+- `internal/network`: the client protocol server
 - `internal/node`: wires Raft, the store, the client server, the `net/rpc` peer transport and the metrics together
 - `cmd/server`: one node; `cmd/godis-cli`: REPL and one-shot client
 
@@ -28,11 +30,29 @@ Followers never serve reads or writes; they answer REDIRECT with the leader's cl
 
 - Linearizable writes and reads, from the leader only.
 - A write is acked only once it is fsynced on a majority and applied on the leader.
-- Exactly-once writes through the Go client. Each client picks a random 64-bit id and numbers its writes; every write carries `(client, seq)` through the log, and the store keeps each client's last seq and result, so a write that reaches the log twice takes effect once and the duplicate gets the cached result. The client retries a write with the same seq whenever the outcome is unknown: a lost leadership, a server timeout, a dropped connection, a failed dial. It gives up after 10 seconds with `ErrOutcomeUnknown`, and the next write uses the next seq, so the abandoned one can still commit at most once. Until one of its writes has applied, a client whose write fails starts a new session instead, because the cluster may hold no session for it yet. A write that returns success took effect exactly once.
+- Exactly-once writes through the Go client. Each client picks a random 64-bit id and numbers its writes; every write carries `(client, seq)` through the log, and the store keeps each client's last seq and result, so a write that reaches the log twice takes effect once and the duplicate gets the cached result. The client retries a write with the same seq whenever the outcome is unknown: a lost leadership, a server timeout, a dropped connection, a failed dial. It gives up after 10 seconds, or sooner when the call's context ends, with `ErrOutcomeUnknown`, and the next write uses the next seq, so the abandoned one can still commit at most once. Until one of its writes has applied, a client whose write fails starts a new session instead, because the cluster may hold no session for it yet. A write that returns success took effect exactly once.
 - Leader loss: the remaining majority elects a new leader within one to two election timeouts (1s by default) and the client retries through the redirect, or redials the other nodes if the leader is gone.
 - A leader that hasn't heard from a majority for an election timeout steps down instead of timing out its pending requests. Pending reads get a redirect. Pending writes get "outcome unknown" (a write already in the log may still commit), and the client resends them with the same seq.
 - Snapshots: every node snapshots the store after each `--snapshot-entries` applied entries and drops the log before it. The snapshot is fsynced and renamed into place before the log is rewritten, so a crash between the two restarts cleanly, and a follower acks an InstallSnapshot only once both are durable. A restart restores the snapshot and replays only the log after it.
 - A node that can no longer persist its log or term halts and the process exits non-zero, rather than serve from a state it can't make durable.
+
+## Go client
+
+```go
+c, err := client.Dial("localhost:8081", "localhost:8082", "localhost:8083")
+if err != nil {
+	return err
+}
+defer c.Close()
+if err := c.Set(ctx, "k", []byte("v")); err != nil {
+	return err
+}
+v, ok, err := c.Get(ctx, "k")
+n, err := c.Incr(ctx, "hits", 1)
+swapped, err := c.CAS(ctx, "k", []byte("v"), true, []byte("w"))
+```
+
+A `Client` is one session and is not safe for concurrent use: give each goroutine its own.
 
 ## Running it
 

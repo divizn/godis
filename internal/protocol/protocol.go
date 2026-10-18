@@ -1,5 +1,5 @@
-// Package network implements the godis TCP protocol, its server and its client.
-package network
+// Package protocol is the godis client protocol: framing, requests, and response statuses.
+package protocol
 
 import (
 	"bytes"
@@ -10,34 +10,34 @@ import (
 )
 
 // frame layout: uint32 payload length | payload, big endian
-const maxFrameSize = 16 << 20
+const MaxFrameSize = 16 << 20
 
-// request payload: op | session (writes only: uvarint client | uvarint seq) | uvarint-length-prefixed key | rest
+// Request payload: op | session (writes only: uvarint client | uvarint seq) | uvarint-length-prefixed key | rest
 // set rest: value field; cas rest: byte expectFound | expected field | value field; incr rest: varint delta
 const (
-	opPing byte = iota + 1
-	opGet
-	opSet
-	opDel
-	opCas
-	opIncr
+	OpPing byte = iota + 1
+	OpGet
+	OpSet
+	OpDel
+	OpCas
+	OpIncr
 )
 
 // response payload: status | body
 // OK bodies: the value for get, 1 or 0 for whether a cas swapped, the new value in decimal for incr
 const (
-	statusOK byte = iota
-	statusNotFound
-	statusError
-	statusRedirect
-	// statusUnknown means the write may or may not apply: retry it with the same seq
-	statusUnknown
+	StatusOK byte = iota
+	StatusNotFound
+	StatusError
+	StatusRedirect
+	// StatusUnknown means the write may or may not apply: retry it with the same seq
+	StatusUnknown
 )
 
-var errFrameTooLarge = errors.New("frame too large")
+var ErrFrameTooLarge = errors.New("frame too large")
 
 // ErrOutcomeUnknown means a write may or may not have taken effect. A Store returns it, wrapped, for the server to
-// answer statusUnknown; the client returns it once it gives up retrying.
+// answer StatusUnknown; the client returns it once it gives up retrying.
 var ErrOutcomeUnknown = errors.New("outcome unknown")
 
 // RedirectError reports that a node is not the leader. Addr is the leader's client address, empty if unknown.
@@ -52,15 +52,15 @@ func (e *RedirectError) Error() string {
 	return "not the leader, leader is at " + e.Addr
 }
 
-// readFrame grows its buffer as bytes arrive, never allocating a length the peer has not sent.
-func readFrame(r io.Reader) ([]byte, error) {
+// ReadFrame reads one frame, growing its buffer as bytes arrive, never allocating a length the peer has not sent.
+func ReadFrame(r io.Reader) ([]byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
 	n := binary.BigEndian.Uint32(hdr[:])
-	if n > maxFrameSize {
-		return nil, fmt.Errorf("%w: %d bytes", errFrameTooLarge, n)
+	if n > MaxFrameSize {
+		return nil, fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, n)
 	}
 	var buf bytes.Buffer
 	if _, err := io.CopyN(&buf, r, int64(n)); err != nil {
@@ -72,9 +72,9 @@ func readFrame(r io.Reader) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func writeFrame(w io.Writer, payload []byte) error {
-	if len(payload) > maxFrameSize {
-		return fmt.Errorf("%w: %d bytes", errFrameTooLarge, len(payload))
+func WriteFrame(w io.Writer, payload []byte) error {
+	if len(payload) > MaxFrameSize {
+		return fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(payload))
 	}
 	frame := binary.BigEndian.AppendUint32(make([]byte, 0, 4+len(payload)), uint32(len(payload)))
 	if _, err := w.Write(append(frame, payload...)); err != nil {
@@ -83,43 +83,43 @@ func writeFrame(w io.Writer, payload []byte) error {
 	return nil
 }
 
-// request is one client request; writes carry the client's session, (client, seq)
-type request struct {
-	op          byte
-	client, seq uint64
-	key         string
-	value       []byte
-	expected    []byte
-	expectFound bool
-	delta       int64
+// Request is one client Request; writes carry the client's session, (client, seq)
+type Request struct {
+	Op          byte
+	Client, Seq uint64
+	Key         string
+	Value       []byte
+	Expected    []byte
+	ExpectFound bool
+	Delta       int64
 }
 
-func (r request) isWrite() bool {
-	return r.op == opSet || r.op == opDel || r.op == opCas || r.op == opIncr
+func (r Request) IsWrite() bool {
+	return r.Op == OpSet || r.Op == OpDel || r.Op == OpCas || r.Op == OpIncr
 }
 
-func (r request) append(b []byte) []byte {
-	b = append(b, r.op)
-	if r.op == opPing {
+func (r Request) Append(b []byte) []byte {
+	b = append(b, r.Op)
+	if r.Op == OpPing {
 		return b
 	}
-	if r.isWrite() {
-		b = binary.AppendUvarint(b, r.client)
-		b = binary.AppendUvarint(b, r.seq)
+	if r.IsWrite() {
+		b = binary.AppendUvarint(b, r.Client)
+		b = binary.AppendUvarint(b, r.Seq)
 	}
-	b = appendField(b, []byte(r.key))
-	switch r.op {
-	case opSet:
-		b = appendField(b, r.value)
-	case opCas:
+	b = appendField(b, []byte(r.Key))
+	switch r.Op {
+	case OpSet:
+		b = appendField(b, r.Value)
+	case OpCas:
 		flag := byte(0)
-		if r.expectFound {
+		if r.ExpectFound {
 			flag = 1
 		}
-		b = appendField(append(b, flag), r.expected)
-		b = appendField(b, r.value)
-	case opIncr:
-		b = binary.AppendVarint(b, r.delta)
+		b = appendField(append(b, flag), r.Expected)
+		b = appendField(b, r.Value)
+	case OpIncr:
+		b = binary.AppendVarint(b, r.Delta)
 	}
 	return b
 }
@@ -128,35 +128,35 @@ func appendField(b, f []byte) []byte {
 	return append(binary.AppendUvarint(b, uint64(len(f))), f...)
 }
 
-func parseRequest(p []byte) (request, error) {
-	var r request
+func ParseRequest(p []byte) (Request, error) {
+	var r Request
 	if len(p) == 0 {
-		return r, errors.New("empty request")
+		return r, errors.New("empty Request")
 	}
-	r.op = p[0]
+	r.Op = p[0]
 	rest := p[1:]
-	if r.op < opPing || r.op > opIncr {
-		return r, fmt.Errorf("unknown op %d", r.op)
+	if r.Op < OpPing || r.Op > OpIncr {
+		return r, fmt.Errorf("unknown op %d", r.Op)
 	}
-	if r.op == opPing {
+	if r.Op == OpPing {
 		if len(rest) != 0 {
 			return r, fmt.Errorf("%d trailing bytes", len(rest))
 		}
 		return r, nil
 	}
 	var err error
-	if r.isWrite() {
+	if r.IsWrite() {
 		for _, f := range []struct {
 			v    *uint64
 			what string
-		}{{&r.client, "client"}, {&r.seq, "seq"}} {
+		}{{&r.Client, "client"}, {&r.Seq, "seq"}} {
 			n, w := binary.Uvarint(rest)
 			if w <= 0 {
 				return r, fmt.Errorf("%s: missing or malformed", f.what)
 			}
 			*f.v, rest = n, rest[w:]
 		}
-		if r.seq == 0 {
+		if r.Seq == 0 {
 			return r, errors.New("seq: must start at 1")
 		}
 	}
@@ -164,29 +164,29 @@ func parseRequest(p []byte) (request, error) {
 	if k, rest, err = cutField(rest); err != nil {
 		return r, fmt.Errorf("key: %w", err)
 	}
-	r.key = string(k)
-	switch r.op {
-	case opSet:
-		if r.value, rest, err = cutField(rest); err != nil {
+	r.Key = string(k)
+	switch r.Op {
+	case OpSet:
+		if r.Value, rest, err = cutField(rest); err != nil {
 			return r, fmt.Errorf("value: %w", err)
 		}
-	case opCas:
+	case OpCas:
 		if len(rest) == 0 || rest[0] > 1 {
 			return r, errors.New("expect flag: missing or not 0 or 1")
 		}
-		r.expectFound = rest[0] == 1
-		if r.expected, rest, err = cutField(rest[1:]); err != nil {
+		r.ExpectFound = rest[0] == 1
+		if r.Expected, rest, err = cutField(rest[1:]); err != nil {
 			return r, fmt.Errorf("expected value: %w", err)
 		}
-		if r.value, rest, err = cutField(rest); err != nil {
+		if r.Value, rest, err = cutField(rest); err != nil {
 			return r, fmt.Errorf("value: %w", err)
 		}
-	case opIncr:
+	case OpIncr:
 		d, w := binary.Varint(rest)
 		if w <= 0 {
 			return r, errors.New("delta: missing or malformed")
 		}
-		r.delta, rest = d, rest[w:]
+		r.Delta, rest = d, rest[w:]
 	}
 	if len(rest) != 0 {
 		return r, fmt.Errorf("%d trailing bytes", len(rest))
@@ -201,7 +201,7 @@ func cutField(p []byte) (field, rest []byte, err error) {
 	}
 	p = p[w:]
 	if n > uint64(len(p)) {
-		return nil, nil, fmt.Errorf("length %d runs past end of request", n)
+		return nil, nil, fmt.Errorf("length %d runs past end of Request", n)
 	}
 	return p[:n], p[n:], nil
 }

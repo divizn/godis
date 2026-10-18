@@ -13,6 +13,7 @@ import (
 
 	"github.com/divizn/godis/internal/consensus"
 	"github.com/divizn/godis/internal/network"
+	"github.com/divizn/godis/internal/protocol"
 	"github.com/divizn/godis/internal/storage"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -264,9 +265,9 @@ func (s kvStore) classify(err error) error {
 	var nle *consensus.NotLeaderError
 	switch {
 	case errors.As(err, &nle):
-		return &network.RedirectError{Addr: s.clientAddrs[nle.Leader]}
+		return &protocol.RedirectError{Addr: s.clientAddrs[nle.Leader]}
 	case errors.Is(err, consensus.ErrCommandTooLarge), errors.Is(err, consensus.ErrEmptyCommand):
 		return err
 	}
-	return fmt.Errorf("%w: %w", network.ErrOutcomeUnknown, err)
+	return fmt.Errorf("%w: %w", protocol.ErrOutcomeUnknown, err)
 }

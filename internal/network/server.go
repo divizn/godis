@@ -1,3 +1,4 @@
+// Package network is the godis client protocol server.
 package network
 
 import (
@@ -8,11 +9,13 @@ import (
 	"net"
 	"strconv"
 	"sync"
+
+	"github.com/divizn/godis/internal/protocol"
 )
 
 // Store is the key-value store a Server serves. Each write carries the client's session, (client, seq), and must
-// take effect at most once per session. An error wrapping ErrOutcomeUnknown says the write may still apply,
-// a *RedirectError that it never ran.
+// take effect at most once per session. An error wrapping protocol.ErrOutcomeUnknown says the write may still apply,
+// a *protocol.RedirectError that it never ran.
 type Store interface {
 	Get(key string) ([]byte, bool, error)
 	Set(client, seq uint64, key string, value []byte) error
@@ -100,61 +103,61 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 func (s *Server) handle(conn net.Conn, setBusy func(net.Conn, bool) bool) {
 	r := bufio.NewReader(conn)
 	for {
-		req, err := readFrame(r)
+		req, err := protocol.ReadFrame(r)
 		if err != nil || !setBusy(conn, true) {
 			return
 		}
-		if err := writeFrame(conn, s.exec(req)); err != nil || !setBusy(conn, false) {
+		if err := protocol.WriteFrame(conn, s.exec(req)); err != nil || !setBusy(conn, false) {
 			return
 		}
 	}
 }
 
 func (s *Server) exec(p []byte) []byte {
-	req, err := parseRequest(p)
+	req, err := protocol.ParseRequest(p)
 	if err != nil {
 		return errorResponse(fmt.Errorf("malformed request: %w", err))
 	}
 	var body []byte
-	switch req.op {
-	case opGet:
-		v, ok, err := s.store.Get(req.key)
+	switch req.Op {
+	case protocol.OpGet:
+		v, ok, err := s.store.Get(req.Key)
 		if err != nil {
 			return errorResponse(err)
 		}
 		if !ok {
-			return []byte{statusNotFound}
+			return []byte{protocol.StatusNotFound}
 		}
 		body = v
-	case opSet:
-		err = s.store.Set(req.client, req.seq, req.key, req.value)
-	case opDel:
-		err = s.store.Delete(req.client, req.seq, req.key)
-	case opCas:
+	case protocol.OpSet:
+		err = s.store.Set(req.Client, req.Seq, req.Key, req.Value)
+	case protocol.OpDel:
+		err = s.store.Delete(req.Client, req.Seq, req.Key)
+	case protocol.OpCas:
 		var swapped bool
-		swapped, err = s.store.Cas(req.client, req.seq, req.key, req.expected, req.expectFound, req.value)
+		swapped, err = s.store.Cas(req.Client, req.Seq, req.Key, req.Expected, req.ExpectFound, req.Value)
 		body = []byte{0}
 		if swapped {
 			body[0] = 1
 		}
-	case opIncr:
+	case protocol.OpIncr:
 		var n int64
-		n, err = s.store.Incr(req.client, req.seq, req.key, req.delta)
+		n, err = s.store.Incr(req.Client, req.Seq, req.Key, req.Delta)
 		body = strconv.AppendInt(nil, n, 10)
 	}
 	if err != nil {
 		return errorResponse(err)
 	}
-	return append([]byte{statusOK}, body...)
+	return append([]byte{protocol.StatusOK}, body...)
 }
 
 func errorResponse(err error) []byte {
-	var re *RedirectError
+	var re *protocol.RedirectError
 	switch {
 	case errors.As(err, &re):
-		return append([]byte{statusRedirect}, re.Addr...)
-	case errors.Is(err, ErrOutcomeUnknown):
-		return append([]byte{statusUnknown}, err.Error()...)
+		return append([]byte{protocol.StatusRedirect}, re.Addr...)
+	case errors.Is(err, protocol.ErrOutcomeUnknown):
+		return append([]byte{protocol.StatusUnknown}, err.Error()...)
 	}
-	return append([]byte{statusError}, err.Error()...)
+	return append([]byte{protocol.StatusError}, err.Error()...)
 }

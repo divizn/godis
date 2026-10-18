@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/divizn/godis/internal/consensus"
-	"github.com/divizn/godis/internal/network"
+	"github.com/divizn/godis/internal/protocol"
 	"github.com/divizn/godis/internal/storage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -62,12 +62,12 @@ func registerStoreCounters(reg prometheus.Registerer, store *storage.Store) {
 }
 
 func (m *metrics) observe(op string, start time.Time, found bool, err error) {
-	var re *network.RedirectError
+	var re *protocol.RedirectError
 	result := "ok"
 	switch {
 	case errors.As(err, &re):
 		result = "redirect"
-	case errors.Is(err, network.ErrOutcomeUnknown):
+	case errors.Is(err, protocol.ErrOutcomeUnknown):
 		result = "unknown"
 	case err != nil:
 		result = "error"

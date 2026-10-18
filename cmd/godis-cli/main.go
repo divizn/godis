@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,7 +13,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/divizn/godis/internal/network"
+	"github.com/divizn/godis/client"
 )
 
 func main() {
@@ -20,7 +21,7 @@ func main() {
 	addr := flag.String("addr", "localhost:8080", "server addresses, comma separated")
 	flag.Parse()
 
-	c, err := network.Dial(strings.Split(*addr, ",")...)
+	c, err := client.Dial(strings.Split(*addr, ",")...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -45,7 +46,7 @@ func main() {
 	}
 }
 
-func repl(c *network.Client, in io.Reader, out io.Writer, prompt string) error {
+func repl(c *client.Client, in io.Reader, out io.Writer, prompt string) error {
 	sc := bufio.NewScanner(in)
 	sc.Buffer(nil, 64<<20)
 	for {
@@ -78,7 +79,7 @@ var arity = map[string][2]int{"PING": {1, 1}, "GET": {2, 2}, "SET": {3, 3}, "DEL
 // absent as CAS's expected value means "only if the key does not exist"
 const absent = "-"
 
-func run(c *network.Client, args []string) (string, error) {
+func run(c *client.Client, args []string) (string, error) {
 	cmd := strings.ToUpper(args[0])
 	n, ok := arity[cmd]
 	if !ok {
@@ -88,28 +89,29 @@ func run(c *network.Client, args []string) (string, error) {
 		return "", fmt.Errorf("wrong number of arguments for '%s'", strings.ToLower(cmd))
 	}
 
+	ctx := context.Background()
 	var err error
 	switch cmd {
 	case "PING":
-		if err = c.Ping(); err == nil {
+		if err = c.Ping(ctx); err == nil {
 			return "PONG", nil
 		}
 	case "GET":
 		var v []byte
 		var found bool
-		if v, found, err = c.Get(args[1]); err == nil {
+		if v, found, err = c.Get(ctx, args[1]); err == nil {
 			if !found {
 				return "(nil)", nil
 			}
 			return strconv.Quote(string(v)), nil
 		}
 	case "SET":
-		err = c.Set(args[1], []byte(args[2]))
+		err = c.Set(ctx, args[1], []byte(args[2]))
 	case "DEL":
-		err = c.Del(args[1])
+		err = c.Del(ctx, args[1])
 	case "CAS":
 		var swapped bool
-		if swapped, err = c.CAS(args[1], []byte(args[2]), args[2] != absent, []byte(args[3])); err == nil {
+		if swapped, err = c.CAS(ctx, args[1], []byte(args[2]), args[2] != absent, []byte(args[3])); err == nil {
 			if swapped {
 				return "(integer) 1", nil
 			}
@@ -123,7 +125,7 @@ func run(c *network.Client, args []string) (string, error) {
 			}
 		}
 		var v int64
-		if v, err = c.Incr(args[1], delta); err == nil {
+		if v, err = c.Incr(ctx, args[1], delta); err == nil {
 			return fmt.Sprint("(integer) ", v), nil
 		}
 	}

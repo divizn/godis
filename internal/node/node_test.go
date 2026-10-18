@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/divizn/godis/client"
 	"github.com/divizn/godis/internal/consensus"
-	"github.com/divizn/godis/internal/network"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -143,8 +143,8 @@ func waitFor(t testing.TB, what string, f func() error) {
 }
 
 // via runs f against a fresh client on node id's client address
-func (c *testCluster) via(id string, f func(*network.Client) error) error {
-	cl, err := network.Dial(c.peer(id).ClientAddr)
+func (c *testCluster) via(id string, f func(*client.Client) error) error {
+	cl, err := client.Dial(c.peer(id).ClientAddr)
 	if err != nil {
 		return err
 	}
@@ -152,18 +152,18 @@ func (c *testCluster) via(id string, f func(*network.Client) error) error {
 	return f(cl)
 }
 
-func set(key, value string) func(*network.Client) error {
-	return func(cl *network.Client) error { return cl.Set(key, []byte(value)) }
+func set(key, value string) func(*client.Client) error {
+	return func(cl *client.Client) error { return cl.Set(context.Background(), key, []byte(value)) }
 }
 
-func del(key string) func(*network.Client) error {
-	return func(cl *network.Client) error { return cl.Del(key) }
+func del(key string) func(*client.Client) error {
+	return func(cl *client.Client) error { return cl.Del(context.Background(), key) }
 }
 
 // get fails the test on a wrong value; an error is returned for the caller to retry
-func get(t *testing.T, key string, want string, wantOK bool) func(*network.Client) error {
-	return func(cl *network.Client) error {
-		v, ok, err := cl.Get(key)
+func get(t *testing.T, key string, want string, wantOK bool) func(*client.Client) error {
+	return func(cl *client.Client) error {
+		v, ok, err := cl.Get(context.Background(), key)
 		if err != nil {
 			return err
 		}
@@ -297,14 +297,14 @@ func TestStopAnswersInFlightWrites(t *testing.T) {
 	stopped := make(chan string, 8)
 	for i := range 8 {
 		wg.Go(func() {
-			cl, err := network.Dial(c.peer(leader).ClientAddr)
+			cl, err := client.Dial(c.peer(leader).ClientAddr)
 			if err != nil {
 				t.Errorf("dial: %v", err)
 				return
 			}
 			defer cl.Close()
 			for j := 0; ; j++ {
-				err := cl.Set(fmt.Sprint("k", i, "-", j), []byte("v"))
+				err := cl.Set(t.Context(), fmt.Sprint("k", i, "-", j), []byte("v"))
 				if err != nil {
 					if strings.Contains(err.Error(), consensus.ErrStopped.Error()) {
 						stopped <- err.Error()
@@ -346,16 +346,16 @@ func TestMaxSizeValuesCommitWithoutElection(t *testing.T) {
 
 func TestRaftErrorsTellTheClientWhatToRetry(t *testing.T) {
 	s := kvStore{clientAddrs: map[string]string{"node-2": "addr-2"}}
-	var re *network.RedirectError
+	var re *client.RedirectError
 	if err := s.classify(fmt.Errorf("propose: %w", &consensus.NotLeaderError{Leader: "node-2"})); !errors.As(err, &re) || re.Addr != "addr-2" {
 		t.Fatalf("not the leader: got %v, want a redirect to addr-2", err)
 	}
 	for _, cause := range []error{consensus.ErrLeadershipLost, context.DeadlineExceeded} {
-		if err := s.classify(fmt.Errorf("propose: %w", cause)); errors.As(err, &re) || !errors.Is(err, network.ErrOutcomeUnknown) || !errors.Is(err, cause) {
+		if err := s.classify(fmt.Errorf("propose: %w", cause)); errors.As(err, &re) || !errors.Is(err, client.ErrOutcomeUnknown) || !errors.Is(err, cause) {
 			t.Fatalf("%v with the write logged: got %v, want an unknown outcome the client retries", cause, err)
 		}
 	}
-	if err := s.classify(fmt.Errorf("propose: %w", consensus.ErrCommandTooLarge)); errors.Is(err, network.ErrOutcomeUnknown) || errors.As(err, &re) {
+	if err := s.classify(fmt.Errorf("propose: %w", consensus.ErrCommandTooLarge)); errors.Is(err, client.ErrOutcomeUnknown) || errors.As(err, &re) {
 		t.Fatalf("command too large: got %v, want a definite error", err)
 	}
 }
@@ -372,12 +372,12 @@ func TestWriteRetriedAcrossALeaderKillAppliesOnce(t *testing.T) {
 			addrs = append(addrs, p.ClientAddr)
 		}
 	}
-	cl, err := network.Dial(addrs...)
+	cl, err := client.Dial(addrs...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cl.Close()
-	if _, err := cl.Incr("other", 1); err != nil {
+	if _, err := cl.Incr(t.Context(), "other", 1); err != nil {
 		t.Fatalf("warm up incr: %v", err)
 	}
 
@@ -390,7 +390,7 @@ func TestWriteRetriedAcrossALeaderKillAppliesOnce(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		n, err := cl.Incr("n", 1)
+		n, err := cl.Incr(t.Context(), "n", 1)
 		done <- result{n, err}
 	}()
 	waitFor(t, leader+" to step down without a quorum", func() error {
@@ -407,19 +407,19 @@ func TestWriteRetriedAcrossALeaderKillAppliesOnce(t *testing.T) {
 	if r.err != nil || r.n != 1 {
 		t.Fatalf("incr retried across a leader kill: got %d, %v; want 1", r.n, r.err)
 	}
-	if v, ok, err := cl.Get("n"); err != nil || !ok || string(v) != "1" {
+	if v, ok, err := cl.Get(t.Context(), "n"); err != nil || !ok || string(v) != "1" {
 		t.Fatalf("get n: got %q, %v, %v; want 1", v, ok, err)
 	}
 	if d := c.nodes[c.leader()].store.Duplicates(); d == 0 {
 		t.Fatal("the leader dropped no duplicate: the first attempt never committed, so the retry was not deduplicated")
 	}
-	if _, err := cl.Incr("other", 1); err != nil {
+	if _, err := cl.Incr(t.Context(), "other", 1); err != nil {
 		t.Fatalf("incr after the retry: %v", err)
 	}
-	if err := cl.Set("s", []byte("x")); err != nil {
+	if err := cl.Set(t.Context(), "s", []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cl.Incr("s", 1); err == nil || errors.Is(err, network.ErrOutcomeUnknown) {
+	if _, err := cl.Incr(t.Context(), "s", 1); err == nil || errors.Is(err, client.ErrOutcomeUnknown) {
 		t.Fatalf("incr of a non-integer: got %v, want a definite error", err)
 	}
 }

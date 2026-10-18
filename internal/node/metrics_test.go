@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/divizn/godis/internal/network"
+	"github.com/divizn/godis/client"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -105,13 +105,13 @@ func TestMetrics(t *testing.T) {
 			c.stop(p.ID)
 		}
 	}
-	cl, err := network.Dial(c.peer(leader).ClientAddr)
+	cl, err := client.Dial(c.peer(leader).ClientAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cl.Close()
 	// the client retries the get for 10s, so watch the metric rather than wait for it
-	go func() { _, _, _ = cl.Get("a") }()
+	go func() { _, _, _ = cl.Get(t.Context(), "a") }()
 	waitFor(t, "a get without a quorum to count as unknown", func() error {
 		if got := metric(t, lr, "godis_requests_total", "op", "get", "result", "unknown"); got < 1 {
 			return fmt.Errorf("counted %v", got)
