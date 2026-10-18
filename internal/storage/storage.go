@@ -15,16 +15,22 @@ import (
 
 const (
 	defaultMaxSessions = 100_000
-	snapshotVersion    = 1
+	snapshotVersion    = 2
 )
 
 // Store is the state machine: the data plus a session per client, so a retried write applies once.
 type Store struct {
-	mu          sync.RWMutex
-	data        map[string][]byte
+	mu   sync.RWMutex
+	data map[string][]byte
+	// deadlines holds the keys of data that expire, in Unix ms
+	// ponytail: scanned whole by every sweep; a min-heap if keys with TTLs get numerous
+	deadlines map[string]uint64
+	// clock is the highest command time applied, which time in the state machine never goes behind
+	clock       uint64
 	sessions    map[uint64]session
 	maxSessions int
 	duplicates  atomic.Uint64
+	expired     atomic.Uint64
 }
 
 // session is a client's last applied write, its log index and its result
@@ -34,10 +40,12 @@ type session struct {
 }
 
 func New() *Store {
-	return &Store{data: map[string][]byte{}, sessions: map[uint64]session{}, maxSessions: defaultMaxSessions}
+	return &Store{data: map[string][]byte{}, deadlines: map[string]uint64{}, sessions: map[uint64]session{}, maxSessions: defaultMaxSessions}
 }
 
 // Apply applies the command at log index once per (client, seq) and returns its result, for ParseResult.
+// The command runs at the later of its time and the highest time applied before it.
+// A sweep has no session and runs every time.
 // A duplicate, seq at or below the client's last, returns the last result and changes nothing.
 // A seq above 1 from a client without a session fails with "session expired".
 // The error is only for a malformed command, which changes nothing.
@@ -48,6 +56,10 @@ func (s *Store) Apply(index uint64, cmd []byte) ([]byte, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.clock = max(s.clock, c.now)
+	if c.op == opSweep {
+		return s.sweep(s.clock), nil
+	}
 	sess, ok := s.sessions[c.client]
 	if ok && c.seq <= sess.seq {
 		s.duplicates.Add(1)
@@ -58,7 +70,7 @@ func (s *Store) Apply(index uint64, cmd []byte) ([]byte, error) {
 		// ponytail: an evicted client retrying its seq 1 write can still apply it twice; expire sessions by leader time to close that
 		result = failedResult("session expired")
 	} else {
-		result = s.exec(c)
+		result = s.exec(c, s.clock)
 	}
 	s.sessions[c.client] = session{seq: c.seq, index: index, result: result}
 	if len(s.sessions) > s.maxSessions {
@@ -83,40 +95,102 @@ func (s *Store) evict() {
 	}
 }
 
-// Get returns the stored slice itself; callers must not modify it.
-func (s *Store) Get(key string) ([]byte, bool) {
+// Expired counts the keys sweeps deleted since New.
+func (s *Store) Expired() uint64 {
+	return s.expired.Load()
+}
+
+// Clock is the highest command time applied, in Unix ms.
+func (s *Store) Clock() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.clock
+}
+
+// Len counts the keys held, expired ones a sweep has not yet deleted included.
+func (s *Store) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.data)
+}
+
+// Get reads key at the later of now, in Unix ms, and the store's clock. It returns the stored slice itself; callers must not modify it.
+func (s *Store) Get(key string, now uint64) ([]byte, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.live(key, max(now, s.clock))
+}
+
+// TTL reports the ms left before key expires, read like Get. Zero means no deadline, found false a missing or expired key.
+func (s *Store) TTL(key string, now uint64) (remaining uint64, found bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t := max(now, s.clock)
+	if _, found = s.live(key, t); !found {
+		return 0, false
+	}
+	if d := s.deadlines[key]; d != 0 {
+		remaining = d - t
+	}
+	return remaining, true
+}
+
+// due is whether a key with deadline d, 0 for none, is expired at t
+func due(d, t uint64) bool { return d != 0 && d <= t }
+
+// live returns key's value unless it is missing or expired at t; mu must be held
+func (s *Store) live(key string, t uint64) ([]byte, bool) {
 	v, ok := s.data[key]
+	if due(s.deadlines[key], t) {
+		return nil, false
+	}
 	return v, ok
 }
 
+// put stores a copy of value with deadline, 0 for none; mu must be held
+func (s *Store) put(key string, value []byte, deadline uint64) {
+	s.data[key] = bytes.Clone(value)
+	if deadline == 0 {
+		delete(s.deadlines, key)
+	} else {
+		s.deadlines[key] = deadline
+	}
+}
+
+// remove deletes key and its deadline; mu must be held
+func (s *Store) remove(key string) {
+	delete(s.data, key)
+	delete(s.deadlines, key)
+}
+
+// Set stores value with no deadline.
 func (s *Store) Set(key string, value []byte) {
-	v := bytes.Clone(value)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[key] = v
+	s.put(key, value, 0)
 }
 
 func (s *Store) Delete(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.data, key)
+	s.remove(key)
 }
 
 // Snapshot encodes the whole store, keys and clients sorted so equal stores give equal bytes:
-// version 1 | uvarint count | (uvarint key length | key | uvarint value length | value)* |
+// version 2 | uvarint clock | uvarint count | (uvarint key length | key | uvarint value length | value | uvarint deadline)* |
 // uvarint session count | (uvarint client | uvarint seq | uvarint last index | uvarint result length | result)*
 // ponytail: holds the read lock while encoding, so writes wait for the whole snapshot; copy-on-write if that stalls the store
 func (s *Store) Snapshot() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	b := binary.AppendUvarint([]byte{snapshotVersion}, uint64(len(s.data)))
+	b := binary.AppendUvarint([]byte{snapshotVersion}, s.clock)
+	b = binary.AppendUvarint(b, uint64(len(s.data)))
 	for _, k := range slices.Sorted(maps.Keys(s.data)) {
 		b = binary.AppendUvarint(b, uint64(len(k)))
 		b = append(b, k...)
 		b = binary.AppendUvarint(b, uint64(len(s.data[k])))
 		b = append(b, s.data[k]...)
+		b = binary.AppendUvarint(b, s.deadlines[k])
 	}
 	b = binary.AppendUvarint(b, uint64(len(s.sessions)))
 	for _, c := range slices.Sorted(maps.Keys(s.sessions)) {
@@ -156,11 +230,16 @@ func (s *Store) Restore(b []byte) error {
 		b = b[size:]
 		return f, nil
 	}
+	clock, err := uvarint("clock")
+	if err != nil {
+		return err
+	}
 	count, err := uvarint("key count")
 	if err != nil {
 		return err
 	}
 	data := make(map[string][]byte, min(count, uint64(len(b))))
+	deadlines := map[string]uint64{}
 	for range count {
 		k, err := field()
 		if err != nil {
@@ -171,6 +250,13 @@ func (s *Store) Restore(b []byte) error {
 			return err
 		}
 		data[string(k)] = bytes.Clone(v)
+		d, err := uvarint("deadline")
+		if err != nil {
+			return err
+		}
+		if d != 0 {
+			deadlines[string(k)] = d
+		}
 	}
 	count, err = uvarint("session count")
 	if err != nil {
@@ -200,6 +286,6 @@ func (s *Store) Restore(b []byte) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data, s.sessions = data, sessions
+	s.data, s.deadlines, s.clock, s.sessions = data, deadlines, clock, sessions
 	return nil
 }

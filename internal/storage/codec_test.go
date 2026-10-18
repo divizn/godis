@@ -46,19 +46,19 @@ func wantFailed(t *testing.T, r []byte, msg string) {
 
 func wantValue(t *testing.T, s *testStore, key, value string, found bool) {
 	t.Helper()
-	if v, ok := s.Get(key); ok != found || string(v) != value {
+	if v, ok := s.Get(key, 0); ok != found || string(v) != value {
 		t.Fatalf("get %q: got %q, %v; want %q, %v", key, v, ok, value, found)
 	}
 }
 
 func TestApplyEncodedCommands(t *testing.T) {
 	s := newTestStore(t)
-	s.apply(EncodeSet(1, 1, "a", []byte("1")))
-	s.apply(EncodeSet(1, 2, "b", []byte("2")))
-	s.apply(EncodeSet(1, 3, "a", []byte("3")))
-	s.apply(EncodeSet(1, 4, "empty", nil))
-	s.apply(EncodeSet(1, 5, "bin\x00\x01", []byte("\x00\xff\x02")))
-	wantOK(t, s.apply(EncodeDelete(1, 6, "b")), "")
+	s.apply(EncodeSet(1, 1, 0, 0, "a", []byte("1")))
+	s.apply(EncodeSet(1, 2, 0, 0, "b", []byte("2")))
+	s.apply(EncodeSet(1, 3, 0, 0, "a", []byte("3")))
+	s.apply(EncodeSet(1, 4, 0, 0, "empty", nil))
+	s.apply(EncodeSet(1, 5, 0, 0, "bin\x00\x01", []byte("\x00\xff\x02")))
+	wantOK(t, s.apply(EncodeDelete(1, 6, 0, "b")), "")
 
 	want := map[string]string{"a": "3", "empty": "", "bin\x00\x01": "\x00\xff\x02"}
 	for k, v := range want {
@@ -70,23 +70,29 @@ func TestApplyEncodedCommands(t *testing.T) {
 func TestMalformedCommandChangesNothing(t *testing.T) {
 	cmds := map[string][]byte{
 		"empty":                {},
-		"unknown op":           {9, 1, 1, 1, 'k'},
+		"unknown op":           {9, 1, 1, 0, 1, 'k'},
 		"no session":           {opSet},
 		"no seq":               {opSet, 1},
-		"seq zero":             {opSet, 1, 0, 1, 'k'},
-		"truncated key":        {opSet, 1, 1, 5, 'k'},
-		"bad varint":           {opSet, 1, 1, 0xff},
-		"delete with data":     append(EncodeDelete(1, 1, "k"), 'x'),
-		"cas without flag":     {opCas, 1, 1, 1, 'k'},
-		"cas bad flag":         {opCas, 1, 1, 1, 'k', 2, 0},
-		"cas truncated expect": {opCas, 1, 1, 1, 'k', 1, 5, 'v'},
-		"incr without delta":   {opIncr, 1, 1, 1, 'k'},
-		"incr trailing bytes":  append(EncodeIncr(1, 1, "k", 1), 0),
+		"no now":               {opSet, 1, 1},
+		"seq zero":             {opSet, 1, 0, 0, 1, 'k'},
+		"truncated key":        {opSet, 1, 1, 0, 5, 'k'},
+		"bad varint":           {opSet, 1, 1, 0, 0xff},
+		"set without deadline": {opSet, 1, 1, 0, 1, 'k'},
+		"delete with data":     append(EncodeDelete(1, 1, 0, "k"), 'x'),
+		"cas without flag":     {opCas, 1, 1, 0, 1, 'k', 0},
+		"cas bad flag":         {opCas, 1, 1, 0, 1, 'k', 0, 2, 0},
+		"cas truncated expect": {opCas, 1, 1, 0, 1, 'k', 0, 1, 5, 'v'},
+		"incr without delta":   {opIncr, 1, 1, 0, 1, 'k'},
+		"incr trailing bytes":  append(EncodeIncr(1, 1, 0, "k", 1), 0),
+		"expire no deadline":   {opExpire, 1, 1, 0, 1, 'k'},
+		"expire trailing":      append(EncodeExpire(1, 1, 0, "k", 5), 0),
+		"sweep no now":         {opSweep},
+		"sweep trailing":       append(EncodeSweep(5), 0),
 	}
 	for name, cmd := range cmds {
 		t.Run(name, func(t *testing.T) {
 			s := newTestStore(t)
-			s.apply(EncodeSet(7, 1, "k", []byte("v")))
+			s.apply(EncodeSet(7, 1, 0, 0, "k", []byte("v")))
 			before := s.Snapshot()
 			if _, err := s.Apply(2, cmd); err == nil {
 				t.Fatal("want error")
@@ -100,27 +106,27 @@ func TestMalformedCommandChangesNothing(t *testing.T) {
 
 func TestDuplicateWritesApplyOnce(t *testing.T) {
 	s := newTestStore(t)
-	s.apply(EncodeSet(1, 1, "k", []byte("a")))
-	wantOK(t, s.apply(EncodeIncr(1, 2, "n", 1)), "1")
+	s.apply(EncodeSet(1, 1, 0, 0, "k", []byte("a")))
+	wantOK(t, s.apply(EncodeIncr(1, 2, 0, "n", 1)), "1")
 
-	wantOK(t, s.apply(EncodeIncr(1, 2, "n", 1)), "1")
+	wantOK(t, s.apply(EncodeIncr(1, 2, 0, "n", 1)), "1")
 	wantValue(t, s, "n", "1", true)
-	s.apply(EncodeSet(1, 1, "k", []byte("b")))
+	s.apply(EncodeSet(1, 1, 0, 0, "k", []byte("b")))
 	wantValue(t, s, "k", "a", true)
 	if n := s.Duplicates(); n != 2 {
 		t.Fatalf("counted %d duplicates, want 2", n)
 	}
 
-	wantFailed(t, s.apply(EncodeSet(2, 3, "k", []byte("c"))), "session expired")
+	wantFailed(t, s.apply(EncodeSet(2, 3, 0, 0, "k", []byte("c"))), "session expired")
 	wantValue(t, s, "k", "a", true)
 
-	s.apply(EncodeSet(3, 1, "k", []byte("d")))
+	s.apply(EncodeSet(3, 1, 0, 0, "k", []byte("d")))
 	wantValue(t, s, "k", "d", true)
-	wantOK(t, s.apply(EncodeIncr(1, 3, "n", 1)), "2")
+	wantOK(t, s.apply(EncodeIncr(1, 3, 0, "n", 1)), "2")
 
-	wantFailed(t, s.apply(EncodeIncr(1, 4, "k", 1)), "not an integer")
-	s.apply(EncodeSet(3, 2, "k", []byte("5")))
-	wantFailed(t, s.apply(EncodeIncr(1, 4, "k", 1)), "not an integer")
+	wantFailed(t, s.apply(EncodeIncr(1, 4, 0, "k", 1)), "not an integer")
+	s.apply(EncodeSet(3, 2, 0, 0, "k", []byte("5")))
+	wantFailed(t, s.apply(EncodeIncr(1, 4, 0, "k", 1)), "not an integer")
 	wantValue(t, s, "k", "5", true)
 }
 
@@ -148,9 +154,9 @@ func TestIncr(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newTestStore(t)
 			if tt.initial != nil {
-				s.apply(EncodeSet(1, 1, "k", []byte(*tt.initial)))
+				s.apply(EncodeSet(1, 1, 0, 0, "k", []byte(*tt.initial)))
 			}
-			r := s.apply(EncodeIncr(2, 1, "k", tt.delta))
+			r := s.apply(EncodeIncr(2, 1, 0, "k", tt.delta))
 			if tt.fail != "" {
 				wantFailed(t, r, tt.fail)
 				if tt.initial == nil {
@@ -190,9 +196,9 @@ func TestCas(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newTestStore(t)
 			if tt.initial != nil {
-				s.apply(EncodeSet(1, 1, "k", []byte(*tt.initial)))
+				s.apply(EncodeSet(1, 1, 0, 0, "k", []byte(*tt.initial)))
 			}
-			r := s.apply(EncodeCas(2, 1, "k", []byte(tt.expected), tt.expectFound, []byte("new")))
+			r := s.apply(EncodeCas(2, 1, 0, 0, "k", []byte(tt.expected), tt.expectFound, []byte("new")))
 			if !tt.swapped {
 				wantOK(t, r, "\x00")
 				if tt.initial == nil {
@@ -218,7 +224,7 @@ func TestSessionEvictionIsDeterministic(t *testing.T) {
 	for _, s := range stores {
 		s.maxSessions = 20
 		for _, c := range clients {
-			s.apply(EncodeIncr(c, 1, "n", 1))
+			s.apply(EncodeIncr(c, 1, 0, "n", 1))
 		}
 	}
 	if !bytes.Equal(stores[0].Snapshot(), stores[1].Snapshot()) {
@@ -230,17 +236,17 @@ func TestSessionEvictionIsDeterministic(t *testing.T) {
 	}
 	wantValue(t, s, "n", "21", true)
 	for _, c := range clients[:2] {
-		wantFailed(t, s.apply(EncodeIncr(c, 2, "n", 1)), "session expired")
+		wantFailed(t, s.apply(EncodeIncr(c, 2, 0, "n", 1)), "session expired")
 	}
-	wantOK(t, s.apply(EncodeIncr(clients[10], 1, "n", 1)), "11")
+	wantOK(t, s.apply(EncodeIncr(clients[10], 1, 0, "n", 1)), "11")
 	wantValue(t, s, "n", "21", true)
 }
 
 func TestSessionsSurviveSnapshot(t *testing.T) {
 	src := newTestStore(t)
-	src.apply(EncodeIncr(5, 1, "n", 1))
-	src.apply(EncodeIncr(9, 1, "n", 1))
-	src.apply(EncodeIncr(5, 2, "n", 1))
+	src.apply(EncodeIncr(5, 1, 0, "n", 1))
+	src.apply(EncodeIncr(9, 1, 0, "n", 1))
+	src.apply(EncodeIncr(5, 2, 0, "n", 1))
 
 	dst := newTestStore(t)
 	if err := dst.Restore(src.Snapshot()); err != nil {
@@ -250,15 +256,15 @@ func TestSessionsSurviveSnapshot(t *testing.T) {
 		t.Fatal("restored store snapshots to different bytes")
 	}
 	dst.index = src.index
-	wantOK(t, dst.apply(EncodeIncr(5, 2, "n", 1)), "3")
-	wantOK(t, dst.apply(EncodeIncr(9, 1, "n", 1)), "2")
+	wantOK(t, dst.apply(EncodeIncr(5, 2, 0, "n", 1)), "3")
+	wantOK(t, dst.apply(EncodeIncr(9, 1, 0, "n", 1)), "2")
 	wantValue(t, dst, "n", "3", true)
-	wantOK(t, dst.apply(EncodeIncr(9, 2, "n", 1)), "4")
+	wantOK(t, dst.apply(EncodeIncr(9, 2, 0, "n", 1)), "4")
 }
 
 func TestRestoreRejectsUnknownVersion(t *testing.T) {
 	good := New().Snapshot()
-	for _, v := range []byte{0, 2} {
+	for _, v := range []byte{0, 1, 3} {
 		b := append([]byte{v}, good[1:]...)
 		if err := New().Restore(b); err == nil {
 			t.Fatalf("restore of a version %d snapshot: want error", v)

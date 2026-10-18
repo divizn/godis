@@ -9,13 +9,18 @@ import (
 	"strconv"
 )
 
-// command layout: op | uvarint client | uvarint seq | uvarint key length | key | rest
-// set rest: value; delete rest: empty; cas rest: byte expectFound | uvarint expected length | expected | new; incr rest: varint delta
+// command layout: op | uvarint client | uvarint seq | uvarint now | uvarint key length | key | rest
+// now is the proposer's clock in Unix ms, a deadline is absolute in Unix ms with 0 for none
+// set rest: uvarint deadline | value; delete rest: empty; incr rest: varint delta; expire rest: uvarint deadline
+// cas rest: uvarint deadline | byte expectFound | uvarint expected length | expected | new
+// sweep layout: op | uvarint now, with no client
 const (
 	opSet byte = iota + 1
 	opDelete
 	opCas
 	opIncr
+	opExpire
+	opSweep
 )
 
 // result layout: status | body
@@ -24,17 +29,20 @@ const (
 	resultFailed
 )
 
-func EncodeSet(client, seq uint64, key string, value []byte) []byte {
-	return append(header(opSet, client, seq, key, len(value)), value...)
+// EncodeSet sets key to value, replacing any deadline with deadline.
+func EncodeSet(client, seq, now, deadline uint64, key string, value []byte) []byte {
+	b := header(opSet, client, seq, now, key, binary.MaxVarintLen64+len(value))
+	return append(binary.AppendUvarint(b, deadline), value...)
 }
 
-func EncodeDelete(client, seq uint64, key string) []byte {
-	return header(opDelete, client, seq, key, 0)
+func EncodeDelete(client, seq, now uint64, key string) []byte {
+	return header(opDelete, client, seq, now, key, 0)
 }
 
-// EncodeCas swaps in value if key is absent when expectFound is false, or holds exactly expected when it is true.
-func EncodeCas(client, seq uint64, key string, expected []byte, expectFound bool, value []byte) []byte {
-	b := header(opCas, client, seq, key, 1+binary.MaxVarintLen64+len(expected)+len(value))
+// EncodeCas swaps in value and deadline if key is absent when expectFound is false, or holds exactly expected when it is true.
+func EncodeCas(client, seq, now, deadline uint64, key string, expected []byte, expectFound bool, value []byte) []byte {
+	b := header(opCas, client, seq, now, key, 2*binary.MaxVarintLen64+1+len(expected)+len(value))
+	b = binary.AppendUvarint(b, deadline)
 	flag := byte(0)
 	if expectFound {
 		flag = 1
@@ -46,21 +54,33 @@ func EncodeCas(client, seq uint64, key string, expected []byte, expectFound bool
 }
 
 // EncodeIncr adds delta to the base-10 int64 stored at key, a missing key counting as 0.
-func EncodeIncr(client, seq uint64, key string, delta int64) []byte {
-	return binary.AppendVarint(header(opIncr, client, seq, key, binary.MaxVarintLen64), delta)
+func EncodeIncr(client, seq, now uint64, key string, delta int64) []byte {
+	return binary.AppendVarint(header(opIncr, client, seq, now, key, binary.MaxVarintLen64), delta)
 }
 
-func header(op byte, client, seq uint64, key string, rest int) []byte {
-	b := make([]byte, 0, 1+3*binary.MaxVarintLen64+len(key)+rest)
+// EncodeExpire sets the deadline of a live key, or deletes it if deadline is not after the command's time.
+func EncodeExpire(client, seq, now uint64, key string, deadline uint64) []byte {
+	return binary.AppendUvarint(header(opExpire, client, seq, now, key, binary.MaxVarintLen64), deadline)
+}
+
+// EncodeSweep deletes every key whose deadline is at or before now. It has no session, so it is never deduplicated.
+func EncodeSweep(now uint64) []byte {
+	return binary.AppendUvarint([]byte{opSweep}, now)
+}
+
+func header(op byte, client, seq, now uint64, key string, rest int) []byte {
+	b := make([]byte, 0, 1+4*binary.MaxVarintLen64+len(key)+rest)
 	b = append(b, op)
 	b = binary.AppendUvarint(b, client)
 	b = binary.AppendUvarint(b, seq)
+	b = binary.AppendUvarint(b, now)
 	b = binary.AppendUvarint(b, uint64(len(key)))
 	return append(b, key...)
 }
 
 // ParseResult splits a result of Apply into its body, or the error of a command that failed.
-// The body is empty for Set and Delete, 1 or 0 for whether a Cas swapped, and the new value for Incr.
+// The body is empty for Set and Delete, 1 or 0 for whether a Cas swapped or an Expire found a live key, the new value
+// for Incr, and the uvarint count of keys deleted for Sweep.
 func ParseResult(r []byte) ([]byte, error) {
 	if len(r) == 0 {
 		return nil, errors.New("empty result")
@@ -81,6 +101,8 @@ func failedResult(msg string) []byte { return append([]byte{resultFailed}, msg..
 type command struct {
 	op          byte
 	client, seq uint64
+	now         uint64
+	deadline    uint64
 	key         string
 	value       []byte
 	expected    []byte
@@ -116,6 +138,15 @@ func decode(cmd []byte) (command, error) {
 		return f, nil
 	}
 	var err error
+	if c.op == opSweep {
+		if c.now, err = uvarint("now"); err != nil {
+			return c, err
+		}
+		if len(rest) != 0 {
+			return c, fmt.Errorf("sweep carries %d stray bytes", len(rest))
+		}
+		return c, nil
+	}
 	if c.client, err = uvarint("client"); err != nil {
 		return c, err
 	}
@@ -125,6 +156,9 @@ func decode(cmd []byte) (command, error) {
 	if c.seq == 0 {
 		return c, errors.New("seq 0")
 	}
+	if c.now, err = uvarint("now"); err != nil {
+		return c, err
+	}
 	key, err := field("key")
 	if err != nil {
 		return c, err
@@ -133,12 +167,18 @@ func decode(cmd []byte) (command, error) {
 
 	switch c.op {
 	case opSet:
+		if c.deadline, err = uvarint("deadline"); err != nil {
+			return c, err
+		}
 		c.value = rest
 	case opDelete:
 		if len(rest) != 0 {
 			return c, fmt.Errorf("delete of %q carries %d stray bytes", c.key, len(rest))
 		}
 	case opCas:
+		if c.deadline, err = uvarint("deadline"); err != nil {
+			return c, err
+		}
 		if len(rest) == 0 || rest[0] > 1 {
 			return c, errors.New("malformed cas expect flag")
 		}
@@ -153,25 +193,32 @@ func decode(cmd []byte) (command, error) {
 			return c, errors.New("malformed incr delta")
 		}
 		c.delta = d
+	case opExpire:
+		if c.deadline, err = uvarint("deadline"); err != nil {
+			return c, err
+		}
+		if len(rest) != 0 {
+			return c, fmt.Errorf("expire of %q carries %d stray bytes", c.key, len(rest))
+		}
 	default:
 		return c, fmt.Errorf("unknown op %d", c.op)
 	}
 	return c, nil
 }
 
-// exec runs c against the data and returns its result; mu must be held
-func (s *Store) exec(c command) []byte {
-	cur, found := s.data[c.key]
+// exec runs c against the data at time t and returns its result; mu must be held
+func (s *Store) exec(c command, t uint64) []byte {
+	cur, found := s.live(c.key, t)
 	switch c.op {
 	case opSet:
-		s.data[c.key] = bytes.Clone(c.value)
+		s.put(c.key, c.value, c.deadline)
 	case opDelete:
-		delete(s.data, c.key)
+		s.remove(c.key)
 	case opCas:
 		if found != c.expectFound || found && !bytes.Equal(cur, c.expected) {
 			return okResult(0)
 		}
-		s.data[c.key] = bytes.Clone(c.value)
+		s.put(c.key, c.value, c.deadline)
 		return okResult(1)
 	case opIncr:
 		var n int64
@@ -185,8 +232,35 @@ func (s *Store) exec(c command) []byte {
 			return failedResult(fmt.Sprintf("incr of %q would overflow", c.key))
 		}
 		v := strconv.AppendInt(nil, n+c.delta, 10)
-		s.data[c.key] = v
+		var deadline uint64
+		if found {
+			deadline = s.deadlines[c.key]
+		}
+		s.put(c.key, v, deadline)
 		return okResult(v...)
+	case opExpire:
+		switch {
+		case !found:
+			return okResult(0)
+		case c.deadline <= t:
+			s.remove(c.key)
+		default:
+			s.deadlines[c.key] = c.deadline
+		}
+		return okResult(1)
 	}
 	return okResult()
+}
+
+// sweep deletes every key due at t and returns how many; mu must be held
+func (s *Store) sweep(t uint64) []byte {
+	var n uint64
+	for k, d := range s.deadlines {
+		if d <= t {
+			s.remove(k)
+			n++
+		}
+	}
+	s.expired.Add(n)
+	return okResult(binary.AppendUvarint(nil, n)...)
 }
