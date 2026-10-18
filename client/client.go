@@ -116,6 +116,61 @@ func (c *Client) CAS(ctx context.Context, key string, expected []byte, expectFou
 	return body[0] == 1, nil
 }
 
+// SetTTL is Set with a deadline ttl from now, rounded up to a whole millisecond. ttl must be positive and at most
+// about 100 years.
+func (c *Client) SetTTL(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	ms, err := ttlMillis(ttl)
+	if err != nil {
+		return err
+	}
+	if ms == 0 {
+		return errors.New("ttl must be positive")
+	}
+	_, _, err = c.write(ctx, protocol.Request{Op: protocol.OpSet, Key: key, Value: value, TTL: ms})
+	return err
+}
+
+// Expire gives key a deadline ttl from now, rounded up to a whole millisecond, and reports whether key was live.
+// A ttl of 0 or less deletes it.
+func (c *Client) Expire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	ms, err := ttlMillis(max(ttl, 0))
+	if err != nil {
+		return false, err
+	}
+	_, body, err := c.write(ctx, protocol.Request{Op: protocol.OpExpire, Key: key, TTL: ms})
+	if err != nil {
+		return false, err
+	}
+	if len(body) != 1 || body[0] > 1 {
+		return false, fmt.Errorf("malformed expire response %q", body)
+	}
+	return body[0] == 1, nil
+}
+
+// TTL reports the time left before key expires, zero if it has no deadline, and found false if key does not exist.
+func (c *Client) TTL(ctx context.Context, key string) (remaining time.Duration, found bool, err error) {
+	status, body, err := c.do(ctx, protocol.Request{Op: protocol.OpTTL, Key: key})
+	if err != nil || status != protocol.StatusOK {
+		return 0, false, err
+	}
+	ms, n := binary.Uvarint(body)
+	if n != len(body) || ms > protocol.MaxTTL {
+		return 0, false, fmt.Errorf("malformed ttl response %q", body)
+	}
+	return time.Duration(ms) * time.Millisecond, true, nil
+}
+
+// ttlMillis rounds ttl up to whole ms, 0 for a ttl of 0 or less
+func ttlMillis(ttl time.Duration) (int64, error) {
+	switch {
+	case ttl <= 0:
+		return 0, nil
+	case ttl > protocol.MaxTTL*time.Millisecond:
+		return 0, fmt.Errorf("ttl %v is over the maximum of %d ms", ttl, protocol.MaxTTL)
+	}
+	return int64((ttl + time.Millisecond - 1) / time.Millisecond), nil
+}
+
 // Incr adds delta to the base-10 int64 at key, a missing key counting as 0, and returns the new value.
 func (c *Client) Incr(ctx context.Context, key string, delta int64) (int64, error) {
 	_, body, err := c.write(ctx, protocol.Request{Op: protocol.OpIncr, Key: key, Delta: delta})
