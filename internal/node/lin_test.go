@@ -2,6 +2,7 @@ package node
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -32,7 +33,7 @@ func TestLinearizableAcrossRestarts(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range 3 {
 		wg.Go(func() {
-			ops := linClient(c, &clock, i, end)
+			ops := linClient(t, c, &clock, i, end)
 			mu.Lock()
 			history = append(history, ops...)
 			mu.Unlock()
@@ -87,34 +88,53 @@ func TestLinearizableAcrossRestarts(t *testing.T) {
 	}
 }
 
-func linClient(c *testCluster, clock *atomic.Int64, client int, end time.Time) []lincheck.Op {
+// linClient runs operations through one client session, which retries unknown outcomes itself; an op is
+// pending only if the client gave up on it
+func linClient(t *testing.T, c *testCluster, clock *atomic.Int64, client int, end time.Time) []lincheck.Op {
+	var addrs []string
+	for _, p := range c.peers {
+		addrs = append(addrs, p.ClientAddr)
+	}
+	rand.Shuffle(len(addrs), func(i, j int) { addrs[i], addrs[j] = addrs[j], addrs[i] })
+	cl, err := network.Dial(addrs...)
+	if err != nil {
+		t.Errorf("dial: %v", err)
+		return nil
+	}
+	defer cl.Close()
+
 	var ops []lincheck.Op
-	var cl *network.Client
-	defer func() {
-		if cl != nil {
-			cl.Close()
-		}
-	}()
 	for n := 0; time.Now().Before(end); n++ {
 		time.Sleep(rand.N(50 * time.Millisecond))
-		if cl == nil {
-			var err error
-			if cl, err = network.Dial(c.peers[rand.IntN(len(c.peers))].ClientAddr); err != nil {
-				continue
-			}
-		}
 		op := lincheck.Op{Client: client, Key: []string{"x", "y"}[rand.IntN(2)]}
+		value := fmt.Sprintf("c%d-%d", client, n)
 		op.Call = clock.Add(1)
 		var err error
-		switch r := rand.IntN(10); {
-		case r < 4:
-			op.Kind, op.Value = lincheck.Set, fmt.Sprintf("c%d-%d", client, n)
-			err = cl.Set(op.Key, []byte(op.Value))
+		switch r := rand.IntN(20); {
 		case r < 5:
+			op.Kind, op.Value = lincheck.Set, value
+			err = cl.Set(op.Key, []byte(value))
+		case r < 7:
 			op.Kind = lincheck.Del
 			err = cl.Del(op.Key)
+		case r < 10:
+			op.Kind, op.Value = lincheck.Cas, value
+			var v []byte
+			if v, op.ExpectFound, err = cl.Get(op.Key); err != nil {
+				continue
+			}
+			op.Call, op.Expected = clock.Add(1), string(v)
+			op.Found, err = cl.CAS(op.Key, v, op.ExpectFound, []byte(value))
+		case r < 13:
+			op.Kind, op.Key, op.Delta = lincheck.Incr, "n", 1+rand.Int64N(3)
+			var v int64
+			v, err = cl.Incr(op.Key, op.Delta)
+			op.Value = fmt.Sprint(v)
 		default:
 			op.Kind = lincheck.Get
+			if rand.IntN(3) == 0 {
+				op.Key = "n"
+			}
 			var v []byte
 			v, op.Found, err = cl.Get(op.Key)
 			op.Value = string(v)
@@ -123,15 +143,12 @@ func linClient(c *testCluster, clock *atomic.Int64, client int, end time.Time) [
 		case err == nil:
 			op.Return = clock.Add(1)
 		case op.Kind == lincheck.Get:
-		default:
+			continue
+		case errors.Is(err, network.ErrOutcomeUnknown):
 			op.Return = lincheck.Pending
-		}
-		if err != nil {
-			cl.Close()
-			cl = nil
-			if op.Kind == lincheck.Get {
-				continue
-			}
+		default:
+			t.Errorf("%s %s: definite error %v", op.Kind, op.Key, err)
+			continue
 		}
 		ops = append(ops, op)
 	}
