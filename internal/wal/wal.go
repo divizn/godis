@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/divizn/godis/internal/vfs"
 )
 
 // record layout: uint32 payload length | uint32 crc32c of payload | payload, little endian
@@ -22,25 +24,25 @@ const (
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 type Log struct {
-	f *os.File
+	f vfs.File
 }
 
 // Open replays every intact record in path through replay, drops a torn tail
 // left by a crash, and opens the log for appending.
-func Open(path string, replay func(record []byte) error) (*Log, error) {
-	valid, err := replayFile(path, replay)
+func Open(fsys vfs.FS, path string, replay func(record []byte) error) (*Log, error) {
+	valid, err := replayFile(fsys, path, replay)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Truncate(path, valid); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := fsys.Truncate(path, valid); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("truncate wal torn tail: %w", err)
 	}
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := fsys.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open wal: %w", err)
 	}
-	if err := syncDir(filepath.Dir(path)); err != nil {
+	if err := fsys.SyncDir(filepath.Dir(path)); err != nil {
 		return nil, errors.Join(fmt.Errorf("sync wal dir: %w", err), f.Close())
 	}
 	return &Log{f: f}, nil
@@ -63,7 +65,7 @@ func (l *Log) Append(record []byte) error {
 
 // Rewrite atomically replaces the log at path with records and opens it for appending.
 // Close any Log open on path first.
-func Rewrite(path string, records [][]byte) (*Log, error) {
+func Rewrite(fsys vfs.FS, path string, records [][]byte) (*Log, error) {
 	var buf []byte
 	for _, rec := range records {
 		var err error
@@ -72,16 +74,16 @@ func Rewrite(path string, records [][]byte) (*Log, error) {
 		}
 	}
 	tmp := path + ".tmp"
-	if err := writeSync(tmp, buf); err != nil {
+	if err := writeSync(fsys, tmp, buf); err != nil {
 		return nil, fmt.Errorf("write rewritten wal: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := fsys.Rename(tmp, path); err != nil {
 		return nil, fmt.Errorf("rename rewritten wal: %w", err)
 	}
-	if err := syncDir(filepath.Dir(path)); err != nil {
+	if err := fsys.SyncDir(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("sync wal dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	f, err := fsys.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open rewritten wal: %w", err)
 	}
@@ -100,8 +102,8 @@ func frame(buf, record []byte) ([]byte, error) {
 	return append(buf, record...), nil
 }
 
-func writeSync(path string, b []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+func writeSync(fsys vfs.FS, path string, b []byte) error {
+	f, err := fsys.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
@@ -118,8 +120,8 @@ func (l *Log) Close() error {
 	return l.f.Close()
 }
 
-func replayFile(path string, replay func([]byte) error) (int64, error) {
-	f, err := os.Open(path)
+func replayFile(fsys vfs.FS, path string, replay func([]byte) error) (int64, error) {
+	f, err := fsys.OpenFile(path, os.O_RDONLY, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
@@ -165,12 +167,4 @@ func replayRecords(r *bufio.Reader, replay func([]byte) error) (int64, error) {
 		}
 		off += headerSize + int64(n)
 	}
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(d.Sync(), d.Close())
 }

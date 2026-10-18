@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	"github.com/divizn/godis/internal/vfs"
 )
 
 func mustClose(t *testing.T, c io.Closer) {
@@ -19,7 +21,7 @@ func mustClose(t *testing.T, c io.Closer) {
 func open(t *testing.T, path string) (*Log, []string) {
 	t.Helper()
 	var got []string
-	l, err := Open(path, func(rec []byte) error {
+	l, err := Open(vfs.OS, path, func(rec []byte) error {
 		got = append(got, string(rec))
 		return nil
 	})
@@ -112,7 +114,7 @@ func TestChecksumMismatchFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open(path, func([]byte) error { return nil }); err == nil {
+	if _, err := Open(vfs.OS, path, func([]byte) error { return nil }); err == nil {
 		t.Fatal("open on corrupt log: want error")
 	}
 }
@@ -124,7 +126,7 @@ func TestReplayErrorFailsOpen(t *testing.T) {
 	mustClose(t, l)
 
 	errBad := errors.New("bad record")
-	l, err := Open(path, func(rec []byte) error {
+	l, err := Open(vfs.OS, path, func(rec []byte) error {
 		if string(rec) == "b" {
 			return errBad
 		}
@@ -150,7 +152,7 @@ func TestRewriteReplacesContents(t *testing.T) {
 			for _, r := range recs {
 				raw = append(raw, []byte(r))
 			}
-			l, err := Rewrite(path, raw)
+			l, err := Rewrite(vfs.OS, path, raw)
 			if err != nil {
 				t.Fatalf("rewrite: %v", err)
 			}

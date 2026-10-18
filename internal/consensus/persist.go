@@ -10,12 +10,13 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/divizn/godis/internal/vfs"
 	"github.com/divizn/godis/internal/wal"
 )
 
 // state file: uint64 term little endian | votedFor
-func readState(dir string) (term uint64, votedFor string, err error) {
-	b, err := os.ReadFile(filepath.Join(dir, "state"))
+func readState(fsys vfs.FS, dir string) (term uint64, votedFor string, err error) {
+	b, err := fsys.ReadFile(filepath.Join(dir, "state"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, "", nil
 	}
@@ -28,24 +29,24 @@ func readState(dir string) (term uint64, votedFor string, err error) {
 	return binary.LittleEndian.Uint64(b), string(b[8:]), nil
 }
 
-func writeState(dir string, term uint64, votedFor string) error {
+func writeState(fsys vfs.FS, dir string, term uint64, votedFor string) error {
 	b := binary.LittleEndian.AppendUint64(nil, term)
 	b = append(b, votedFor...)
 	tmp := filepath.Join(dir, "state.tmp")
-	if err := writeFileSync(tmp, b); err != nil {
+	if err := writeFileSync(fsys, tmp, b); err != nil {
 		return fmt.Errorf("write raft state: %w", err)
 	}
-	if err := os.Rename(tmp, filepath.Join(dir, "state")); err != nil {
+	if err := fsys.Rename(tmp, filepath.Join(dir, "state")); err != nil {
 		return fmt.Errorf("rename raft state: %w", err)
 	}
-	if err := syncDir(dir); err != nil {
+	if err := fsys.SyncDir(dir); err != nil {
 		return fmt.Errorf("sync raft state dir: %w", err)
 	}
 	return nil
 }
 
-func writeFileSync(path string, b []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+func writeFileSync(fsys vfs.FS, path string, b []byte) error {
+	f, err := fsys.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
@@ -60,29 +61,20 @@ func writeFileSync(path string, b []byte) error {
 	return f.Close()
 }
 
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 // snapshot file: uvarint index | uvarint term | data | uint32 crc32c of everything before it, little endian
-func writeSnapshot(path string, index, term uint64, data []byte) error {
+func writeSnapshot(fsys vfs.FS, path string, index, term uint64, data []byte) error {
 	b := binary.AppendUvarint(nil, index)
 	b = binary.AppendUvarint(b, term)
 	b = append(b, data...)
 	b = binary.LittleEndian.AppendUint32(b, crc32.Checksum(b, crcTable))
-	return writeFileSync(path, b)
+	return writeFileSync(fsys, path, b)
 }
 
 // readSnapshot returns index 0 when dir holds no snapshot
-func readSnapshot(dir string) (index, term uint64, data []byte, err error) {
-	b, err := os.ReadFile(filepath.Join(dir, "snapshot"))
+func readSnapshot(fsys vfs.FS, dir string) (index, term uint64, data []byte, err error) {
+	b, err := fsys.ReadFile(filepath.Join(dir, "snapshot"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, 0, nil, nil
 	}
@@ -106,11 +98,11 @@ func readSnapshot(dir string) (index, term uint64, data []byte, err error) {
 }
 
 // renameSnapshot durably makes the snapshot written to tmp dir's snapshot
-func renameSnapshot(dir, tmp string) error {
-	if err := os.Rename(tmp, filepath.Join(dir, "snapshot")); err != nil {
+func renameSnapshot(fsys vfs.FS, dir, tmp string) error {
+	if err := fsys.Rename(tmp, filepath.Join(dir, "snapshot")); err != nil {
 		return fmt.Errorf("rename raft snapshot: %w", err)
 	}
-	if err := syncDir(dir); err != nil {
+	if err := fsys.SyncDir(dir); err != nil {
 		return fmt.Errorf("sync raft snapshot dir: %w", err)
 	}
 	return nil

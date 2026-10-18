@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
+	"github.com/divizn/godis/internal/vfs"
 	"github.com/divizn/godis/internal/wal"
 )
 
@@ -125,8 +125,10 @@ type Transport interface {
 type Config struct {
 	ID string
 	// Peers lists every member, including ID.
-	Peers     []string
-	Dir       string
+	Peers []string
+	Dir   string
+	// FS is the filesystem under Dir, default vfs.OS.
+	FS        vfs.FS
 	Transport Transport
 	// Apply gets committed commands in order, once per process lifetime: after a restart, every command after the snapshot again.
 	// Its result is opaque to Raft: Propose returns it on the leader, followers drop it.
@@ -160,6 +162,7 @@ type Node struct {
 	id             string
 	peers          []string
 	dir            string
+	fs             vfs.FS
 	tr             Transport
 	apply          func(uint64, []byte) []byte
 	snapshot       func() []byte
@@ -223,17 +226,20 @@ func New(cfg Config) (*Node, error) {
 	if (cfg.Snapshot == nil) != (cfg.Restore == nil) {
 		return nil, errors.New("consensus: Snapshot and Restore must be set together")
 	}
+	if cfg.FS == nil {
+		cfg.FS = vfs.OS
+	}
 	if cfg.SnapshotEntries == 0 {
 		cfg.SnapshotEntries = 10000
 	}
-	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
+	if err := cfg.FS.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create raft dir: %w", err)
 	}
-	term, vote, err := readState(cfg.Dir)
+	term, vote, err := readState(cfg.FS, cfg.Dir)
 	if err != nil {
 		return nil, err
 	}
-	snapIndex, snapTerm, data, err := readSnapshot(cfg.Dir)
+	snapIndex, snapTerm, data, err := readSnapshot(cfg.FS, cfg.Dir)
 	if err != nil {
 		return nil, err
 	}
@@ -250,6 +256,7 @@ func New(cfg Config) (*Node, error) {
 		id:             cfg.ID,
 		peers:          slices.DeleteFunc(slices.Clone(cfg.Peers), func(p string) bool { return p == cfg.ID }),
 		dir:            cfg.Dir,
+		fs:             cfg.FS,
 		tr:             cfg.Transport,
 		apply:          cfg.Apply,
 		snapshot:       cfg.Snapshot,
@@ -268,7 +275,7 @@ func New(cfg Config) (*Node, error) {
 		waiters:        map[uint64]chan outcome{},
 		applied:        make(chan struct{}),
 	}
-	n.wal, err = wal.Open(filepath.Join(cfg.Dir, "log"), n.replay)
+	n.wal, err = wal.Open(cfg.FS, filepath.Join(cfg.Dir, "log"), n.replay)
 	if err != nil {
 		return nil, fmt.Errorf("open raft log: %w", err)
 	}
@@ -498,7 +505,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) (InstallSnapshotR
 		return reply, nil
 	}
 	tmp := filepath.Join(n.dir, "snapshot.recv.tmp")
-	if err := writeSnapshot(tmp, args.LastIndex, args.LastTerm, args.Data); err != nil {
+	if err := writeSnapshot(n.fs, tmp, args.LastIndex, args.LastTerm, args.Data); err != nil {
 		err = fmt.Errorf("write received raft snapshot: %w", err)
 		n.halt(err)
 		return InstallSnapshotReply{}, err
@@ -522,7 +529,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) (InstallSnapshotR
 
 // compact durably makes the snapshot written to tmp this node's, keeping the log after it only if the log holds its last entry; mu must be held
 func (n *Node) compact(tmp string, index, term uint64) error {
-	if err := renameSnapshot(n.dir, tmp); err != nil {
+	if err := renameSnapshot(n.fs, n.dir, tmp); err != nil {
 		n.halt(err)
 		return err
 	}
@@ -536,7 +543,7 @@ func (n *Node) compact(tmp string, index, term uint64) error {
 	err := n.wal.Close()
 	n.wal = nil
 	if err == nil {
-		n.wal, err = wal.Rewrite(filepath.Join(n.dir, "log"), logRecords(n.snapIndex+1, n.log[1:]))
+		n.wal, err = wal.Rewrite(n.fs, filepath.Join(n.dir, "log"), logRecords(n.snapIndex+1, n.log[1:]))
 	}
 	if err != nil {
 		err = fmt.Errorf("rewrite raft log: %w", err)
@@ -570,7 +577,7 @@ func (n *Node) setTermVote(term uint64, vote string) error {
 	if term == n.term && vote == n.votedFor {
 		return nil
 	}
-	if err := writeState(n.dir, term, vote); err != nil {
+	if err := writeState(n.fs, n.dir, term, vote); err != nil {
 		n.halt(err)
 		return err
 	}
@@ -807,7 +814,7 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 
 // sendSnapshot sends the snapshot on disk to a peer whose next entry it covers, as leader of term
 func (n *Node) sendSnapshot(peer string, term uint64, dir string) {
-	index, lastTerm, data, err := readSnapshot(dir)
+	index, lastTerm, data, err := readSnapshot(n.fs, dir)
 	if err != nil {
 		n.mu.Lock()
 		n.halt(fmt.Errorf("read raft snapshot to send: %w", err))
@@ -1002,7 +1009,7 @@ func (n *Node) takeSnapshot() {
 	index, term := n.lastApplied, n.termAt(n.lastApplied)
 	tmp := filepath.Join(n.dir, "snapshot.tmp")
 	n.mu.Unlock()
-	err := writeSnapshot(tmp, index, term, n.snapshot())
+	err := writeSnapshot(n.fs, tmp, index, term, n.snapshot())
 	n.mu.Lock()
 	if err != nil {
 		n.halt(fmt.Errorf("write raft snapshot: %w", err))

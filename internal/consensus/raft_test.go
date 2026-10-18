@@ -15,6 +15,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/divizn/godis/internal/vfs"
 	"github.com/divizn/godis/internal/wal"
 )
 
@@ -909,7 +910,7 @@ func TestFailedVotePersistIsNotGranted(t *testing.T) {
 
 func TestLogWithGapFailsNew(t *testing.T) {
 	dir := t.TempDir()
-	l, err := wal.Open(filepath.Join(dir, "log"), func([]byte) error { return nil })
+	l, err := wal.Open(vfs.OS, filepath.Join(dir, "log"), func([]byte) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

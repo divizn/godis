@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/divizn/godis/internal/storage"
+	"github.com/divizn/godis/internal/vfs"
 	"github.com/divizn/godis/internal/wal"
 )
 
@@ -66,7 +67,7 @@ func install(t *testing.T, n *Node, args InstallSnapshotArgs) InstallSnapshotRep
 func walIndexes(t *testing.T, path string) []uint64 {
 	t.Helper()
 	var idx []uint64
-	l, err := wal.Open(path, func(rec []byte) error {
+	l, err := wal.Open(vfs.OS, path, func(rec []byte) error {
 		start, es, err := decodeBatch(rec)
 		for i := range es {
 			idx = append(idx, start+uint64(i))
@@ -114,7 +115,7 @@ func TestSnapshotCompactsLogAndRestartSkipsIt(t *testing.T) {
 		c.stop(leader)
 
 		dir := filepath.Join(c.root, leader)
-		if idx, _, _, err := readSnapshot(dir); err != nil || idx != 6 {
+		if idx, _, _, err := readSnapshot(vfs.OS, dir); err != nil || idx != 6 {
 			t.Fatalf("snapshot file: index %d, %v; want 6", idx, err)
 		}
 		if got := walIndexes(t, filepath.Join(dir, "log")); !slices.Equal(got, []uint64{7}) {
@@ -145,13 +146,13 @@ func TestCrashBetweenSnapshotAndLogRewrite(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeState(dir, 1, "n1"); err != nil {
+		if err := writeState(vfs.OS, dir, 1, "n1"); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeSnapshot(filepath.Join(dir, "snapshot"), 3, 1, snapshotOf(applied{2, "a"}, applied{3, "b"})); err != nil {
+		if err := writeSnapshot(vfs.OS, filepath.Join(dir, "snapshot"), 3, 1, snapshotOf(applied{2, "a"}, applied{3, "b"})); err != nil {
 			t.Fatal(err)
 		}
-		l, err := wal.Open(filepath.Join(dir, "log"), func([]byte) error { return nil })
+		l, err := wal.Open(vfs.OS, filepath.Join(dir, "log"), func([]byte) error { return nil })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -185,7 +186,7 @@ func TestCorruptSnapshotFailsNew(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "snapshot")
-			if err := writeSnapshot(path, 3, 1, snapshotOf(applied{2, "a"})); err != nil {
+			if err := writeSnapshot(vfs.OS, path, 3, 1, snapshotOf(applied{2, "a"})); err != nil {
 				t.Fatal(err)
 			}
 			b, err := os.ReadFile(path)
@@ -298,7 +299,7 @@ func TestInstallSnapshotTailRule(t *testing.T) {
 				n := snapNode(t, dir, al)
 				appendEntries(t, n, AppendEntriesArgs{Term: 1, Leader: "b", Entries: entries(1, "x", "y", "z")})
 				install(t, n, InstallSnapshotArgs{Term: 2, Leader: "c", LastIndex: 2, LastTerm: tc.lastTerm, Data: snapshotOf(applied{1, "x"}, applied{2, "y"})})
-				if idx, _, _, err := readSnapshot(dir); err != nil || idx != 2 {
+				if idx, _, _, err := readSnapshot(vfs.OS, dir); err != nil || idx != 2 {
 					t.Fatalf("snapshot on disk once the install was answered: index %d, %v; want 2", idx, err)
 				}
 				probe := func(n *Node) {
@@ -363,10 +364,10 @@ func (behindPeer) InstallSnapshot(context.Context, string, InstallSnapshotArgs) 
 func TestHigherTermInstallReplyStepsLeaderDown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		dir := t.TempDir()
-		if err := writeState(dir, 1, ""); err != nil {
+		if err := writeState(vfs.OS, dir, 1, ""); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeSnapshot(filepath.Join(dir, "snapshot"), 5, 1, snapshotOf(appliedN(5)...)); err != nil {
+		if err := writeSnapshot(vfs.OS, filepath.Join(dir, "snapshot"), 5, 1, snapshotOf(appliedN(5)...)); err != nil {
 			t.Fatal(err)
 		}
 		cfg := snapConfig(dir, &applyLog{})
@@ -397,7 +398,7 @@ func TestOlderInstallSnapshotDoesNotRollBack(t *testing.T) {
 		if s := n.Status(); s.CommitIndex != 5 || s.SnapshotIndex != 5 {
 			t.Fatalf("commit index %d, snapshot index %d after an older install; want 5, 5", s.CommitIndex, s.SnapshotIndex)
 		}
-		if idx, _, _, err := readSnapshot(dir); err != nil || idx != 5 {
+		if idx, _, _, err := readSnapshot(vfs.OS, dir); err != nil || idx != 5 {
 			t.Fatalf("snapshot file index %d, %v; want 5", idx, err)
 		}
 	})
