@@ -93,8 +93,11 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 
 func TestRestoreRejectsBadSnapshot(t *testing.T) {
 	src := New()
-	src.Set("key", []byte("value"))
-	src.Set("other", []byte("v2"))
+	for i, k := range []string{"key", "other"} {
+		if _, err := src.Apply(uint64(i+1), EncodeSet(uint64(i+1), 1, k, []byte("v"))); err != nil {
+			t.Fatal(err)
+		}
+	}
 	good := src.Snapshot()
 	bad := map[string][]byte{
 		"empty":         {},

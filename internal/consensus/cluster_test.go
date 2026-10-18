@@ -297,10 +297,10 @@ func (a *applyLog) apply(index uint64, cmd []byte) []byte {
 	}
 	result := append([]byte("applied "), cmd...)
 	if a.store != nil {
-		if err := a.store.Apply(cmd); err != nil {
+		var err error
+		if result, err = a.store.Apply(index, cmd); err != nil {
 			panic(fmt.Sprintf("apply %d: %v", index, err))
 		}
-		result = nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()

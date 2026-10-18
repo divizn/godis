@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/rpc"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -95,10 +96,11 @@ func start(cfg Config) (*Node, error) {
 		ElectionTimeout:   election,
 		HeartbeatInterval: election / 10,
 		Apply: func(index uint64, cmd []byte) []byte {
-			if err := store.Apply(cmd); err != nil {
+			result, err := store.Apply(index, cmd)
+			if err != nil {
 				panic(fmt.Sprintf("apply committed command %d: %v", index, err))
 			}
-			return nil
+			return result
 		},
 		Snapshot:        store.Snapshot,
 		Restore:         store.Restore,
@@ -198,14 +200,14 @@ func (s kvStore) Get(key string) ([]byte, bool, error) {
 
 func (s kvStore) Set(key string, value []byte) error {
 	start := time.Now()
-	err := s.propose(storage.EncodeSet(key, value))
+	err := s.propose(storage.EncodeSet(rand.Uint64(), 1, key, value))
 	s.metrics.observe("set", start, true, err)
 	return err
 }
 
 func (s kvStore) Delete(key string) error {
 	start := time.Now()
-	err := s.propose(storage.EncodeDelete(key))
+	err := s.propose(storage.EncodeDelete(rand.Uint64(), 1, key))
 	s.metrics.observe("del", start, true, err)
 	return err
 }

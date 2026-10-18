@@ -54,6 +54,7 @@ type linRecorder struct {
 	clock   atomic.Int64
 	mu      sync.Mutex
 	history []lincheck.Op
+	sets    []string
 }
 
 func (r *linRecorder) record(op lincheck.Op) {
@@ -93,7 +94,7 @@ func linRun(t *testing.T, seed uint64) {
 			c.start(id)
 		}
 	}
-	marker := storage.EncodeSet("end", nil)
+	marker := storage.EncodeSet(0, 1, "end", nil)
 	waitFor(t, 30*time.Second, "the end marker to commit", func() bool {
 		leader, _ := c.waitLeader()
 		return c.propose(leader, string(marker), time.Second) == nil
@@ -101,10 +102,8 @@ func linRun(t *testing.T, seed uint64) {
 	c.waitApplied(string(marker))
 	// a client retries only a write that never ran, and values are unique, so each set applies at most once
 	sets := map[string]bool{}
-	for _, op := range rec.history {
-		if op.Kind == lincheck.Set {
-			sets[string(storage.EncodeSet(op.Key, []byte(op.Value)))] = true
-		}
+	for _, cmd := range rec.sets {
+		sets[cmd] = true
 	}
 	applied := map[string]bool{}
 	for _, e := range c.checkSame() {
@@ -149,6 +148,7 @@ func (c *cluster) nodeStore(id string) (*Node, *storage.Store) {
 // linClient runs operations until end, retrying an operation only on NotLeaderError, which means it never ran
 func linClient(c *cluster, rec *linRecorder, rng *rand.Rand, client int, end time.Time, think time.Duration) {
 	target := c.ids[rng.IntN(len(c.ids))]
+	var seq uint64
 	for n := 0; ; n++ {
 		time.Sleep(time.Duration(rng.Int64N(int64(2 * think))))
 		if time.Now().After(end) {
@@ -158,11 +158,16 @@ func linClient(c *cluster, rec *linRecorder, rng *rand.Rand, client int, end tim
 		var cmd []byte
 		switch r := rng.IntN(10); {
 		case r < 4:
+			seq++
 			op.Kind, op.Value = lincheck.Set, fmt.Sprintf("c%d-%d", client, n)
-			cmd = storage.EncodeSet(op.Key, []byte(op.Value))
+			cmd = storage.EncodeSet(uint64(client+1), seq, op.Key, []byte(op.Value))
+			rec.mu.Lock()
+			rec.sets = append(rec.sets, string(cmd))
+			rec.mu.Unlock()
 		case r < 5:
+			seq++
 			op.Kind = lincheck.Del
-			cmd = storage.EncodeDelete(op.Key)
+			cmd = storage.EncodeDelete(uint64(client+1), seq, op.Key)
 		default:
 			op.Kind = lincheck.Get
 		}
