@@ -111,7 +111,7 @@ func TestMetrics(t *testing.T) {
 	}
 	defer cl.Close()
 	// the client retries the get for 10s, so watch the metric rather than wait for it
-	go cl.Get("a")
+	go func() { _, _, _ = cl.Get("a") }()
 	waitFor(t, "a get without a quorum to count as unknown", func() error {
 		if got := metric(t, lr, "godis_requests_total", "op", "get", "result", "unknown"); got < 1 {
 			return fmt.Errorf("counted %v", got)
