@@ -807,3 +807,57 @@ func TestWriteAfterAnAbandonedFirstWriteSucceeds(t *testing.T) {
 		t.Fatalf("third write: %v", err)
 	}
 }
+
+func TestClientIsSafeForConcurrentUse(t *testing.T) {
+	addr, _ := serve(t, newMemStore())
+	c := dial(t, addr)
+	const goroutines, incrs = 16, 50
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Go(func() {
+			for range incrs {
+				if _, err := c.Incr(t.Context(), "n", 1); err != nil {
+					t.Errorf("incr: %v", err)
+					return
+				}
+				if _, _, err := c.Get(t.Context(), "n"); err != nil {
+					t.Errorf("get: %v", err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if v, _ := mustGet(t, c, "n"); string(v) != strconv.Itoa(goroutines*incrs) {
+		t.Fatalf("n = %s after %d concurrent incrs", v, goroutines*incrs)
+	}
+}
+
+// countingListener counts the connections it accepts
+type countingListener struct {
+	net.Listener
+	n atomic.Int64
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.n.Add(1)
+	}
+	return conn, err
+}
+
+func TestSequentialCallsReuseOneConnection(t *testing.T) {
+	ln := &countingListener{Listener: listen(t)}
+	serveOn(t, ln, newMemStore())
+	c := dial(t, ln.Addr().String())
+	for i := range 20 {
+		if err := c.Set(t.Context(), "k", []byte(strconv.Itoa(i))); err != nil {
+			t.Fatal(err)
+		}
+		mustGet(t, c, "k")
+	}
+	if n := ln.n.Load(); n != 1 {
+		t.Fatalf("server accepted %d connections for 40 sequential calls, want 1", n)
+	}
+}
