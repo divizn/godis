@@ -88,6 +88,7 @@ func TestMetrics(t *testing.T) {
 		{fr, "godis_raft_leader", nil, 0},
 		{lr, "godis_raft_term", nil, float64(c.nodes[leader].Status().Term)},
 		{lr, "godis_raft_commit_index", nil, float64(c.nodes[leader].Status().CommitIndex)},
+		{lr, "godis_duplicate_writes_total", nil, 0},
 	} {
 		if got := metric(t, m.reg, m.name, m.labels...); got != m.want {
 			t.Errorf("%s%v = %v, want %v", m.name, m.labels, got, m.want)
@@ -104,10 +105,17 @@ func TestMetrics(t *testing.T) {
 			c.stop(p.ID)
 		}
 	}
-	if err := c.via(leader, func(cl *network.Client) error { _, _, err := cl.Get("a"); return err }); err == nil {
-		t.Fatal("get without a quorum succeeded")
+	cl, err := network.Dial(c.peer(leader).ClientAddr)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := metric(t, lr, "godis_requests_total", "op", "get", "result", "error"); got != 1 {
-		t.Errorf("failed get counted %v times as an error, want 1", got)
-	}
+	defer cl.Close()
+	// the client retries the get for 10s, so watch the metric rather than wait for it
+	go cl.Get("a")
+	waitFor(t, "a get without a quorum to count as unknown", func() error {
+		if got := metric(t, lr, "godis_requests_total", "op", "get", "result", "unknown"); got < 1 {
+			return fmt.Errorf("counted %v", got)
+		}
+		return nil
+	})
 }

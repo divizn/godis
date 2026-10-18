@@ -6,6 +6,7 @@ import (
 
 	"github.com/divizn/godis/internal/consensus"
 	"github.com/divizn/godis/internal/network"
+	"github.com/divizn/godis/internal/storage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -53,12 +54,21 @@ func registerRaftGauges(reg prometheus.Registerer, raft *consensus.Node) {
 		})
 }
 
+func registerStoreCounters(reg prometheus.Registerer, store *storage.Store) {
+	promauto.With(reg).NewCounterFunc(prometheus.CounterOpts{
+		Name: "godis_duplicate_writes_total",
+		Help: "Retried writes this node's state machine dropped as already applied, since it started.",
+	}, func() float64 { return float64(store.Duplicates()) })
+}
+
 func (m *metrics) observe(op string, start time.Time, found bool, err error) {
 	var re *network.RedirectError
 	result := "ok"
 	switch {
 	case errors.As(err, &re):
 		result = "redirect"
+	case errors.Is(err, network.ErrOutcomeUnknown):
+		result = "unknown"
 	case err != nil:
 		result = "error"
 	case !found:

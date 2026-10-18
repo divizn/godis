@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/rpc"
-	"math/rand/v2"
+	"strconv"
 	"sync"
 	"time"
 
@@ -111,6 +111,7 @@ func start(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("start raft: %w", err)
 	}
 	registerRaftGauges(cfg.Metrics, raft)
+	registerStoreCounters(cfg.Metrics, store)
 	srv := rpc.NewServer()
 	if err := srv.RegisterName("Raft", raftService{raft}); err != nil {
 		return nil, errors.Join(fmt.Errorf("register raft rpc: %w", err), raft.Stop())
@@ -198,43 +199,74 @@ func (s kvStore) Get(key string) ([]byte, bool, error) {
 	return v, ok, err
 }
 
-func (s kvStore) Set(key string, value []byte) error {
+func (s kvStore) Set(client, seq uint64, key string, value []byte) error {
 	start := time.Now()
-	err := s.propose(storage.EncodeSet(rand.Uint64(), 1, key, value))
+	_, err := s.write(storage.EncodeSet(client, seq, key, value))
 	s.metrics.observe("set", start, true, err)
 	return err
 }
 
-func (s kvStore) Delete(key string) error {
+func (s kvStore) Delete(client, seq uint64, key string) error {
 	start := time.Now()
-	err := s.propose(storage.EncodeDelete(rand.Uint64(), 1, key))
+	_, err := s.write(storage.EncodeDelete(client, seq, key))
 	s.metrics.observe("del", start, true, err)
 	return err
+}
+
+func (s kvStore) Cas(client, seq uint64, key string, expected []byte, expectFound bool, value []byte) (bool, error) {
+	start := time.Now()
+	body, err := s.write(storage.EncodeCas(client, seq, key, expected, expectFound, value))
+	s.metrics.observe("cas", start, true, err)
+	if err != nil {
+		return false, err
+	}
+	return len(body) == 1 && body[0] == 1, nil
+}
+
+func (s kvStore) Incr(client, seq uint64, key string, delta int64) (int64, error) {
+	start := time.Now()
+	body, err := s.write(storage.EncodeIncr(client, seq, key, delta))
+	s.metrics.observe("incr", start, true, err)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(string(body), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("incr result %q: %w", body, err)
+	}
+	return n, nil
 }
 
 func (s kvStore) get(key string) ([]byte, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 	if err := s.raft.ReadIndex(ctx); err != nil {
-		return nil, false, s.redirect(fmt.Errorf("read index: %w", err))
+		return nil, false, s.classify(fmt.Errorf("read index: %w", err))
 	}
 	v, ok := s.store.Get(key)
 	return v, ok, nil
 }
 
-func (s kvStore) propose(cmd []byte) error {
+// write proposes cmd and returns the body of its result, or the error of a command that failed
+func (s kvStore) write(cmd []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	if _, err := s.raft.Propose(ctx, cmd); err != nil {
-		return s.redirect(fmt.Errorf("propose: %w", err))
+	r, err := s.raft.Propose(ctx, cmd)
+	if err != nil {
+		return nil, s.classify(fmt.Errorf("propose: %w", err))
 	}
-	return nil
+	return storage.ParseResult(r)
 }
 
-func (s kvStore) redirect(err error) error {
+// classify tells the client what a Raft error means: a redirect never ran, a command Raft refused to log is
+// definite, and anything else, a lost leadership or a timeout above all, may still apply and is retried with the same seq
+func (s kvStore) classify(err error) error {
 	var nle *consensus.NotLeaderError
-	if errors.As(err, &nle) {
+	switch {
+	case errors.As(err, &nle):
 		return &network.RedirectError{Addr: s.clientAddrs[nle.Leader]}
+	case errors.Is(err, consensus.ErrCommandTooLarge), errors.Is(err, consensus.ErrEmptyCommand):
+		return err
 	}
-	return err
+	return fmt.Errorf("%w: %w", network.ErrOutcomeUnknown, err)
 }

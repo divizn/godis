@@ -17,10 +17,10 @@ import (
 
 func main() {
 	log.SetFlags(0)
-	addr := flag.String("addr", "localhost:8080", "server address")
+	addr := flag.String("addr", "localhost:8080", "server addresses, comma separated")
 	flag.Parse()
 
-	c, err := network.Dial(*addr)
+	c, err := network.Dial(strings.Split(*addr, ",")...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -72,7 +72,11 @@ func repl(c *network.Client, in io.Reader, out io.Writer, prompt string) error {
 	return nil
 }
 
-var arity = map[string]int{"PING": 1, "GET": 2, "SET": 3, "DEL": 2}
+// arity is the least and most arguments of each command, its name included
+var arity = map[string][2]int{"PING": {1, 1}, "GET": {2, 2}, "SET": {3, 3}, "DEL": {2, 2}, "CAS": {4, 4}, "INCR": {2, 3}}
+
+// absent as CAS's expected value means "only if the key does not exist"
+const absent = "-"
 
 func run(c *network.Client, args []string) (string, error) {
 	cmd := strings.ToUpper(args[0])
@@ -80,7 +84,7 @@ func run(c *network.Client, args []string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("unknown command %q", args[0])
 	}
-	if len(args) != n {
+	if len(args) < n[0] || len(args) > n[1] {
 		return "", fmt.Errorf("wrong number of arguments for '%s'", strings.ToLower(cmd))
 	}
 
@@ -103,6 +107,25 @@ func run(c *network.Client, args []string) (string, error) {
 		err = c.Set(args[1], []byte(args[2]))
 	case "DEL":
 		err = c.Del(args[1])
+	case "CAS":
+		var swapped bool
+		if swapped, err = c.CAS(args[1], []byte(args[2]), args[2] != absent, []byte(args[3])); err == nil {
+			if swapped {
+				return "(integer) 1", nil
+			}
+			return "(integer) 0", nil
+		}
+	case "INCR":
+		delta := int64(1)
+		if len(args) == 3 {
+			if delta, err = strconv.ParseInt(args[2], 10, 64); err != nil {
+				return "", fmt.Errorf("delta %q is not an integer", args[2])
+			}
+		}
+		var v int64
+		if v, err = c.Incr(args[1], delta); err == nil {
+			return fmt.Sprint("(integer) ", v), nil
+		}
 	}
 	if err != nil {
 		return "", err

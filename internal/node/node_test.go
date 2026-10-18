@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -343,13 +344,82 @@ func TestMaxSizeValuesCommitWithoutElection(t *testing.T) {
 	}
 }
 
-func TestOnlyUnloggedWritesAreRedirected(t *testing.T) {
+func TestRaftErrorsTellTheClientWhatToRetry(t *testing.T) {
 	s := kvStore{clientAddrs: map[string]string{"node-2": "addr-2"}}
 	var re *network.RedirectError
-	if err := s.redirect(fmt.Errorf("propose: %w", &consensus.NotLeaderError{Leader: "node-2"})); !errors.As(err, &re) || re.Addr != "addr-2" {
+	if err := s.classify(fmt.Errorf("propose: %w", &consensus.NotLeaderError{Leader: "node-2"})); !errors.As(err, &re) || re.Addr != "addr-2" {
 		t.Fatalf("not the leader: got %v, want a redirect to addr-2", err)
 	}
-	if err := s.redirect(fmt.Errorf("propose: %w", consensus.ErrLeadershipLost)); errors.As(err, &re) || !errors.Is(err, consensus.ErrLeadershipLost) {
-		t.Fatalf("leadership lost with the write logged: got %v, want an error the client does not retry", err)
+	for _, cause := range []error{consensus.ErrLeadershipLost, context.DeadlineExceeded} {
+		if err := s.classify(fmt.Errorf("propose: %w", cause)); errors.As(err, &re) || !errors.Is(err, network.ErrOutcomeUnknown) || !errors.Is(err, cause) {
+			t.Fatalf("%v with the write logged: got %v, want an unknown outcome the client retries", cause, err)
+		}
+	}
+	if err := s.classify(fmt.Errorf("propose: %w", consensus.ErrCommandTooLarge)); errors.Is(err, network.ErrOutcomeUnknown) || errors.As(err, &re) {
+		t.Fatalf("command too large: got %v, want a definite error", err)
+	}
+}
+
+func TestWriteRetriedAcrossALeaderKillAppliesOnce(t *testing.T) {
+	// the production timeout keeps the write logged on the leader for a whole second before it steps down
+	c := newTestClusterWithElection(t, 3, 0)
+	leader := c.leader()
+	var followers []string
+	addrs := []string{c.peer(leader).ClientAddr}
+	for _, p := range c.peers {
+		if p.ID != leader {
+			followers = append(followers, p.ID)
+			addrs = append(addrs, p.ClientAddr)
+		}
+	}
+	cl, err := network.Dial(addrs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	if _, err := cl.Incr("other", 1); err != nil {
+		t.Fatalf("warm up incr: %v", err)
+	}
+
+	for _, f := range followers {
+		c.stop(f)
+	}
+	type result struct {
+		n   int64
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := cl.Incr("n", 1)
+		done <- result{n, err}
+	}()
+	waitFor(t, leader+" to step down without a quorum", func() error {
+		if c.nodes[leader].Status().Role == consensus.Leader {
+			return errors.New("still leading")
+		}
+		return nil
+	})
+	c.stop(leader)
+	c.start(leader)
+	c.start(followers[0])
+
+	r := <-done
+	if r.err != nil || r.n != 1 {
+		t.Fatalf("incr retried across a leader kill: got %d, %v; want 1", r.n, r.err)
+	}
+	if v, ok, err := cl.Get("n"); err != nil || !ok || string(v) != "1" {
+		t.Fatalf("get n: got %q, %v, %v; want 1", v, ok, err)
+	}
+	if d := c.nodes[c.leader()].store.Duplicates(); d == 0 {
+		t.Fatal("the leader dropped no duplicate: the first attempt never committed, so the retry was not deduplicated")
+	}
+	if _, err := cl.Incr("other", 1); err != nil {
+		t.Fatalf("incr after the retry: %v", err)
+	}
+	if err := cl.Set("s", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cl.Incr("s", 1); err == nil || errors.Is(err, network.ErrOutcomeUnknown) {
+		t.Fatalf("incr of a non-integer: got %v, want a definite error", err)
 	}
 }

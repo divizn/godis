@@ -11,6 +11,8 @@ import (
 	"math"
 	"net"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,24 +22,62 @@ import (
 	"github.com/divizn/godis/internal/storage"
 )
 
-type memStore struct{ s *storage.Store }
+// memStore applies writes to a storage.Store as a one-node log would, so retried writes are deduplicated
+type memStore struct {
+	s     *storage.Store
+	mu    sync.Mutex
+	index uint64
+}
 
-func newMemStore() memStore { return memStore{storage.New()} }
+func newMemStore() *memStore { return &memStore{s: storage.New()} }
 
-func (m memStore) Get(key string) ([]byte, bool, error) {
+func (m *memStore) Get(key string) ([]byte, bool, error) {
 	v, ok := m.s.Get(key)
 	return v, ok, nil
 }
 
-func (m memStore) Set(key string, value []byte) error {
-	m.s.Set(key, value)
-	return nil
+func (m *memStore) apply(cmd []byte) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.index++
+	r, err := m.s.Apply(m.index, cmd)
+	if err != nil {
+		return nil, err
+	}
+	return storage.ParseResult(r)
 }
 
-func (m memStore) Delete(key string) error {
-	m.s.Delete(key)
-	return nil
+func (m *memStore) Set(client, seq uint64, key string, value []byte) error {
+	_, err := m.apply(storage.EncodeSet(client, seq, key, value))
+	return err
 }
+
+func (m *memStore) Delete(client, seq uint64, key string) error {
+	_, err := m.apply(storage.EncodeDelete(client, seq, key))
+	return err
+}
+
+func (m *memStore) Cas(client, seq uint64, key string, expected []byte, expectFound bool, value []byte) (bool, error) {
+	r, err := m.apply(storage.EncodeCas(client, seq, key, expected, expectFound, value))
+	return len(r) == 1 && r[0] == 1, err
+}
+
+func (m *memStore) Incr(client, seq uint64, key string, delta int64) (int64, error) {
+	r, err := m.apply(storage.EncodeIncr(client, seq, key, delta))
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(string(r), 10, 64)
+}
+
+// nopWrites gives a fake store the write methods it does not exercise
+type nopWrites struct{}
+
+func (nopWrites) Delete(uint64, uint64, string) error { return nil }
+func (nopWrites) Cas(uint64, uint64, string, []byte, bool, []byte) (bool, error) {
+	return false, nil
+}
+func (nopWrites) Incr(uint64, uint64, string, int64) (int64, error) { return 0, nil }
 
 func listen(t testing.TB) net.Listener {
 	t.Helper()
@@ -72,9 +112,9 @@ func serveOn(t testing.TB, ln net.Listener, store Store) (string, func()) {
 	return ln.Addr().String(), stop
 }
 
-func dial(t testing.TB, addr string) *Client {
+func dial(t testing.TB, addrs ...string) *Client {
 	t.Helper()
-	c, err := Dial(addr)
+	c, err := Dial(addrs...)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -202,11 +242,11 @@ func TestPipelinedRequestsAnsweredInOrder(t *testing.T) {
 	const n = 50
 	var out bytes.Buffer
 	for i := range n {
-		set := appendRequest(nil, opSet, "k", fmt.Appendf(nil, "%d", i))
+		set := request{op: opSet, client: 1, seq: uint64(i + 1), key: "k", value: fmt.Appendf(nil, "%d", i)}.append(nil)
 		if err := writeFrame(&out, set); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeFrame(&out, appendRequest(nil, opGet, "k", nil)); err != nil {
+		if err := writeFrame(&out, request{op: opGet, key: "k"}.append(nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -278,14 +318,25 @@ func TestMalformedRequests(t *testing.T) {
 	r := bufio.NewReader(conn)
 
 	bad := map[string][]byte{
-		"empty payload":   {},
-		"unknown op":      {0xee, 1, 'k'},
-		"missing key":     {opGet},
-		"field past end":  {opSet, 1, 'k', 9, 'v'},
-		"bad uvarint":     {opGet, 0xff},
-		"missing value":   {opSet, 1, 'k'},
-		"trailing bytes":  {opGet, 1, 'k', 'x'},
-		"ping with field": {opPing, 0},
+		"empty payload":        {},
+		"unknown op":           {0xee, 1, 'k'},
+		"missing key":          {opGet},
+		"field past end":       {opSet, 1, 1, 1, 'k', 9, 'v'},
+		"bad uvarint":          {opGet, 0xff},
+		"missing value":        {opSet, 1, 1, 1, 'k'},
+		"trailing bytes":       {opGet, 1, 'k', 'x'},
+		"ping with field":      {opPing, 0},
+		"set without session":  {opSet, 1, 'k', 1, 'v'},
+		"del without seq":      {opDel, 1},
+		"seq zero":             {opDel, 1, 0, 1, 'k'},
+		"cas without flag":     {opCas, 1, 1, 1, 'k'},
+		"cas bad flag":         {opCas, 1, 1, 1, 'k', 2, 0, 0},
+		"cas without value":    {opCas, 1, 1, 1, 'k', 1, 1, 'v'},
+		"cas trailing bytes":   {opCas, 1, 1, 1, 'k', 0, 0, 0, 'x'},
+		"incr without delta":   {opIncr, 1, 1, 1, 'k'},
+		"incr bad delta":       {opIncr, 1, 1, 1, 'k', 0xff},
+		"incr trailing bytes":  {opIncr, 1, 1, 1, 'k', 2, 0},
+		"incr without session": {opIncr, 1, 'k', 2},
 	}
 	for name, payload := range bad {
 		if err := writeFrame(conn, payload); err != nil {
@@ -343,12 +394,12 @@ func TestShutdownClosesIdleConnections(t *testing.T) {
 }
 
 type blockingStore struct {
+	nopWrites
 	entered, release chan struct{}
 }
 
 func (s *blockingStore) Get(string) ([]byte, bool, error) { return nil, false, nil }
-func (s *blockingStore) Delete(string) error              { return nil }
-func (s *blockingStore) Set(string, []byte) error {
+func (s *blockingStore) Set(uint64, uint64, string, []byte) error {
 	close(s.entered)
 	<-s.release
 	return nil
@@ -385,18 +436,27 @@ func TestShutdownWaitsForInFlightRequest(t *testing.T) {
 	}
 }
 
-type failingStore struct{}
+type failingStore struct {
+	nopWrites
+	calls atomic.Int64
+}
 
-func (failingStore) Get(string) ([]byte, bool, error) { return nil, false, nil }
-func (failingStore) Delete(string) error              { return nil }
-func (failingStore) Set(string, []byte) error         { return errors.New("disk on fire") }
+func (*failingStore) Get(string) ([]byte, bool, error) { return nil, false, nil }
+func (s *failingStore) Set(uint64, uint64, string, []byte) error {
+	s.calls.Add(1)
+	return errors.New("disk on fire")
+}
 
 func TestStoreErrorReachesClient(t *testing.T) {
-	addr, _ := serve(t, failingStore{})
+	store := &failingStore{}
+	addr, _ := serve(t, store)
 	c := dial(t, addr)
 	err := c.Set("k", []byte("v"))
-	if err == nil || !strings.Contains(err.Error(), "disk on fire") {
-		t.Fatalf("got %v, want the store's error", err)
+	if err == nil || !strings.Contains(err.Error(), "disk on fire") || errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("got %v, want the store's error as a definite failure", err)
+	}
+	if n := store.calls.Load(); n != 1 {
+		t.Fatalf("store saw %d attempts, want 1: a definite error is not retried", n)
 	}
 	if err := c.Ping(); err != nil {
 		t.Fatalf("connection unusable after server error: %v", err)
@@ -430,18 +490,32 @@ func (r *redirectStore) Get(key string) ([]byte, bool, error) {
 	return r.next.Get(key)
 }
 
-func (r *redirectStore) Set(key string, value []byte) error {
+func (r *redirectStore) Set(client, seq uint64, key string, value []byte) error {
 	if err := r.redirect(); err != nil || r.next == nil {
 		return err
 	}
-	return r.next.Set(key, value)
+	return r.next.Set(client, seq, key, value)
 }
 
-func (r *redirectStore) Delete(key string) error {
+func (r *redirectStore) Delete(client, seq uint64, key string) error {
 	if err := r.redirect(); err != nil || r.next == nil {
 		return err
 	}
-	return r.next.Delete(key)
+	return r.next.Delete(client, seq, key)
+}
+
+func (r *redirectStore) Cas(client, seq uint64, key string, expected []byte, expectFound bool, value []byte) (bool, error) {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return false, err
+	}
+	return r.next.Cas(client, seq, key, expected, expectFound, value)
+}
+
+func (r *redirectStore) Incr(client, seq uint64, key string, delta int64) (int64, error) {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return 0, err
+	}
+	return r.next.Incr(client, seq, key, delta)
 }
 
 func TestClientFollowsRedirect(t *testing.T) {
@@ -515,9 +589,9 @@ func TestRedirectToDeadLeaderIsRetried(t *testing.T) {
 }
 
 func TestNeverElectedLeaderGivesUp(t *testing.T) {
-	t.Parallel()
 	addr, _ := serve(t, &redirectStore{unknown: math.MaxInt64})
 	c := dial(t, addr)
+	c.retryFor = 500 * time.Millisecond
 
 	var re *RedirectError
 	if err := c.Set("k", []byte("v")); !errors.As(err, &re) || re.Addr != "" {
@@ -546,5 +620,224 @@ func BenchmarkSet(b *testing.B) {
 		if err := c.Set("k", v); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestRequestRoundTrip(t *testing.T) {
+	for _, r := range []request{
+		{op: opPing},
+		{op: opGet, key: "k"},
+		{op: opSet, client: 1 << 63, seq: 7, key: "k", value: []byte("v\x00")},
+		{op: opDel, client: 3, seq: 1, key: ""},
+		{op: opCas, client: 3, seq: 2, key: "k", expected: []byte("old"), expectFound: true, value: []byte("new")},
+		{op: opCas, client: 3, seq: 3, key: "k", value: []byte("new")},
+		{op: opIncr, client: 3, seq: 4, key: "n", delta: -1 << 62},
+	} {
+		got, err := parseRequest(r.append(nil))
+		if err != nil {
+			t.Fatalf("parse %+v: %v", r, err)
+		}
+		if got.op != r.op || got.client != r.client || got.seq != r.seq || got.key != r.key || !bytes.Equal(got.value, r.value) ||
+			!bytes.Equal(got.expected, r.expected) || got.expectFound != r.expectFound || got.delta != r.delta {
+			t.Fatalf("round trip of %+v gave %+v", r, got)
+		}
+	}
+}
+
+func TestCasAndIncr(t *testing.T) {
+	addr, _ := serve(t, newMemStore())
+	c := dial(t, addr)
+
+	for _, step := range []struct {
+		expected    string
+		expectFound bool
+		value       string
+		want        bool
+	}{
+		{"", true, "a", false},
+		{"", false, "a", true},
+		{"", false, "b", false},
+		{"x", true, "b", false},
+		{"a", true, "", true},
+		{"", false, "c", false},
+		{"", true, "c", true},
+	} {
+		swapped, err := c.CAS("k", []byte(step.expected), step.expectFound, []byte(step.value))
+		if err != nil || swapped != step.want {
+			t.Fatalf("cas %+v: got %v, %v; want %v", step, swapped, err, step.want)
+		}
+	}
+	if v, ok := mustGet(t, c, "k"); !ok || string(v) != "c" {
+		t.Fatalf("get after cas: got %q, %v", v, ok)
+	}
+
+	for _, step := range []struct{ delta, want int64 }{{1, 1}, {41, 42}, {-50, -8}} {
+		if n, err := c.Incr("n", step.delta); err != nil || n != step.want {
+			t.Fatalf("incr %d: got %d, %v; want %d", step.delta, n, err, step.want)
+		}
+	}
+	if _, err := c.Incr("k", 1); err == nil || errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("incr of a non-integer: got %v, want a definite error", err)
+	}
+}
+
+// flakyServer serves store, answering each request whose number fail picks with no reply (closing the
+// connection) or statusUnknown, after running it; it records every request
+type flakyServer struct {
+	srv   *Server
+	fail  func(n int) (cut, unknown bool)
+	mu    sync.Mutex
+	reqs  []request
+	conns sync.WaitGroup
+}
+
+func serveFlaky(t *testing.T, store Store, fail func(n int) (cut, unknown bool)) (string, *flakyServer) {
+	t.Helper()
+	ln := listen(t)
+	f := &flakyServer{srv: NewServer(store), fail: fail}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			f.conns.Go(func() { f.handle(conn) })
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		f.conns.Wait()
+	})
+	return ln.Addr().String(), f
+}
+
+func (f *flakyServer) handle(conn net.Conn) {
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	for {
+		p, err := readFrame(r)
+		if err != nil {
+			return
+		}
+		req, err := parseRequest(p)
+		if err != nil {
+			return
+		}
+		f.mu.Lock()
+		f.reqs = append(f.reqs, req)
+		n := len(f.reqs)
+		f.mu.Unlock()
+		resp := f.srv.exec(p)
+		cut, unknown := f.fail(n)
+		if cut {
+			return
+		}
+		if unknown {
+			resp = append([]byte{statusUnknown}, "leadership lost"...)
+		}
+		if err := writeFrame(conn, resp); err != nil {
+			return
+		}
+	}
+}
+
+func (f *flakyServer) requests() []request {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.reqs)
+}
+
+func TestWriteRetriedWithTheSameSeq(t *testing.T) {
+	for name, fail := range map[string]func(int) (bool, bool){
+		"unknown":        func(n int) (bool, bool) { return false, n == 1 },
+		"connection cut": func(n int) (bool, bool) { return n == 1, false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			addr, f := serveFlaky(t, newMemStore(), fail)
+			c := dial(t, addr)
+			if n, err := c.Incr("n", 1); err != nil || n != 1 {
+				t.Fatalf("incr whose first attempt applied but failed: got %d, %v; want 1", n, err)
+			}
+			if n, err := c.Incr("n", 1); err != nil || n != 2 {
+				t.Fatalf("next incr: got %d, %v; want 2", n, err)
+			}
+			reqs := f.requests()
+			if len(reqs) != 3 {
+				t.Fatalf("server saw %d requests, want 3", len(reqs))
+			}
+			if reqs[0].client != reqs[1].client || reqs[0].seq != reqs[1].seq {
+				t.Fatalf("retry sent session (%d, %d), first attempt (%d, %d)", reqs[1].client, reqs[1].seq, reqs[0].client, reqs[0].seq)
+			}
+			if reqs[2].client != reqs[0].client || reqs[2].seq != reqs[0].seq+1 {
+				t.Fatalf("next write sent session (%d, %d) after (%d, %d)", reqs[2].client, reqs[2].seq, reqs[0].client, reqs[0].seq)
+			}
+		})
+	}
+}
+
+func TestWriteGivesUpWithOutcomeUnknown(t *testing.T) {
+	addr, f := serveFlaky(t, newMemStore(), func(int) (bool, bool) { return false, true })
+	c := dial(t, addr)
+	c.retryFor = 500 * time.Millisecond
+	start := time.Now()
+	err := c.Set("k", []byte("v"))
+	if !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("write never answered definitely: got %v, want ErrOutcomeUnknown", err)
+	}
+	if d := time.Since(start); d < c.retryFor-retryWait || d > c.retryFor+time.Second {
+		t.Fatalf("gave up after %v, want just past %v", d, c.retryFor)
+	}
+	reqs := f.requests()
+	if len(reqs) < 2 {
+		t.Fatalf("server saw %d attempts, want retries", len(reqs))
+	}
+	for _, r := range reqs {
+		if r.seq != reqs[0].seq {
+			t.Fatalf("retries sent seqs %d and %d", reqs[0].seq, r.seq)
+		}
+	}
+
+	if err := c.Set("k", []byte("w")); !errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("second write: got %v", err)
+	}
+	if last := f.requests(); last[len(last)-1].seq != reqs[0].seq+1 {
+		t.Fatalf("write after giving up sent seq %d, want %d", last[len(last)-1].seq, reqs[0].seq+1)
+	}
+}
+
+func TestReadGivesUpWithTheLastError(t *testing.T) {
+	addr, _ := serve(t, &redirectStore{unknown: math.MaxInt64})
+	c := dial(t, addr)
+	c.retryFor = 300 * time.Millisecond
+	var re *RedirectError
+	if _, _, err := c.Get("k"); !errors.As(err, &re) || errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("get with no leader: got %v, want the redirect, not an unknown outcome", err)
+	}
+}
+
+func TestClientRedialsTheSeeds(t *testing.T) {
+	first, stopFirst := serve(t, newMemStore())
+	store := newMemStore()
+	second, _ := serve(t, store)
+	c := dial(t, first, second)
+	if err := c.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	stopFirst()
+	if err := c.Set("k", []byte("v")); err != nil {
+		t.Fatalf("set after the connected server stopped: %v", err)
+	}
+	if v, ok := store.s.Get("k"); !ok || string(v) != "v" {
+		t.Fatalf("second seed has k = %q, %v; want the retried write", v, ok)
+	}
+}
+
+func TestOutcomeUnknownSentAsStatusUnknown(t *testing.T) {
+	if resp := errorResponse(fmt.Errorf("propose: %w", ErrOutcomeUnknown)); resp[0] != statusUnknown {
+		t.Fatalf("an unknown outcome was answered with status %d, want statusUnknown", resp[0])
+	}
+	if resp := errorResponse(errors.New("value is not an integer")); resp[0] != statusError {
+		t.Fatalf("a failed write was answered with status %d, want ERROR", resp[0])
 	}
 }

@@ -6,14 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 )
 
-// Store is the key-value store a Server serves.
+// Store is the key-value store a Server serves. Each write carries the client's session, (client, seq), and must
+// take effect at most once per session. An error wrapping ErrOutcomeUnknown says the write may still apply,
+// a *RedirectError that it never ran.
 type Store interface {
 	Get(key string) ([]byte, bool, error)
-	Set(key string, value []byte) error
-	Delete(key string) error
+	Set(client, seq uint64, key string, value []byte) error
+	Delete(client, seq uint64, key string) error
+	Cas(client, seq uint64, key string, expected []byte, expectFound bool, value []byte) (swapped bool, err error)
+	Incr(client, seq uint64, key string, delta int64) (int64, error)
 }
 
 type Server struct {
@@ -105,36 +110,51 @@ func (s *Server) handle(conn net.Conn, setBusy func(net.Conn, bool) bool) {
 	}
 }
 
-func (s *Server) exec(req []byte) []byte {
-	op, key, value, err := parseRequest(req)
+func (s *Server) exec(p []byte) []byte {
+	req, err := parseRequest(p)
 	if err != nil {
 		return errorResponse(fmt.Errorf("malformed request: %w", err))
 	}
-	switch op {
+	var body []byte
+	switch req.op {
 	case opGet:
-		v, ok, err := s.store.Get(key)
+		v, ok, err := s.store.Get(req.key)
 		if err != nil {
 			return errorResponse(err)
 		}
 		if !ok {
 			return []byte{statusNotFound}
 		}
-		return append([]byte{statusOK}, v...)
+		body = v
 	case opSet:
-		err = s.store.Set(key, value)
+		err = s.store.Set(req.client, req.seq, req.key, req.value)
 	case opDel:
-		err = s.store.Delete(key)
+		err = s.store.Delete(req.client, req.seq, req.key)
+	case opCas:
+		var swapped bool
+		swapped, err = s.store.Cas(req.client, req.seq, req.key, req.expected, req.expectFound, req.value)
+		body = []byte{0}
+		if swapped {
+			body[0] = 1
+		}
+	case opIncr:
+		var n int64
+		n, err = s.store.Incr(req.client, req.seq, req.key, req.delta)
+		body = strconv.AppendInt(nil, n, 10)
 	}
 	if err != nil {
 		return errorResponse(err)
 	}
-	return []byte{statusOK}
+	return append([]byte{statusOK}, body...)
 }
 
 func errorResponse(err error) []byte {
 	var re *RedirectError
-	if errors.As(err, &re) {
+	switch {
+	case errors.As(err, &re):
 		return append([]byte{statusRedirect}, re.Addr...)
+	case errors.Is(err, ErrOutcomeUnknown):
+		return append([]byte{statusUnknown}, err.Error()...)
 	}
 	return append([]byte{statusError}, err.Error()...)
 }

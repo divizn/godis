@@ -76,6 +76,15 @@ func TestScriptedSession(t *testing.T) {
 		"GET",
 		"FLY away",
 		`SET k "oops`,
+		"CAS c - 1",
+		"CAS c - 2",
+		"CAS c 1 2",
+		"GET c",
+		"INCR n",
+		"INCR n -5",
+		"INCR n x",
+		"INCR c",
+		"incr greeting 1 2",
 		"PING",
 	}, "\n")
 	var out strings.Builder
@@ -94,6 +103,15 @@ func TestScriptedSession(t *testing.T) {
 		"(error) wrong number of arguments for 'get'",
 		`(error) unknown command "FLY"`,
 		"(error) invalid quoted argument",
+		"(integer) 1",
+		"(integer) 0",
+		"(integer) 1",
+		`"2"`,
+		"(integer) 1",
+		"(integer) -4",
+		`(error) delta "x" is not an integer`,
+		"(integer) 3",
+		"(error) wrong number of arguments for 'incr'",
 		"PONG",
 	}, "\n") + "\n"
 	if out.String() != want {

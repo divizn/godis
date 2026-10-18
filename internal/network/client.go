@@ -2,116 +2,226 @@ package network
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 )
 
 const (
 	maxRedirects = 10
-	// outlasts an election at the server's default timeout, randomized up to 2s
-	unknownLeaderTimeout = 5 * time.Second
-	unknownLeaderWait    = 100 * time.Millisecond
+	// outlasts an election at the server's default timeout, randomized up to 2s, and a server's 5s request timeout
+	retryTimeout = 10 * time.Second
+	retryWait    = 100 * time.Millisecond
+	dialTimeout  = time.Second
 )
 
-// Client is one connection, not safe for concurrent use; any error not sent by the server means it is broken.
-// It follows up to 10 redirects per request to the leader and stays connected there, waiting up to 5s for a reachable leader to be elected.
+// Client is a session with a godis cluster, not safe for concurrent use. Writes carry the session's client id and
+// a sequence number, so a write retried after an unknown outcome takes effect at most once.
+//
+// A request is retried for up to 10s: after a redirect (up to 10 per request, staying on the leader), when the
+// server reports an unknown outcome, and after a connection failure, redialing the last leader and then the seed
+// addresses. Definite errors are returned at once: an error sent by the server (a malformed request, Incr of a
+// value that is not an integer, a session that expired), which means the write did not apply. A write that gives
+// up returns an error wrapping ErrOutcomeUnknown: it may or may not have taken effect, and is never applied later
+// on its own. A read that gives up returns the last error.
 type Client struct {
-	conn net.Conn
-	r    *bufio.Reader
+	seeds  []string
+	leader string
+	conn   net.Conn
+	r      *bufio.Reader
+	id     uint64
+	seq    uint64
+	// retryFor is how long a request is retried, retryTimeout outside tests
+	retryFor time.Duration
 }
 
-func Dial(addr string) (*Client, error) {
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
+// Dial connects to the first reachable address; the client redials any of them later.
+func Dial(addrs ...string) (*Client, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("connect to godis: no address")
+	}
+	var id [8]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil, fmt.Errorf("pick client id: %w", err)
+	}
+	c := &Client{seeds: addrs, id: binary.LittleEndian.Uint64(id[:]), retryFor: retryTimeout}
+	if err := c.connectAny(); err != nil {
 		return nil, fmt.Errorf("connect to godis: %w", err)
 	}
-	return &Client{conn: conn, r: bufio.NewReader(conn)}, nil
+	return c, nil
 }
 
 func (c *Client) Ping() error {
-	_, _, err := c.do(opPing, "", nil)
+	_, _, err := c.do(request{op: opPing})
 	return err
 }
 
 // Get reports ok false if key does not exist.
 func (c *Client) Get(key string) (value []byte, ok bool, err error) {
-	return c.do(opGet, key, nil)
+	status, body, err := c.do(request{op: opGet, key: key})
+	return body, status == statusOK, err
 }
 
 func (c *Client) Set(key string, value []byte) error {
-	_, _, err := c.do(opSet, key, value)
+	_, _, err := c.write(request{op: opSet, key: key, value: value})
 	return err
 }
 
 func (c *Client) Del(key string) error {
-	_, _, err := c.do(opDel, key, nil)
+	_, _, err := c.write(request{op: opDel, key: key})
 	return err
 }
 
+// CAS sets key to value if key is absent and expectFound is false, or holds exactly expected and expectFound is true.
+func (c *Client) CAS(key string, expected []byte, expectFound bool, value []byte) (swapped bool, err error) {
+	_, body, err := c.write(request{op: opCas, key: key, expected: expected, expectFound: expectFound, value: value})
+	if err != nil {
+		return false, err
+	}
+	if len(body) != 1 || body[0] > 1 {
+		return false, fmt.Errorf("malformed cas response %q", body)
+	}
+	return body[0] == 1, nil
+}
+
+// Incr adds delta to the base-10 int64 at key, a missing key counting as 0, and returns the new value.
+func (c *Client) Incr(key string, delta int64) (int64, error) {
+	_, body, err := c.write(request{op: opIncr, key: key, delta: delta})
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(string(body), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("malformed incr response: %w", err)
+	}
+	return n, nil
+}
+
 func (c *Client) Close() error {
+	if c.conn == nil {
+		return nil
+	}
 	return c.conn.Close()
 }
 
-// do retries on a redirect, which is safe because a node that redirects has not run the request
-func (c *Client) do(op byte, key string, value []byte) ([]byte, bool, error) {
-	var re *RedirectError
-	var dialErr error
-	deadline := time.Now().Add(unknownLeaderTimeout)
+// write sends req with the session's next seq, the same on every retry
+func (c *Client) write(req request) (byte, []byte, error) {
+	c.seq++
+	req.client, req.seq = c.id, c.seq
+	status, body, err := c.do(req)
+	var se *serverError
+	if err != nil && !errors.As(err, &se) {
+		return 0, nil, fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
+	}
+	return status, body, err
+}
+
+// serverError is a definite error sent by the server
+type serverError struct{ msg string }
+
+func (e *serverError) Error() string { return e.msg }
+
+// do sends req until it gets a definite answer, retrying redirects, unknown outcomes and connection failures until retryFor passes
+func (c *Client) do(req request) (byte, []byte, error) {
+	p := req.append(nil)
+	deadline := time.Now().Add(c.retryFor)
 	for redirects := 0; ; {
-		body, ok, err := c.roundTrip(op, key, value)
-		if !errors.As(err, &re) {
-			return body, ok, err
-		}
-		if re.Addr != "" {
-			if redirects == maxRedirects {
-				return nil, false, fmt.Errorf("gave up after %d redirects: %w", maxRedirects, re)
+		status, body, err := c.roundTrip(p, deadline)
+		switch {
+		case err != nil:
+		case status == statusOK || status == statusNotFound:
+			return status, body, nil
+		case status == statusError:
+			return 0, nil, &serverError{string(body)}
+		case status == statusUnknown:
+			err = fmt.Errorf("server: %s", body)
+		case status == statusRedirect:
+			re := &RedirectError{Addr: string(body)}
+			err = re
+			if re.Addr != "" {
+				if redirects == maxRedirects {
+					return 0, nil, fmt.Errorf("gave up after %d redirects: %w", maxRedirects, re)
+				}
+				dialErr := c.connect(re.Addr)
+				if dialErr == nil {
+					redirects++
+					continue
+				}
+				err = errors.Join(re, dialErr)
 			}
-			if dialErr = c.redial(re.Addr); dialErr == nil {
-				redirects++
-				continue
-			}
+		default:
+			err = fmt.Errorf("unknown response status %d", status)
 		}
-		// the leader is unknown, or a dead one is still named until followers time out: ask again shortly
-		if time.Now().After(deadline) {
-			return nil, false, fmt.Errorf("no reachable leader after %v: %w", unknownLeaderTimeout, errors.Join(re, dialErr))
+		// the leader is unknown, a dead one is still named until followers time out, or the cluster is unreachable: ask again shortly
+		if time.Now().Add(retryWait).After(deadline) {
+			return 0, nil, fmt.Errorf("gave up after %v: %w", c.retryFor, err)
 		}
-		time.Sleep(unknownLeaderWait)
+		time.Sleep(retryWait)
 	}
 }
 
-func (c *Client) redial(addr string) error {
-	conn, err := net.Dial("tcp", addr)
+// roundTrip sends one request, (re)connecting first if needed; a connection error closes the connection
+func (c *Client) roundTrip(p []byte, deadline time.Time) (byte, []byte, error) {
+	if c.conn == nil {
+		if err := c.connectAny(); err != nil {
+			return 0, nil, err
+		}
+	}
+	resp, err := c.exchange(p, deadline)
 	if err != nil {
-		return fmt.Errorf("follow redirect to %s: %w", addr, err)
+		c.conn.Close()
+		c.conn = nil
+		return 0, nil, err
 	}
-	c.conn.Close()
-	c.conn, c.r = conn, bufio.NewReader(conn)
-	return nil
+	return resp[0], resp[1:], nil
 }
 
-func (c *Client) roundTrip(op byte, key string, value []byte) ([]byte, bool, error) {
-	if err := writeFrame(c.conn, appendRequest(nil, op, key, value)); err != nil {
-		return nil, false, err
+func (c *Client) exchange(p []byte, deadline time.Time) ([]byte, error) {
+	if err := c.conn.SetDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
+	}
+	if err := writeFrame(c.conn, p); err != nil {
+		return nil, err
 	}
 	resp, err := readFrame(c.r)
 	if err != nil {
-		return nil, false, fmt.Errorf("read response: %w", err)
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 	if len(resp) == 0 {
-		return nil, false, errors.New("empty response")
+		return nil, errors.New("empty response")
 	}
-	switch status, body := resp[0], resp[1:]; status {
-	case statusOK:
-		return body, true, nil
-	case statusNotFound:
-		return nil, false, nil
-	case statusError:
-		return nil, false, errors.New(string(body))
-	case statusRedirect:
-		return nil, false, &RedirectError{Addr: string(body)}
-	default:
-		return nil, false, fmt.Errorf("unknown response status %d", status)
+	return resp, nil
+}
+
+// connectAny dials the last known leader, then each seed in order
+func (c *Client) connectAny() error {
+	var errs []error
+	for _, addr := range append([]string{c.leader}, c.seeds...) {
+		if addr == "" {
+			continue
+		}
+		err := c.connect(addr)
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, err)
 	}
+	return errors.Join(errs...)
+}
+
+// connect replaces the connection with one to addr, keeping the old one if the dial fails
+func (c *Client) connect(addr string) error {
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", addr, err)
+	}
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.conn, c.r, c.leader = conn, bufio.NewReader(conn), addr
+	return nil
 }
