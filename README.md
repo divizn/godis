@@ -52,7 +52,7 @@ n, err := c.Incr(ctx, "hits", 1)
 swapped, err := c.CAS(ctx, "k", []byte("v"), true, []byte("w"))
 ```
 
-A `Client` is one session and is not safe for concurrent use: give each goroutine its own.
+A `Client` is safe for concurrent use. It keeps a pool of sessions, each with one connection and one request in flight, so concurrent calls run in parallel and each session's writes still reach the log in order.
 
 ## Running it
 
