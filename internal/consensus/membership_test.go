@@ -118,6 +118,12 @@ func TestRemoveFollowerShrinksTheQuorum(t *testing.T) {
 		if got := memberIDs(c.node(leader).Members()); len(got) != 3 || slices.Contains(got, rest[0]) {
 			t.Fatalf("members %v after removing %s", got, rest[0])
 		}
+		n := c.node(leader)
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.peers[rest[0]] != nil {
+			t.Fatalf("leader still replicates to the removed %s", rest[0])
+		}
 	})
 }
 
@@ -366,6 +372,7 @@ func TestInstallSnapshotCarriesTheConfig(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		dir := t.TempDir()
 		n := snapNode(t, dir, &applyLog{})
+		defer func() { _ = n.Stop() }()
 		install(t, n, InstallSnapshotArgs{Term: 1, Leader: "b", LastIndex: 2, LastTerm: 1, Members: ids("a", "b", "c", "d"), Data: snapshotOf(appliedN(2)...)})
 		if got := memberIDs(n.Members()); len(got) != 4 {
 			t.Fatalf("members %v after a snapshot of a four node cluster", got)
@@ -374,7 +381,6 @@ func TestInstallSnapshotCarriesTheConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 		n = snapNode(t, dir, &applyLog{})
-		defer mustStop(t, n)
 		if got := memberIDs(n.Members()); len(got) != 4 {
 			t.Fatalf("members %v after restarting from the installed snapshot", got)
 		}
@@ -498,6 +504,70 @@ func TestLeaderLosingLeadershipDuringCatchUpAbortsTheAdd(t *testing.T) {
 		defer n.mu.Unlock()
 		if n.learner != "" || len(n.members) != 3 || n.cfgIndex != 0 {
 			t.Fatalf("aborted add left learner %q, members %v, config entry %d", n.learner, n.members, n.cfgIndex)
+		}
+	})
+}
+
+func TestRemovedLeaderDoesNotCountItself(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3)
+		defer c.stopAll()
+		leader, _ := c.waitLeader()
+		c.mustPropose(leader, "x")
+		rest := followers(c, leader)
+		c.net.partition([]string{leader, rest[0]}, []string{rest[1]})
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := c.node(leader).RemoveMember(ctx, leader); err == nil {
+			t.Fatal("the leader committed its own removal with one of the two members that remain")
+		}
+	})
+}
+
+func TestLearnerIsNotCounted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newMemberCluster(t, 3, 1)
+		c.startBootstrap()
+		defer c.stopAll()
+		leader, _ := c.waitLeader()
+		c.mustPropose(leader, "x")
+		c.start("n4")
+		go c.node(leader).AddMember(context.Background(), Member{ID: "n4", Addr: "n4"})
+		waitFor(t, 10*time.Second, "the learner to be tracked", func() bool {
+			n := c.node(leader)
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			return n.learner == "n4"
+		})
+		c.net.partition([]string{leader, "n4"}, followers(c, leader)[:2])
+
+		if err := c.propose(leader, "y", 50*time.Millisecond); err == nil {
+			t.Fatal("a write committed with the leader and a learner, one of three voters")
+		}
+	})
+}
+
+func TestNewConfigQuorumAppliesAtOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newMemberCluster(t, 3, 1)
+		c.startBootstrap()
+		defer c.stopAll()
+		leader, _ := c.waitLeader()
+		c.mustPropose(leader, "x")
+		c.start("n4")
+		rest := followers(c, leader)
+		rest = slices.DeleteFunc(rest, func(id string) bool { return id == "n4" })
+		c.net.setSlowAppend(300 * time.Millisecond)
+
+		errc := make(chan error, 1)
+		go func() { errc <- c.node(leader).AddMember(context.Background(), Member{ID: "n4", Addr: "n4"}) }()
+		waitFor(t, 10*time.Second, "the new configuration to be appended", func() bool {
+			return len(c.node(leader).Members()) == 4
+		})
+		c.net.partition([]string{leader, rest[0]}, []string{rest[1], "n4"})
+		if err := <-errc; err == nil {
+			t.Fatal("the leader committed a four member configuration with two of the four")
 		}
 	})
 }

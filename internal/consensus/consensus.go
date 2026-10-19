@@ -823,7 +823,7 @@ func (n *Node) requestVote(peer string, args RequestVoteArgs) {
 			return
 		}
 	}
-	if n.role != Candidate || n.term != args.Term || !reply.Granted || !n.isMember(peer) {
+	if n.role != Candidate || n.term != args.Term || !reply.Granted {
 		return
 	}
 	n.votes++
