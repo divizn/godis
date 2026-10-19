@@ -114,13 +114,17 @@ Peers talk to each other over `net/rpc` with gob on the raft port.
 
 `go test -run='^$' -bench=. -benchtime=3s ./internal/node/`: a 3-node cluster over loopback in one process, real fsync, 1s election timeout, 128-byte values, client on the leader. Set is sequential with one client, SetParallel runs one client per goroutine (8), Get is a ReadIndex read.
 
-| benchmark | ns/op | ops/s |
-|---|---|---|
-| Set | 2,909,303 | 344 |
-| SetParallel | 1,235,083 | 810 |
-| Get | 199,924 | 5,002 |
+Writes before and after group commit (the leader appends every queued proposal with one log record and one fsync), measured 2026-10-19: one test binary built from each version, the two alternated five times under the same conditions, medians shown. SetParallel at 32 clients is the same benchmark run with `-cpu=32`.
 
-Intel Core i7-8650U (4 cores, 8 threads), SATA SSD (ext4), Linux 6.8, Go 1.26.0, 2026-10-12, with other work running on the machine (load average around 5). All three nodes share one disk, so every write costs three fsyncs on the same device; a real cluster spreads them. Writes are bound by fsync: each Propose holds the Raft mutex across its own fsync and there is no group commit. Reads cost one heartbeat round each. None of this has been optimized yet.
+| benchmark | before (writes/s) | after (writes/s) |
+|---|---|---|
+| Set, 1 client | 398 | 403 |
+| SetParallel, 8 clients | 822 | 1,812 (2.2x) |
+| SetParallel, 32 clients | 840 | 4,625 (5.5x) |
+
+A single client gains nothing: it never has company to batch with, and each write still waits for the leader's fsync and then a follower's, one after the other. Before the change, adding clients barely helped, since every write took its own fsync under the mutex. After it, throughput grows with the number of writers waiting. Reads (Get, a ReadIndex read) were 5,002 ops/s on 2026-10-12.
+
+Intel Core i7-8650U (4 cores, 8 threads), SATA SSD (ext4), Linux 6.8, Go 1.26.0, with other work running on the machine (load average 4 to 8 during the runs). All three nodes share one disk and one CPU, so every write costs fsyncs on the same device; a real cluster spreads them. In a first 32-client series, the first run of each version stalled (3 and 27 writes/s) and one baseline run reported nothing; the 14 runs since were clean, and the table shows the medians of the clean series. The stalls are not explained. The Raft mutex is still held across each fsync, and the leader persists before replicating rather than in parallel with it, so latency per write is about two fsyncs. Reads cost one heartbeat round each.
 
 ### Snapshots
 
