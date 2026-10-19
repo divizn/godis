@@ -177,7 +177,7 @@ type Node struct {
 	cancel context.CancelCauseFunc
 	wg     sync.WaitGroup
 
-	// ponytail: one lock over all state, held across fsyncs; split it and add group commit if a benchmark asks
+	// ponytail: one lock over all state, held across fsyncs (proposals share one per batch); append outside it, overlapped with replication, if latency matters
 	mu        sync.Mutex
 	applyCond *sync.Cond
 	wal       *wal.Log
