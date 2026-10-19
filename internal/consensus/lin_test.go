@@ -330,7 +330,7 @@ type memberChanges struct {
 
 // nemesis injects faults from rng until end: partitions, node stops and restarts, node crashes that lose
 // whatever was not fsynced, message loss and delay, appends with entries held back while empty ones pass, and
-// membership changes, one at a time, that keep the cluster between three and five members
+// membership changes, up to three attempted at once so the leader must refuse the extras, that keep the cluster between three and five members
 func nemesis(c *cluster, rng *rand.Rand, end time.Time, changes *memberChanges) {
 	var changing atomic.Int64
 	var pending sync.WaitGroup
