@@ -59,6 +59,10 @@ left, ok, err := c.TTL(ctx, "k")                             // left 0 means no 
 
 A `Client` is safe for concurrent use. It keeps a pool of sessions, each with one connection and one request in flight, so concurrent calls run in parallel and each session's writes still reach the log in order.
 
+## Example app
+
+[`examples/shortener`](https://github.com/divizn/godis-shortener) is a URL shortener built on godis, a git submodule with its own repo. It claims short codes with CAS, counts clicks and reports with INCR, expires links and per-IP rate limit windows with TTL, and shares one client across its HTTP handlers. Clone with `--recurse-submodules`, or run `git submodule update --init` in an existing clone.
+
 ## Running it
 
 Single node (a cluster of one):

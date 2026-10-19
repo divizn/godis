@@ -1,0 +1,3 @@
+[submodule "examples/shortener"]
+	path = examples/shortener
+	url = https://github.com/divizn/godis-shortener.git
