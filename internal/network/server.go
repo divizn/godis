@@ -29,6 +29,10 @@ type Store interface {
 	Expire(client, seq uint64, key string, ttl time.Duration) (found bool, err error)
 	// TTL reports the time left on a key, 0 for no deadline, found false if the key is missing or expired.
 	TTL(key string) (remaining time.Duration, found bool, err error)
+	// AddNode adds a node to the cluster; it returns once the change has committed.
+	AddNode(id, raftAddr, clientAddr string) error
+	RemoveNode(id string) error
+	Nodes() ([]protocol.Node, error)
 }
 
 type Server struct {
@@ -167,6 +171,16 @@ func (s *Server) exec(p []byte) []byte {
 		var n int64
 		n, err = s.store.Incr(req.Client, req.Seq, req.Key, req.Delta)
 		body = strconv.AppendInt(nil, n, 10)
+	case protocol.OpAddNode:
+		err = s.store.AddNode(req.Key, req.RaftAddr, req.ClientAddr)
+	case protocol.OpRemoveNode:
+		err = s.store.RemoveNode(req.Key)
+	case protocol.OpNodes:
+		nodes, err := s.store.Nodes()
+		if err != nil {
+			return errorResponse(err)
+		}
+		body = protocol.AppendNodes(nil, nodes)
 	}
 	if err != nil {
 		return errorResponse(err)

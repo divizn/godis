@@ -15,6 +15,9 @@ const MaxFrameSize = 16 << 20
 // Request payload: op | session (writes only: uvarint client | uvarint seq) | uvarint-length-prefixed key | rest
 // set rest: value field | uvarint ttl ms, 0 for none; cas rest: byte expectFound | expected field | value field
 // incr rest: varint delta; expire rest: varint ttl ms; ttl has no rest
+//
+// Membership requests carry no session. addnode: key is the node id, rest is a raft address field then a client address
+// field; removenode: key is the node id, no rest; nodes: no key or rest, like ping.
 const (
 	OpPing byte = iota + 1
 	OpGet
@@ -24,6 +27,9 @@ const (
 	OpIncr
 	OpExpire
 	OpTTL
+	OpAddNode
+	OpRemoveNode
+	OpNodes
 )
 
 // MaxTTL is the longest ttl a request may carry, in ms: about 100 years
@@ -31,7 +37,8 @@ const MaxTTL = 100 * 365 * 24 * 3600 * 1000
 
 // response payload: status | body
 // OK bodies: the value for get, 1 or 0 for whether a cas swapped or an expire found a live key, the new value in decimal
-// for incr, the uvarint ms left for ttl with 0 for no deadline (NotFound if the key is missing or expired)
+// for incr, the uvarint ms left for ttl with 0 for no deadline (NotFound if the key is missing or expired); for nodes
+// the uvarint count then, for each node, its id, raft address and client address fields
 const (
 	StatusOK byte = iota
 	StatusNotFound
@@ -101,6 +108,13 @@ type Request struct {
 	Delta       int64
 	// TTL is in ms: for a set 0 means none, for an expire a value at or below 0 deletes the key
 	TTL int64
+	// RaftAddr and ClientAddr are the addresses of the node an addnode names by Key
+	RaftAddr, ClientAddr string
+}
+
+// Node is a cluster member as the nodes request reports it.
+type Node struct {
+	ID, RaftAddr, ClientAddr string
 }
 
 func (r Request) IsWrite() bool {
@@ -109,7 +123,7 @@ func (r Request) IsWrite() bool {
 
 func (r Request) Append(b []byte) []byte {
 	b = append(b, r.Op)
-	if r.Op == OpPing {
+	if r.Op == OpPing || r.Op == OpNodes {
 		return b
 	}
 	if r.IsWrite() {
@@ -131,6 +145,8 @@ func (r Request) Append(b []byte) []byte {
 		b = appendField(b, r.Value)
 	case OpIncr:
 		b = binary.AppendVarint(b, r.Delta)
+	case OpAddNode:
+		b = appendField(appendField(b, []byte(r.RaftAddr)), []byte(r.ClientAddr))
 	}
 	return b
 }
@@ -146,10 +162,10 @@ func ParseRequest(p []byte) (Request, error) {
 	}
 	r.Op = p[0]
 	rest := p[1:]
-	if r.Op < OpPing || r.Op > OpTTL {
+	if r.Op < OpPing || r.Op > OpNodes {
 		return r, fmt.Errorf("unknown op %d", r.Op)
 	}
-	if r.Op == OpPing {
+	if r.Op == OpPing || r.Op == OpNodes {
 		if len(rest) != 0 {
 			return r, fmt.Errorf("%d trailing bytes", len(rest))
 		}
@@ -209,6 +225,15 @@ func ParseRequest(p []byte) (Request, error) {
 			return r, errors.New("delta: missing or malformed")
 		}
 		r.Delta, rest = d, rest[w:]
+	case OpAddNode:
+		var raft, client []byte
+		if raft, rest, err = cutField(rest); err != nil {
+			return r, fmt.Errorf("raft address: %w", err)
+		}
+		if client, rest, err = cutField(rest); err != nil {
+			return r, fmt.Errorf("client address: %w", err)
+		}
+		r.RaftAddr, r.ClientAddr = string(raft), string(client)
 	}
 	if len(rest) != 0 {
 		return r, fmt.Errorf("%d trailing bytes", len(rest))
@@ -226,4 +251,36 @@ func cutField(p []byte) (field, rest []byte, err error) {
 		return nil, nil, fmt.Errorf("length %d runs past end of Request", n)
 	}
 	return p[:n], p[n:], nil
+}
+
+// AppendNodes encodes the body of a nodes response.
+func AppendNodes(b []byte, nodes []Node) []byte {
+	b = binary.AppendUvarint(b, uint64(len(nodes)))
+	for _, n := range nodes {
+		b = appendField(appendField(appendField(b, []byte(n.ID)), []byte(n.RaftAddr)), []byte(n.ClientAddr))
+	}
+	return b
+}
+
+func ParseNodes(p []byte) ([]Node, error) {
+	count, w := binary.Uvarint(p)
+	if w <= 0 || count > uint64(len(p)) {
+		return nil, errors.New("node count: missing or malformed")
+	}
+	rest := p[w:]
+	var nodes []Node
+	for range count {
+		var f [3][]byte
+		var err error
+		for i := range f {
+			if f[i], rest, err = cutField(rest); err != nil {
+				return nil, fmt.Errorf("node %d: %w", len(nodes), err)
+			}
+		}
+		nodes = append(nodes, Node{ID: string(f[0]), RaftAddr: string(f[1]), ClientAddr: string(f[2])})
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("%d trailing bytes", len(rest))
+	}
+	return nodes, nil
 }

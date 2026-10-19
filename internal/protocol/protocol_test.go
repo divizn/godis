@@ -74,13 +74,17 @@ func TestRequestRoundTrip(t *testing.T) {
 		{Op: OpExpire, Client: 3, Seq: 7, Key: "k", TTL: 90_000},
 		{Op: OpExpire, Client: 3, Seq: 8, Key: "k", TTL: -5},
 		{Op: OpTTL, Key: "k"},
+		{Op: OpAddNode, Key: "node-4", RaftAddr: "10.0.0.4:7000", ClientAddr: "10.0.0.4:8080"},
+		{Op: OpRemoveNode, Key: "node-4"},
+		{Op: OpNodes},
 	} {
 		got, err := ParseRequest(r.Append(nil))
 		if err != nil {
 			t.Fatalf("parse %+v: %v", r, err)
 		}
 		if got.Op != r.Op || got.Client != r.Client || got.Seq != r.Seq || got.Key != r.Key || !bytes.Equal(got.Value, r.Value) ||
-			!bytes.Equal(got.Expected, r.Expected) || got.ExpectFound != r.ExpectFound || got.Delta != r.Delta || got.TTL != r.TTL {
+			!bytes.Equal(got.Expected, r.Expected) || got.ExpectFound != r.ExpectFound || got.Delta != r.Delta || got.TTL != r.TTL ||
+			got.RaftAddr != r.RaftAddr || got.ClientAddr != r.ClientAddr {
 			t.Fatalf("round trip of %+v gave %+v", r, got)
 		}
 	}
@@ -121,5 +125,57 @@ func TestRequestAppendMatchesTheWireLayout(t *testing.T) {
 	want = []byte{OpExpire, 1, 2, 1, 'k', 5}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("expire encodes as %v, want %v", got, want)
+	}
+}
+
+func TestMalformedMembershipRequestsRejected(t *testing.T) {
+	bad := map[string][]byte{
+		"addnode without addresses":     {OpAddNode, 1, 'n'},
+		"addnode without client addr":   {OpAddNode, 1, 'n', 1, 'r'},
+		"addnode address past the end":  {OpAddNode, 1, 'n', 1, 'r', 5, 'c'},
+		"addnode trailing bytes":        {OpAddNode, 1, 'n', 1, 'r', 1, 'c', 0},
+		"removenode without id":         {OpRemoveNode},
+		"removenode trailing bytes":     {OpRemoveNode, 1, 'n', 0},
+		"removenode with session":       {OpRemoveNode, 1, 1, 1, 'n'},
+		"nodes with a key":              {OpNodes, 1, 'n'},
+		"op after the last membership":  {OpNodes + 1},
+		"addnode with a session prefix": {OpAddNode, 1, 1, 1, 'n', 1, 'r', 1, 'c'},
+	}
+	for name, p := range bad {
+		if _, err := ParseRequest(p); err == nil {
+			t.Errorf("%s: parsed, want error", name)
+		}
+	}
+}
+
+func TestNodesBodyRoundTrip(t *testing.T) {
+	for _, nodes := range [][]Node{
+		nil,
+		{{ID: "a", RaftAddr: "h:1", ClientAddr: "h:2"}},
+		{{ID: "a", RaftAddr: "h:1", ClientAddr: "h:2"}, {ID: "b", RaftAddr: "", ClientAddr: "x"}},
+	} {
+		got, err := ParseNodes(AppendNodes(nil, nodes))
+		if err != nil {
+			t.Fatalf("parse %+v: %v", nodes, err)
+		}
+		if len(got) != len(nodes) {
+			t.Fatalf("round trip of %+v gave %+v", nodes, got)
+		}
+		for i := range nodes {
+			if got[i] != nodes[i] {
+				t.Fatalf("round trip of %+v gave %+v", nodes, got)
+			}
+		}
+	}
+	for name, p := range map[string][]byte{
+		"empty":              {},
+		"count past the end": {5},
+		"truncated field":    {1, 3, 'a'},
+		"missing addresses":  {1, 1, 'a'},
+		"trailing bytes":     append(AppendNodes(nil, []Node{{ID: "a"}}), 0),
+	} {
+		if _, err := ParseNodes(p); err == nil {
+			t.Errorf("%s: parsed, want error", name)
+		}
 	}
 }

@@ -28,6 +28,34 @@ type memStore struct {
 	s     *storage.Store
 	mu    sync.Mutex
 	index uint64
+	nodes []protocol.Node
+}
+
+func (m *memStore) AddNode(id, raftAddr, clientAddr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if slices.ContainsFunc(m.nodes, func(n protocol.Node) bool { return n.ID == id }) {
+		return fmt.Errorf("node %s is already a member", id)
+	}
+	m.nodes = append(m.nodes, protocol.Node{ID: id, RaftAddr: raftAddr, ClientAddr: clientAddr})
+	return nil
+}
+
+func (m *memStore) RemoveNode(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i := slices.IndexFunc(m.nodes, func(n protocol.Node) bool { return n.ID == id })
+	if i < 0 {
+		return fmt.Errorf("node %s is not a member", id)
+	}
+	m.nodes = slices.Delete(m.nodes, i, i+1)
+	return nil
+}
+
+func (m *memStore) Nodes() ([]protocol.Node, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.nodes), nil
 }
 
 func newMemStore() *memStore { return &memStore{s: storage.New()} }
@@ -106,6 +134,9 @@ func (nopWrites) Expire(uint64, uint64, string, time.Duration) (bool, error) {
 	return false, nil
 }
 func (nopWrites) TTL(string) (time.Duration, bool, error) { return 0, false, nil }
+func (nopWrites) AddNode(string, string, string) error    { return nil }
+func (nopWrites) RemoveNode(string) error                 { return nil }
+func (nopWrites) Nodes() ([]protocol.Node, error)         { return nil, nil }
 
 func listen(t testing.TB) net.Listener {
 	t.Helper()
@@ -360,28 +391,31 @@ func TestMalformedRequests(t *testing.T) {
 	r := bufio.NewReader(conn)
 
 	bad := map[string][]byte{
-		"empty payload":        {},
-		"unknown op":           {0xee, 1, 'k'},
-		"missing key":          {protocol.OpGet},
-		"field past end":       {protocol.OpSet, 1, 1, 1, 'k', 9, 'v'},
-		"bad uvarint":          {protocol.OpGet, 0xff},
-		"missing value":        {protocol.OpSet, 1, 1, 1, 'k'},
-		"trailing bytes":       {protocol.OpGet, 1, 'k', 'x'},
-		"ping with field":      {protocol.OpPing, 0},
-		"set without session":  {protocol.OpSet, 1, 'k', 1, 'v'},
-		"del without seq":      {protocol.OpDel, 1},
-		"seq zero":             {protocol.OpDel, 1, 0, 1, 'k'},
-		"cas without flag":     {protocol.OpCas, 1, 1, 1, 'k'},
-		"cas bad flag":         {protocol.OpCas, 1, 1, 1, 'k', 2, 0, 0},
-		"cas without value":    {protocol.OpCas, 1, 1, 1, 'k', 1, 1, 'v'},
-		"cas trailing bytes":   {protocol.OpCas, 1, 1, 1, 'k', 0, 0, 0, 'x'},
-		"incr without delta":   {protocol.OpIncr, 1, 1, 1, 'k'},
-		"incr bad delta":       {protocol.OpIncr, 1, 1, 1, 'k', 0xff},
-		"incr trailing bytes":  {protocol.OpIncr, 1, 1, 1, 'k', 2, 0},
-		"incr without session": {protocol.OpIncr, 1, 'k', 2},
-		"set without ttl":      {protocol.OpSet, 1, 1, 1, 'k', 1, 'v'},
-		"expire without ttl":   {protocol.OpExpire, 1, 1, 1, 'k'},
-		"ttl trailing bytes":   {protocol.OpTTL, 1, 'k', 0},
+		"empty payload":         {},
+		"unknown op":            {0xee, 1, 'k'},
+		"missing key":           {protocol.OpGet},
+		"field past end":        {protocol.OpSet, 1, 1, 1, 'k', 9, 'v'},
+		"bad uvarint":           {protocol.OpGet, 0xff},
+		"missing value":         {protocol.OpSet, 1, 1, 1, 'k'},
+		"trailing bytes":        {protocol.OpGet, 1, 'k', 'x'},
+		"ping with field":       {protocol.OpPing, 0},
+		"set without session":   {protocol.OpSet, 1, 'k', 1, 'v'},
+		"del without seq":       {protocol.OpDel, 1},
+		"seq zero":              {protocol.OpDel, 1, 0, 1, 'k'},
+		"cas without flag":      {protocol.OpCas, 1, 1, 1, 'k'},
+		"cas bad flag":          {protocol.OpCas, 1, 1, 1, 'k', 2, 0, 0},
+		"cas without value":     {protocol.OpCas, 1, 1, 1, 'k', 1, 1, 'v'},
+		"cas trailing bytes":    {protocol.OpCas, 1, 1, 1, 'k', 0, 0, 0, 'x'},
+		"incr without delta":    {protocol.OpIncr, 1, 1, 1, 'k'},
+		"incr bad delta":        {protocol.OpIncr, 1, 1, 1, 'k', 0xff},
+		"incr trailing bytes":   {protocol.OpIncr, 1, 1, 1, 'k', 2, 0},
+		"incr without session":  {protocol.OpIncr, 1, 'k', 2},
+		"set without ttl":       {protocol.OpSet, 1, 1, 1, 'k', 1, 'v'},
+		"expire without ttl":    {protocol.OpExpire, 1, 1, 1, 'k'},
+		"ttl trailing bytes":    {protocol.OpTTL, 1, 'k', 0},
+		"addnode without addrs": {protocol.OpAddNode, 1, 'n'},
+		"removenode trailing":   {protocol.OpRemoveNode, 1, 'n', 0},
+		"nodes with a key":      {protocol.OpNodes, 1, 'n'},
 	}
 	for name, payload := range bad {
 		if err := protocol.WriteFrame(conn, payload); err != nil {
@@ -568,6 +602,27 @@ func (r *redirectStore) Cas(client, seq uint64, key string, expected []byte, exp
 		return false, err
 	}
 	return r.next.Cas(client, seq, key, expected, expectFound, value)
+}
+
+func (r *redirectStore) AddNode(id, raftAddr, clientAddr string) error {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return err
+	}
+	return r.next.AddNode(id, raftAddr, clientAddr)
+}
+
+func (r *redirectStore) RemoveNode(id string) error {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return err
+	}
+	return r.next.RemoveNode(id)
+}
+
+func (r *redirectStore) Nodes() ([]protocol.Node, error) {
+	if err := r.redirect(); err != nil || r.next == nil {
+		return nil, err
+	}
+	return r.next.Nodes()
 }
 
 func (r *redirectStore) Incr(client, seq uint64, key string, delta int64) (int64, error) {
@@ -960,5 +1015,53 @@ func TestSequentialCallsReuseOneConnection(t *testing.T) {
 	}
 	if n := ln.n.Load(); n != 1 {
 		t.Fatalf("server accepted %d connections for 40 sequential calls, want 1", n)
+	}
+}
+
+func TestNodeOps(t *testing.T) {
+	store := newMemStore()
+	addr, _ := serve(t, store)
+	c := dial(t, addr)
+	ctx := t.Context()
+
+	if err := c.AddNode(ctx, "n4", "h4:7000", "h4:8080"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := c.AddNode(ctx, "n5", "h5:7000", "h5:8080"); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := c.RemoveNode(ctx, "n4"); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	got, err := c.Nodes(ctx)
+	if err != nil {
+		t.Fatalf("nodes: %v", err)
+	}
+	if want := []client.Node{{ID: "n5", RaftAddr: "h5:7000", ClientAddr: "h5:8080"}}; !slices.Equal(got, want) {
+		t.Fatalf("nodes %v, want %v", got, want)
+	}
+
+	err = c.RemoveNode(ctx, "nobody")
+	if err == nil || !strings.Contains(err.Error(), "not a member") || errors.Is(err, client.ErrOutcomeUnknown) {
+		t.Fatalf("remove a stranger: got %v, want the store's error as a definite failure", err)
+	}
+	if err := c.Ping(ctx); err != nil {
+		t.Fatalf("connection unusable after a refused change: %v", err)
+	}
+}
+
+func TestNodeOpsFollowRedirects(t *testing.T) {
+	store := newMemStore()
+	leader, _ := serve(t, store)
+	follower, _ := serve(t, &redirectStore{addr: leader})
+	c := dial(t, follower)
+	if err := c.AddNode(t.Context(), "n4", "h4:7000", "h4:8080"); err != nil {
+		t.Fatalf("add through a follower: %v", err)
+	}
+	if err := c.RemoveNode(t.Context(), "n4"); err != nil {
+		t.Fatalf("remove through a follower: %v", err)
+	}
+	if nodes, err := c.Nodes(t.Context()); err != nil || len(nodes) != 0 {
+		t.Fatalf("nodes after add and remove: %v, %v", nodes, err)
 	}
 }

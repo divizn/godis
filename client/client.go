@@ -20,9 +20,11 @@ const (
 	maxRedirects = 10
 	// outlasts an election at the server's default timeout, randomized up to 2s, and a server's 5s request timeout
 	retryTimeout = 10 * time.Second
-	retryWait    = 100 * time.Millisecond
-	dialTimeout  = time.Second
-	maxIdle      = 8
+	// a membership change waits for a new node to catch up, then for the change to commit
+	changeTimeout = time.Minute
+	retryWait     = 100 * time.Millisecond
+	dialTimeout   = time.Second
+	maxIdle       = 8
 )
 
 // ErrOutcomeUnknown means a write may or may not have taken effect.
@@ -30,6 +32,9 @@ var ErrOutcomeUnknown = protocol.ErrOutcomeUnknown
 
 // RedirectError reports that a node is not the leader. Addr is the leader's client address, empty if unknown.
 type RedirectError = protocol.RedirectError
+
+// Node is a member of the cluster: its id, the address its peers reach it at and the address its clients do.
+type Node = protocol.Node
 
 // aLongTimeAgo is a deadline in the past, set to interrupt a blocked read or write
 var aLongTimeAgo = time.Unix(1, 0)
@@ -184,6 +189,34 @@ func (c *Client) Incr(ctx context.Context, key string, delta int64) (int64, erro
 	return n, nil
 }
 
+// AddNode adds a node to the cluster. Start the node with --join first: AddNode returns once it has caught up and the
+// change has committed. The servers must run with --membership-ops. A call retried after an unknown outcome finds the
+// node already added and succeeds if its addresses are the same.
+func (c *Client) AddNode(ctx context.Context, id, raftAddr, clientAddr string) error {
+	_, _, err := c.do(ctx, protocol.Request{Op: protocol.OpAddNode, Key: id, RaftAddr: raftAddr, ClientAddr: clientAddr})
+	return err
+}
+
+// RemoveNode removes a node from the cluster, which may be the leader. The servers must run with --membership-ops.
+// A call retried after an unknown outcome finds the node gone and fails.
+func (c *Client) RemoveNode(ctx context.Context, id string) error {
+	_, _, err := c.do(ctx, protocol.Request{Op: protocol.OpRemoveNode, Key: id})
+	return err
+}
+
+// Nodes lists the cluster as the node answering knows it, which may be one change behind or ahead of the cluster.
+func (c *Client) Nodes(ctx context.Context) ([]Node, error) {
+	_, body, err := c.do(ctx, protocol.Request{Op: protocol.OpNodes})
+	if err != nil {
+		return nil, err
+	}
+	nodes, err := protocol.ParseNodes(body)
+	if err != nil {
+		return nil, fmt.Errorf("malformed nodes response: %w", err)
+	}
+	return nodes, nil
+}
+
 // Close closes the idle sessions, and each busy one once its call returns; later calls fail.
 func (c *Client) Close() error {
 	c.mu.Lock()
@@ -306,6 +339,9 @@ func (s *session) do(ctx context.Context, req protocol.Request) (byte, []byte, e
 	p := req.Append(nil)
 	start := time.Now()
 	deadline := start.Add(retryTimeout)
+	if req.Op == protocol.OpAddNode || req.Op == protocol.OpRemoveNode {
+		deadline = start.Add(changeTimeout)
+	}
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
