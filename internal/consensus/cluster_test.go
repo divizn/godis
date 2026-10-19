@@ -343,6 +343,8 @@ type cluster struct {
 	fsSeed  uint64
 	fsys    map[string]*vfs.StrictMem
 	crashes int
+	// fs, if set, is every node's filesystem
+	fs vfs.FS
 }
 
 type leaderChange struct {
@@ -411,6 +413,9 @@ func (c *cluster) start(id string) {
 		}
 		cfg.FS = c.fsys[id]
 		c.mu.Unlock()
+	}
+	if c.fs != nil {
+		cfg.FS = c.fs
 	}
 	n, err := New(cfg)
 	if err != nil {

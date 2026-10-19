@@ -201,6 +201,13 @@ type Node struct {
 	applied chan struct{}
 	// pending is an installed snapshot the applier has yet to restore
 	pending *InstallSnapshotArgs
+	// proposals queue for the proposer, which appends all that are waiting with one fsync
+	proposals chan proposal
+}
+
+type proposal struct {
+	cmd  []byte
+	done chan outcome
 }
 
 // New restores the node's term, vote and log from cfg.Dir and starts it as a follower.
@@ -274,6 +281,7 @@ func New(cfg Config) (*Node, error) {
 		lastApplied:    snapIndex,
 		waiters:        map[uint64]chan outcome{},
 		applied:        make(chan struct{}),
+		proposals:      make(chan proposal, 1024),
 	}
 	n.wal, err = wal.Open(cfg.FS, filepath.Join(cfg.Dir, "log"), n.replay)
 	if err != nil {
@@ -285,6 +293,7 @@ func New(cfg Config) (*Node, error) {
 
 	n.wg.Go(n.runTimer)
 	n.wg.Go(n.runApplier)
+	n.wg.Go(n.runProposer)
 	for _, p := range n.peers {
 		ch := make(chan struct{}, 1)
 		n.wake[p] = ch
@@ -328,40 +337,87 @@ func (n *Node) Propose(ctx context.Context, cmd []byte) ([]byte, error) {
 	if len(cmd) > maxCommandSize {
 		return nil, fmt.Errorf("%w: %d bytes, limit %d", ErrCommandTooLarge, len(cmd), maxCommandSize)
 	}
-	n.mu.Lock()
-	if n.ctx.Err() != nil {
-		n.mu.Unlock()
-		return nil, context.Cause(n.ctx)
-	}
-	if n.role != Leader {
-		leader := n.leader
-		n.mu.Unlock()
-		return nil, &NotLeaderError{Leader: leader}
-	}
-	idx := n.lastIndex() + 1
-	if err := n.appendLog(idx, []Entry{{Term: n.term, Cmd: slices.Clone(cmd)}}); err != nil {
-		n.mu.Unlock()
-		return nil, err
-	}
-	done := make(chan outcome, 1)
-	n.waiters[idx] = done
-	n.advanceCommit()
-	n.wakeAll()
-	n.mu.Unlock()
-
+	p := proposal{cmd: slices.Clone(cmd), done: make(chan outcome, 1)}
 	select {
-	case o := <-done:
-		return o.result, o.err
+	case n.proposals <- p:
 	case <-ctx.Done():
-		n.mu.Lock()
-		if n.waiters[idx] == done {
-			delete(n.waiters, idx)
-		}
-		n.mu.Unlock()
 		return nil, ctx.Err()
 	case <-n.ctx.Done():
 		return nil, context.Cause(n.ctx)
 	}
+	select {
+	case o := <-p.done:
+		return o.result, o.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-n.ctx.Done():
+		return nil, context.Cause(n.ctx)
+	}
+}
+
+// runProposer takes every queued proposal, up to maxBatchBytes of commands but at least one, and appends them together, so proposals that queue during one fsync share the next
+func (n *Node) runProposer() {
+	var carry []proposal
+	for {
+		batch := carry
+		carry = nil
+		if len(batch) == 0 {
+			select {
+			case p := <-n.proposals:
+				batch = []proposal{p}
+			case <-n.ctx.Done():
+				return
+			}
+		}
+		size := len(batch[0].cmd)
+	drain:
+		for {
+			select {
+			case p := <-n.proposals:
+				if size+len(p.cmd) > maxBatchBytes {
+					carry = []proposal{p}
+					break drain
+				}
+				batch = append(batch, p)
+				size += len(p.cmd)
+			default:
+				break drain
+			}
+		}
+		n.appendProposals(batch)
+	}
+}
+
+func (n *Node) appendProposals(batch []proposal) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	answer := func(err error) {
+		for _, p := range batch {
+			p.done <- outcome{err: err}
+		}
+	}
+	if n.ctx.Err() != nil {
+		answer(context.Cause(n.ctx))
+		return
+	}
+	if n.role != Leader {
+		answer(&NotLeaderError{Leader: n.leader})
+		return
+	}
+	idx := n.lastIndex() + 1
+	entries := make([]Entry, len(batch))
+	for i, p := range batch {
+		entries[i] = Entry{Term: n.term, Cmd: p.cmd}
+	}
+	if err := n.appendLog(idx, entries); err != nil {
+		answer(err)
+		return
+	}
+	for i, p := range batch {
+		n.waiters[idx+uint64(i)] = p.done
+	}
+	n.advanceCommit()
+	n.wakeAll()
 }
 
 func (n *Node) Status() Status {
