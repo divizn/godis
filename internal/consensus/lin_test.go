@@ -31,6 +31,8 @@ const (
 	linOpWindow = 2 * time.Second
 	linBudget   = 1 << 20
 	linRetryFor = 10 * time.Second
+	// linNodes is the nodes a run can use: the first configuration and the spares to add
+	linNodes = 7
 )
 
 var (
@@ -70,13 +72,15 @@ func (r *linRecorder) record(op lincheck.Op) {
 
 func linRun(t *testing.T, seed uint64) {
 	rng := rand.New(rand.NewPCG(seed, seed))
-	c := newStoppedCluster(t, []int{3, 5}[rng.IntN(2)], rng.Uint64())
+	size := []int{3, 5}[rng.IntN(2)]
+	c := newStoppedCluster(t, size, rng.Uint64())
+	for i := size; i < linNodes; i++ {
+		c.ids = append(c.ids, fmt.Sprintf("n%d", i+1))
+	}
 	c.kv = true
 	c.snapEntries = 1 + seed%20
 	c.fsSeed = rng.Uint64() | 1
-	for _, id := range c.ids {
-		c.start(id)
-	}
+	c.startBootstrap()
 	defer c.stopAll()
 
 	duration := 30*time.Second + time.Duration(rng.Int64N(int64(30*time.Second)))
@@ -89,7 +93,8 @@ func linRun(t *testing.T, seed uint64) {
 		wg.Go(func() { lc.run(end, think) })
 	}
 	nrng := rand.New(rand.NewPCG(rng.Uint64(), rng.Uint64()))
-	wg.Go(func() { nemesis(c, nrng, end) })
+	var changes memberChanges
+	wg.Go(func() { nemesis(c, nrng, end, &changes) })
 	wg.Wait()
 
 	c.net.heal()
@@ -101,18 +106,23 @@ func linRun(t *testing.T, seed uint64) {
 		}
 	}
 	marker := storage.EncodeSet(0, 1, 0, 0, "end", nil)
+	var final []string
 	waitFor(t, 30*time.Second, "the end marker to commit", func() bool {
 		leader, _ := c.waitLeader()
-		return c.propose(leader, string(marker), time.Second) == nil
+		if c.propose(leader, string(marker), time.Second) != nil {
+			return false
+		}
+		final = memberIDs(c.node(leader).Members())
+		return true
 	})
-	c.waitApplied(string(marker))
+	c.waitApplied(string(marker), final...)
 
 	// the log holds a retried write once per attempt that reached it; replaying it must execute each (client, seq) once
 	// and rebuild exactly the stores the nodes have
 	replay := storage.New()
 	executed := map[string]bool{}
 	writes := 0
-	for _, e := range c.checkSame() {
+	for _, e := range c.checkSame(final...) {
 		dups := replay.Duplicates()
 		if _, err := replay.Apply(e.index, []byte(e.cmd)); err != nil {
 			t.Fatalf("seed %d: replay entry %d: %v", seed, e.index, err)
@@ -128,7 +138,7 @@ func linRun(t *testing.T, seed uint64) {
 			writes++
 		}
 	}
-	for _, id := range c.live() {
+	for _, id := range final {
 		if _, store := c.nodeStore(id); !bytes.Equal(store.Snapshot(), replay.Snapshot()) {
 			t.Errorf("seed %d: %s store differs from a replay of the log that applies each write once; replay with -lin.seed=%d", seed, id, seed)
 		}
@@ -143,9 +153,9 @@ func linRun(t *testing.T, seed uint64) {
 			pending++
 		}
 	}
-	t.Logf("%d nodes, %v, %d ops, %d writes (%d pending), %d applied, %d retries, %d duplicates dropped, %d leader terms, %d crashes, snapshots every %d entries: %d taken, %d installed",
-		len(c.ids), duration.Round(time.Second), len(rec.history), ops, pending, writes, rec.retries.Load(), replay.Duplicates(),
-		c.net.leaderTerms(), c.crashes, c.snapEntries, c.snapshots(), c.net.installCount())
+	t.Logf("%d nodes at the start, %d at the end, %v, %d ops, %d writes (%d pending), %d applied, %d retries, %d duplicates dropped, %d leader terms, %d crashes, %d members added, %d removed, snapshots every %d entries: %d taken, %d installed",
+		size, len(final), duration.Round(time.Second), len(rec.history), ops, pending, writes, rec.retries.Load(), replay.Duplicates(),
+		c.net.leaderTerms(), c.crashes, changes.added.Load(), changes.removed.Load(), c.snapEntries, c.snapshots(), c.net.installCount())
 	res := lincheck.Check(rec.history, linBudget)
 	if !res.Linearizable {
 		slices.SortFunc(res.Ops, func(a, b lincheck.Op) int { return cmp.Compare(a.Call, b.Call) })
@@ -157,7 +167,7 @@ func linRun(t *testing.T, seed uint64) {
 		if res.Unknown {
 			verdict = "search budget ran out"
 		}
-		t.Fatalf("seed %d, %d nodes, %d ops: key %q %s:\n%sreplay with -lin.seed=%d", seed, len(c.ids), len(rec.history), res.Key, verdict, b.String(), seed)
+		t.Fatalf("seed %d, %d nodes at the start, %d ops: key %q %s:\n%sreplay with -lin.seed=%d", seed, size, len(rec.history), res.Key, verdict, b.String(), seed)
 	}
 }
 
@@ -313,9 +323,60 @@ func (lc *linClient) send(key string, cmd []byte) (body []byte, found, ok bool) 
 	}
 }
 
+// memberChanges counts the membership changes that committed
+type memberChanges struct {
+	added, removed atomic.Int64
+}
+
 // nemesis injects faults from rng until end: partitions, node stops and restarts, node crashes that lose
-// whatever was not fsynced, message loss and delay, and appends with entries held back while empty ones pass
-func nemesis(c *cluster, rng *rand.Rand, end time.Time) {
+// whatever was not fsynced, message loss and delay, appends with entries held back while empty ones pass, and
+// membership changes, one at a time, that keep the cluster between three and five members
+func nemesis(c *cluster, rng *rand.Rand, end time.Time, changes *memberChanges) {
+	var changing atomic.Bool
+	var pending sync.WaitGroup
+	defer pending.Wait()
+	change := func(leader string) {
+		n := c.node(leader)
+		if n == nil || !changing.CompareAndSwap(false, true) {
+			return
+		}
+		members := n.Members()
+		add := len(members) < 5 && (len(members) == 3 || rng.IntN(2) == 0)
+		if add {
+			var spare []string
+			for _, id := range c.ids {
+				if !slices.ContainsFunc(members, func(m Member) bool { return m.ID == id }) {
+					spare = append(spare, id)
+				}
+			}
+			id := spare[rng.IntN(len(spare))]
+			if c.node(id) == nil {
+				c.start(id)
+			}
+			pending.Go(func() {
+				defer changing.Store(false)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if n.AddMember(ctx, Member{ID: id, Addr: id}) == nil {
+					changes.added.Add(1)
+				}
+			})
+			return
+		}
+		if len(members) <= 3 {
+			changing.Store(false)
+			return
+		}
+		id := members[rng.IntN(len(members))].ID
+		pending.Go(func() {
+			defer changing.Store(false)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if n.RemoveMember(ctx, id) == nil {
+				changes.removed.Add(1)
+			}
+		})
+	}
 	shuffled := func() []string {
 		ids := slices.Clone(c.ids)
 		rng.Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
@@ -335,7 +396,7 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time) {
 	for time.Now().Before(end) {
 		time.Sleep(200*time.Millisecond + time.Duration(rng.Int64N(int64(time.Second))))
 		leader, _ := c.leaderAmong(c.live()...)
-		switch r := rng.IntN(17); {
+		switch r := rng.IntN(20); {
 		case r < 2:
 			ids := shuffled()
 			cut := 1 + rng.IntN(len(ids)-1)
@@ -385,6 +446,10 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time) {
 		case r < 16:
 			if leader != "" {
 				crashNode(leader)
+			}
+		case r < 19:
+			if leader != "" {
+				change(leader)
 			}
 		default:
 			c.crash(c.live()...)

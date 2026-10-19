@@ -615,15 +615,23 @@ func (c *cluster) checkOneLeaderPerTerm() {
 	}
 }
 
-// live nodes applied the same sequence, earlier incarnations a prefix of it
-func (c *cluster) checkSame() []applied {
+// the members, all live nodes if none are given, applied the same sequence, the other live nodes and earlier incarnations a prefix of it
+func (c *cluster) checkSame(members ...string) []applied {
 	c.t.Helper()
 	c.checkOneLeaderPerTerm()
-	ids := c.live()
+	ids := members
+	if len(ids) == 0 {
+		ids = c.live()
+	}
 	want := c.log(ids[0]).snapshot()
 	for _, id := range ids[1:] {
 		if got := c.log(id).snapshot(); !slices.Equal(got, want) {
 			c.t.Fatalf("%s applied %v, %s applied %v", id, got, ids[0], want)
+		}
+	}
+	for _, id := range c.live() {
+		if got := c.log(id).snapshot(); len(got) > len(want) || !slices.Equal(got, want[:len(got)]) {
+			c.t.Fatalf("%s, not a member, applied %v, not a prefix of %v", id, got, want)
 		}
 	}
 	c.mu.Lock()
