@@ -321,10 +321,12 @@ func (a *applyLog) has(cmd string) bool {
 }
 
 type cluster struct {
-	t    *testing.T
-	net  *memNet
-	ids  []string
-	root string
+	t   *testing.T
+	net *memNet
+	ids []string
+	// bootstrap is the cluster's first configuration; every other id is a spare that starts joining, with no configuration
+	bootstrap []string
+	root      string
 
 	mu    sync.Mutex
 	nodes map[string]*Node
@@ -377,7 +379,25 @@ func newStoppedCluster(t *testing.T, size int, seed uint64) *cluster {
 	for i := range size {
 		c.ids = append(c.ids, fmt.Sprintf("n%d", i+1))
 	}
+	c.bootstrap = slices.Clone(c.ids)
 	return c
+}
+
+// newMemberCluster makes room for size nodes and spares more, which start joining when asked to; startBootstrap starts the first size
+func newMemberCluster(t *testing.T, size, spares int) *cluster {
+	t.Helper()
+	c := newStoppedCluster(t, size, rand.Uint64())
+	for i := range spares {
+		c.ids = append(c.ids, fmt.Sprintf("n%d", size+i+1))
+	}
+	return c
+}
+
+func (c *cluster) bootstrapFor(id string) []string {
+	if slices.Contains(c.bootstrap, id) {
+		return c.bootstrap
+	}
+	return nil
 }
 
 func (c *cluster) start(id string) {
@@ -388,7 +408,7 @@ func (c *cluster) start(id string) {
 	}
 	cfg := Config{
 		ID:                id,
-		Peers:             c.ids,
+		Members:           ids(c.bootstrapFor(id)...),
 		Dir:               filepath.Join(c.root, id),
 		Transport:         memTransport{net: c.net, from: id},
 		Apply:             al.apply,
@@ -652,4 +672,13 @@ func (c *cluster) leaderChanges(id string) []leaderChange {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return slices.Clone(c.changes[id])
+}
+
+// ids makes members from ids, each with its id as its address
+func ids(ids ...string) []Member {
+	var out []Member
+	for _, id := range ids {
+		out = append(out, Member{ID: id, Addr: id})
+	}
+	return out
 }

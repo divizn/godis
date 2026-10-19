@@ -47,7 +47,7 @@ func singleNode(t *testing.T, dir string) *Node {
 	t.Helper()
 	n, err := New(Config{
 		ID:                "a",
-		Peers:             []string{"a", "b", "c"},
+		Members:           ids("a", "b", "c"),
 		Dir:               dir,
 		Transport:         memTransport{net: newMemNet(1), from: "a"},
 		Apply:             func(uint64, []byte) []byte { return nil },
@@ -201,7 +201,7 @@ func TestVotesFromAnEarlierElectionAreNotCounted(t *testing.T) {
 		tr := heldVotes{release: make(chan struct{})}
 		n, err := New(Config{
 			ID:                "a",
-			Peers:             []string{"a", "b", "c"},
+			Members:           ids("a", "b", "c"),
 			Dir:               t.TempDir(),
 			Transport:         tr,
 			Apply:             func(uint64, []byte) []byte { return nil },
@@ -448,11 +448,11 @@ func TestProposeOnFollowerNamesLeader(t *testing.T) {
 func TestLeaderCommitsOnlyCurrentTermByCounting(t *testing.T) {
 	n := &Node{
 		id:          "a",
-		peers:       []string{"b", "c", "d", "e"},
+		members:     ids("a", "b", "c", "d", "e"),
+		peers:       map[string]*peer{"b": {match: 2}, "c": {match: 2}, "d": {match: 1}, "e": {match: 1}},
 		role:        Leader,
 		term:        4,
 		log:         []Entry{{}, {Term: 1, Cmd: []byte("x")}, {Term: 2, Cmd: []byte("y")}, {Term: 4}},
-		matchIndex:  map[string]uint64{"b": 2, "c": 2, "d": 1, "e": 1},
 		commitIndex: 1,
 	}
 	n.applyCond = sync.NewCond(&n.mu)
@@ -461,7 +461,7 @@ func TestLeaderCommitsOnlyCurrentTermByCounting(t *testing.T) {
 	if n.commitIndex != 1 {
 		t.Fatalf("committed index %d from term 2 by counting replicas in term 4", n.commitIndex)
 	}
-	n.matchIndex["b"], n.matchIndex["c"] = 3, 3
+	n.peers["b"].match, n.peers["c"].match = 3, 3
 	n.advanceCommit()
 	if n.commitIndex != 3 {
 		t.Fatalf("commit index %d, want 3 once a term 4 entry is on a majority", n.commitIndex)
@@ -632,7 +632,7 @@ func TestOverwrittenProposalIsDropped(t *testing.T) {
 		close(tr.release)
 		n, err := New(Config{
 			ID:                "a",
-			Peers:             []string{"a", "b", "c"},
+			Members:           ids("a", "b", "c"),
 			Dir:               t.TempDir(),
 			Transport:         tr,
 			Apply:             func(uint64, []byte) []byte { return nil },
@@ -845,22 +845,20 @@ func TestWipedFollowerCatchesUpInAnIdleCluster(t *testing.T) {
 
 func TestStaleTermAppendReplyIsIgnored(t *testing.T) {
 	n := &Node{
-		id:         "a",
-		peers:      []string{"b", "c"},
-		ctx:        context.Background(),
-		role:       Leader,
-		term:       4,
-		log:        []Entry{{}, {Term: 1}, {Term: 2, Cmd: []byte("x")}, {Term: 4}},
-		nextIndex:  map[string]uint64{"b": 4, "c": 4},
-		matchIndex: map[string]uint64{},
-		contact:    map[string]time.Time{},
+		id:      "a",
+		members: ids("a", "b", "c"),
+		peers:   map[string]*peer{"b": {next: 4}, "c": {next: 4}},
+		ctx:     context.Background(),
+		role:    Leader,
+		term:    4,
+		log:     []Entry{{}, {Term: 1}, {Term: 2, Cmd: []byte("x")}, {Term: 4}},
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 
 	args := AppendEntriesArgs{Term: 2, Leader: "a", Entries: []Entry{{Term: 1}, {Term: 2, Cmd: []byte("x")}, {Term: 2}}}
-	n.handleAppendReply("b", args, AppendEntriesReply{Term: 2, Success: true})
-	if n.matchIndex["b"] != 0 || n.commitIndex != 0 {
-		t.Fatalf("a term 2 reply moved the term 4 leader to matchIndex %d, commitIndex %d; want 0, 0", n.matchIndex["b"], n.commitIndex)
+	n.handleAppendReply(n.peers["b"], args, AppendEntriesReply{Term: 2, Success: true})
+	if n.peers["b"].match != 0 || n.commitIndex != 0 {
+		t.Fatalf("a term 2 reply moved the term 4 leader to matchIndex %d, commitIndex %d; want 0, 0", n.peers["b"].match, n.commitIndex)
 	}
 }
 
@@ -893,6 +891,7 @@ func TestFailedVotePersistIsNotGranted(t *testing.T) {
 		appendEntries(t, n, AppendEntriesArgs{Term: 5, Leader: "c"})
 		n.mu.Lock()
 		n.dir = filepath.Join(dir, "missing")
+		n.heard = time.Time{}
 		n.mu.Unlock()
 
 		r, err := n.HandleRequestVote(RequestVoteArgs{Term: 5, Candidate: "b"})
@@ -923,7 +922,7 @@ func TestLogWithGapFailsNew(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, err := New(Config{ID: "a", Peers: []string{"a"}, Dir: dir, Transport: memTransport{net: newMemNet(1), from: "a"}, Apply: func(uint64, []byte) []byte { return nil }})
+	n, err := New(Config{ID: "a", Members: ids("a"), Dir: dir, Transport: memTransport{net: newMemNet(1), from: "a"}, Apply: func(uint64, []byte) []byte { return nil }})
 	if err == nil {
 		mustStop(t, n)
 		t.Fatal("new on a log missing entry 2: want error")
@@ -956,7 +955,7 @@ func TestHigherTermAppendReplyStepsLeaderDown(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				n, err := New(Config{
 					ID:                "a",
-					Peers:             []string{"a", "b", "c"},
+					Members:           ids("a", "b", "c"),
 					Dir:               t.TempDir(),
 					Transport:         higherTerm{withEntries: withEntries},
 					Apply:             func(uint64, []byte) []byte { return nil },

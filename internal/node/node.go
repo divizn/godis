@@ -78,11 +78,11 @@ func Start(cfg Config) (*Node, error) {
 }
 
 func start(cfg Config) (*Node, error) {
-	ids := make([]string, 0, len(cfg.Peers))
+	members := make([]consensus.Member, 0, len(cfg.Peers))
 	raftAddrs := map[string]string{}
 	clientAddrs := map[string]string{}
 	for _, p := range cfg.Peers {
-		ids = append(ids, p.ID)
+		members = append(members, consensus.Member{ID: p.ID, Addr: p.RaftAddr + "/" + p.ClientAddr})
 		raftAddrs[p.ID] = p.RaftAddr
 		clientAddrs[p.ID] = p.ClientAddr
 	}
@@ -97,7 +97,7 @@ func start(cfg Config) (*Node, error) {
 	tr := &transport{addrs: raftAddrs, clients: map[conn]*rpc.Client{}}
 	raft, err := consensus.New(consensus.Config{
 		ID:        cfg.ID,
-		Peers:     ids,
+		Members:   members,
 		Dir:       cfg.Dir,
 		Transport: tr,
 

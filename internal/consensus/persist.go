@@ -63,38 +63,43 @@ func writeFileSync(fsys vfs.FS, path string, b []byte) error {
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
-// snapshot file: uvarint index | uvarint term | data | uint32 crc32c of everything before it, little endian
-func writeSnapshot(fsys vfs.FS, path string, index, term uint64, data []byte) error {
+// snapshot file: uvarint index | uvarint term | members | data | uint32 crc32c of everything before it, little endian
+func writeSnapshot(fsys vfs.FS, path string, index, term uint64, members []Member, data []byte) error {
 	b := binary.AppendUvarint(nil, index)
 	b = binary.AppendUvarint(b, term)
+	b = appendMembers(b, members)
 	b = append(b, data...)
 	b = binary.LittleEndian.AppendUint32(b, crc32.Checksum(b, crcTable))
 	return writeFileSync(fsys, path, b)
 }
 
 // readSnapshot returns index 0 when dir holds no snapshot
-func readSnapshot(fsys vfs.FS, dir string) (index, term uint64, data []byte, err error) {
+func readSnapshot(fsys vfs.FS, dir string) (index, term uint64, members []Member, data []byte, err error) {
 	b, err := fsys.ReadFile(filepath.Join(dir, "snapshot"))
 	if errors.Is(err, fs.ErrNotExist) {
-		return 0, 0, nil, nil
+		return 0, 0, nil, nil, nil
 	}
 	if err != nil {
-		return 0, 0, nil, fmt.Errorf("read raft snapshot: %w", err)
+		return 0, 0, nil, nil, fmt.Errorf("read raft snapshot: %w", err)
 	}
 	if len(b) < 4 || crc32.Checksum(b[:len(b)-4], crcTable) != binary.LittleEndian.Uint32(b[len(b)-4:]) {
-		return 0, 0, nil, errors.New("raft snapshot: checksum mismatch")
+		return 0, 0, nil, nil, errors.New("raft snapshot: checksum mismatch")
 	}
 	b = b[:len(b)-4]
 	index, n := binary.Uvarint(b)
 	if n <= 0 || index == 0 {
-		return 0, 0, nil, errors.New("raft snapshot: bad index")
+		return 0, 0, nil, nil, errors.New("raft snapshot: bad index")
 	}
 	b = b[n:]
 	term, n = binary.Uvarint(b)
 	if n <= 0 {
-		return 0, 0, nil, errors.New("raft snapshot: bad term")
+		return 0, 0, nil, nil, errors.New("raft snapshot: bad term")
 	}
-	return index, term, b[n:], nil
+	members, b, err = consumeMembers(b[n:])
+	if err != nil {
+		return 0, 0, nil, nil, fmt.Errorf("raft snapshot: %w", err)
+	}
+	return index, term, members, b, nil
 }
 
 // renameSnapshot durably makes the snapshot written to tmp dir's snapshot
@@ -114,7 +119,7 @@ func logRecords(start uint64, entries []Entry) [][]byte {
 	for len(entries) > 0 {
 		i, size := 0, binary.MaxVarintLen64
 		for i < len(entries) {
-			s := 2*binary.MaxVarintLen64 + len(entries[i].Cmd)
+			s := 2*binary.MaxVarintLen64 + 1 + len(entries[i].Cmd)
 			if i > 0 && size+s > wal.MaxRecordSize {
 				break
 			}
@@ -128,11 +133,12 @@ func logRecords(start uint64, entries []Entry) [][]byte {
 	return recs
 }
 
-// log record: uvarint start index | (uvarint term | uvarint cmd length | cmd)*
+// log record: uvarint start index | (uvarint term | kind byte | uvarint cmd length | cmd)*
 func encodeBatch(start uint64, entries []Entry) []byte {
 	b := binary.AppendUvarint(nil, start)
 	for _, e := range entries {
 		b = binary.AppendUvarint(b, e.Term)
+		b = append(b, byte(e.Kind))
 		b = binary.AppendUvarint(b, uint64(len(e.Cmd)))
 		b = append(b, e.Cmd...)
 	}
@@ -152,6 +158,11 @@ func decodeBatch(b []byte) (uint64, []Entry, error) {
 			return 0, nil, errors.New("bad entry term")
 		}
 		b = b[n:]
+		if len(b) == 0 {
+			return 0, nil, errors.New("bad entry kind")
+		}
+		kind := EntryKind(b[0])
+		b = b[1:]
 		size, n := binary.Uvarint(b)
 		if n <= 0 || size > uint64(len(b)-n) {
 			return 0, nil, errors.New("bad entry length")
@@ -161,7 +172,7 @@ func decodeBatch(b []byte) (uint64, []Entry, error) {
 		if size > 0 {
 			cmd = slices.Clone(b[:size])
 		}
-		entries = append(entries, Entry{Term: term, Cmd: cmd})
+		entries = append(entries, Entry{Term: term, Kind: kind, Cmd: cmd})
 		b = b[size:]
 	}
 	return start, entries, nil

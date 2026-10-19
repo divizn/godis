@@ -20,8 +20,8 @@ import (
 const (
 	maxBatch      = 64
 	maxBatchBytes = 1 << 20
-	// room in a wal record for the batch's varint header
-	maxCommandSize = wal.MaxRecordSize - 3*binary.MaxVarintLen64
+	// room in a wal record for the batch header and the entry kind
+	maxCommandSize = wal.MaxRecordSize - 3*binary.MaxVarintLen64 - 1
 )
 
 var (
@@ -66,9 +66,18 @@ func (r Role) String() string {
 	return fmt.Sprintf("Role(%d)", int(r))
 }
 
-// Entry is one log entry. An empty Cmd is a leader's no-op and is never applied.
+type EntryKind uint8
+
+const (
+	EntryNormal EntryKind = iota
+	// EntryConfig holds the whole member list in Cmd and takes effect on the node that appends it, committed or not.
+	EntryConfig
+)
+
+// Entry is one log entry. An empty normal Cmd is a leader's no-op and is never applied, nor is a config entry.
 type Entry struct {
 	Term uint64
+	Kind EntryKind
 	Cmd  []byte
 }
 
@@ -108,7 +117,9 @@ type InstallSnapshotArgs struct {
 	Leader    string
 	LastIndex uint64
 	LastTerm  uint64
-	Data      []byte
+	// Members is the configuration as of LastIndex
+	Members []Member
+	Data    []byte
 }
 
 type InstallSnapshotReply struct {
@@ -124,9 +135,10 @@ type Transport interface {
 
 type Config struct {
 	ID string
-	// Peers lists every member, including ID.
-	Peers []string
-	Dir   string
+	// Members is the bootstrap configuration, including ID, used only when neither the log nor a snapshot holds one.
+	// Empty means a node that is joining: it never campaigns and waits for a leader to add it.
+	Members []Member
+	Dir     string
 	// FS is the filesystem under Dir, default vfs.OS.
 	FS        vfs.FS
 	Transport Transport
@@ -147,6 +159,9 @@ type Config struct {
 	// OnLeaderChange is called with the node's lock held each time the leader it knows changes to a known one,
 	// so at most once per term; it must not block or call into the Node.
 	OnLeaderChange func(term uint64, leader string)
+	// OnMembership is called with the node's lock held each time the configuration in use changes, and once at startup;
+	// it must not block or call into the Node.
+	OnMembership func([]Member)
 }
 
 type Status struct {
@@ -160,7 +175,6 @@ type Status struct {
 
 type Node struct {
 	id             string
-	peers          []string
 	dir            string
 	fs             vfs.FS
 	tr             Transport
@@ -169,9 +183,9 @@ type Node struct {
 	restore        func([]byte) error
 	snapEntries    uint64
 	onLeaderChange func(uint64, string)
+	onMembership   func([]Member)
 	election       time.Duration
 	heartbeat      time.Duration
-	wake           map[string]chan struct{}
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -191,11 +205,19 @@ type Node struct {
 	commitIndex uint64
 	lastApplied uint64
 	deadline    time.Time
-	votes       int
-	nextIndex   map[string]uint64
-	matchIndex  map[string]uint64
-	// contact is when the leader last had a reply in its term from each peer
-	contact map[string]time.Time
+	// heard is when this node last had an AppendEntries or InstallSnapshot from a current leader
+	heard time.Time
+	votes int
+	// members is the configuration in use: the latest config entry in the log, else base
+	members []Member
+	// base is the configuration as of snapIndex
+	base []Member
+	// cfgIndex is the index of the latest config entry in the log, 0 if there is none
+	cfgIndex uint64
+	// learner is the id of a node the leader replicates to but does not count, while it catches up to join
+	learner string
+	// peers has every node the leader replicates to: the other members and the learner
+	peers   map[string]*peer
 	waiters map[uint64]chan outcome
 	// applied is closed and replaced each time lastApplied advances or the node stops leading
 	applied chan struct{}
@@ -215,11 +237,13 @@ func New(cfg Config) (*Node, error) {
 	if cfg.ID == "" || cfg.Dir == "" || cfg.Transport == nil || cfg.Apply == nil {
 		return nil, errors.New("consensus: ID, Dir, Transport and Apply are required")
 	}
-	if !slices.Contains(cfg.Peers, cfg.ID) {
-		return nil, fmt.Errorf("consensus: peers %v do not include %q", cfg.Peers, cfg.ID)
-	}
-	if len(slices.Compact(slices.Sorted(slices.Values(cfg.Peers)))) != len(cfg.Peers) {
-		return nil, fmt.Errorf("consensus: duplicate peers in %v", cfg.Peers)
+	if len(cfg.Members) > 0 {
+		if err := checkMembers(cfg.Members); err != nil {
+			return nil, err
+		}
+		if !slices.ContainsFunc(cfg.Members, func(m Member) bool { return m.ID == cfg.ID }) {
+			return nil, fmt.Errorf("consensus: members %v do not include %q", cfg.Members, cfg.ID)
+		}
 	}
 	if cfg.ElectionTimeout == 0 {
 		cfg.ElectionTimeout = 150 * time.Millisecond
@@ -246,10 +270,11 @@ func New(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	snapIndex, snapTerm, data, err := readSnapshot(cfg.FS, cfg.Dir)
+	snapIndex, snapTerm, snapMembers, data, err := readSnapshot(cfg.FS, cfg.Dir)
 	if err != nil {
 		return nil, err
 	}
+	base := slices.Clone(cfg.Members)
 	if snapIndex > 0 {
 		if cfg.Restore == nil {
 			return nil, errors.New("consensus: raft dir holds a snapshot but Restore is not set")
@@ -257,11 +282,11 @@ func New(cfg Config) (*Node, error) {
 		if err := cfg.Restore(data); err != nil {
 			return nil, fmt.Errorf("restore raft snapshot at %d: %w", snapIndex, err)
 		}
+		base = snapMembers
 	}
 
 	n := &Node{
 		id:             cfg.ID,
-		peers:          slices.DeleteFunc(slices.Clone(cfg.Peers), func(p string) bool { return p == cfg.ID }),
 		dir:            cfg.Dir,
 		fs:             cfg.FS,
 		tr:             cfg.Transport,
@@ -272,7 +297,8 @@ func New(cfg Config) (*Node, error) {
 		onLeaderChange: cfg.OnLeaderChange,
 		election:       cfg.ElectionTimeout,
 		heartbeat:      cfg.HeartbeatInterval,
-		wake:           map[string]chan struct{}{},
+		base:           base,
+		peers:          map[string]*peer{},
 		term:           term,
 		votedFor:       vote,
 		log:            []Entry{{Term: snapTerm}},
@@ -291,15 +317,16 @@ func New(cfg Config) (*Node, error) {
 	n.ctx, n.cancel = context.WithCancelCause(context.Background())
 	n.resetDeadline()
 
+	n.mu.Lock()
+	n.loadConfig()
+	n.onMembership = cfg.OnMembership
+	if n.onMembership != nil {
+		n.onMembership(slices.Clone(n.members))
+	}
+	n.mu.Unlock()
 	n.wg.Go(n.runTimer)
 	n.wg.Go(n.runApplier)
 	n.wg.Go(n.runProposer)
-	for _, p := range n.peers {
-		ch := make(chan struct{}, 1)
-		n.wake[p] = ch
-		n.wg.Go(func() { n.replicate(p, ch) })
-		n.wg.Go(func() { n.heartbeats(p) })
-	}
 	return n, nil
 }
 
@@ -310,6 +337,9 @@ func (n *Node) replay(rec []byte) error {
 	}
 	if start == 0 || start > n.lastIndex()+1 {
 		return fmt.Errorf("raft log batch starts at %d but log ends at %d", start, n.lastIndex())
+	}
+	if err := checkEntries(entries); err != nil {
+		return fmt.Errorf("raft log batch at %d: %w", start, err)
 	}
 	// entries the snapshot covers are committed, left over from a crash before the log was rewritten
 	if start <= n.snapIndex {
@@ -465,6 +495,9 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) (RequestVoteReply, error)
 	if n.ctx.Err() != nil {
 		return RequestVoteReply{}, context.Cause(n.ctx)
 	}
+	if n.role == Leader || time.Since(n.heard) < n.election {
+		return RequestVoteReply{Term: n.term}, nil
+	}
 	if args.Term < n.term {
 		return RequestVoteReply{Term: n.term}, nil
 	}
@@ -501,6 +534,7 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) (AppendEntriesReply, 
 	}
 	n.setLeader(args.Leader)
 	n.resetDeadline()
+	n.heard = time.Now()
 
 	reply := AppendEntriesReply{Term: n.term}
 	if last := n.lastIndex(); args.PrevLogIndex > last {
@@ -555,13 +589,14 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) (InstallSnapshotR
 	}
 	n.setLeader(args.Leader)
 	n.resetDeadline()
+	n.heard = time.Now()
 
 	reply := InstallSnapshotReply{Term: n.term}
 	if args.LastIndex <= n.commitIndex {
 		return reply, nil
 	}
 	tmp := filepath.Join(n.dir, "snapshot.recv.tmp")
-	if err := writeSnapshot(n.fs, tmp, args.LastIndex, args.LastTerm, args.Data); err != nil {
+	if err := writeSnapshot(n.fs, tmp, args.LastIndex, args.LastTerm, args.Members, args.Data); err != nil {
 		err = fmt.Errorf("write received raft snapshot: %w", err)
 		n.halt(err)
 		return InstallSnapshotReply{}, err
@@ -574,7 +609,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) (InstallSnapshotR
 			}
 		}
 	}
-	if err := n.compact(tmp, args.LastIndex, args.LastTerm); err != nil {
+	if err := n.compact(tmp, args.LastIndex, args.LastTerm, args.Members); err != nil {
 		return InstallSnapshotReply{}, err
 	}
 	n.commitIndex = args.LastIndex
@@ -584,7 +619,7 @@ func (n *Node) HandleInstallSnapshot(args InstallSnapshotArgs) (InstallSnapshotR
 }
 
 // compact durably makes the snapshot written to tmp this node's, keeping the log after it only if the log holds its last entry; mu must be held
-func (n *Node) compact(tmp string, index, term uint64) error {
+func (n *Node) compact(tmp string, index, term uint64, members []Member) error {
 	if err := renameSnapshot(n.fs, n.dir, tmp); err != nil {
 		n.halt(err)
 		return err
@@ -595,6 +630,8 @@ func (n *Node) compact(tmp string, index, term uint64) error {
 	}
 	n.log = append([]Entry{{Term: term}}, tail...)
 	n.snapIndex = index
+	n.base = members
+	n.loadConfig()
 
 	err := n.wal.Close()
 	n.wal = nil
@@ -614,7 +651,7 @@ func (n *Node) lastIndex() uint64 { return n.snapIndex + uint64(len(n.log)-1) }
 // termAt is the term of entry i, from snapIndex to lastIndex; mu must be held
 func (n *Node) termAt(i uint64) uint64 { return n.log[i-n.snapIndex].Term }
 
-func (n *Node) majority() int { return (len(n.peers)+1)/2 + 1 }
+func (n *Node) majority() int { return len(n.members)/2 + 1 }
 
 func (n *Node) resetDeadline() {
 	n.deadline = time.Now().Add(n.election + rand.N(n.election))
@@ -643,6 +680,9 @@ func (n *Node) setTermVote(term uint64, vote string) error {
 
 // appendLog durably replaces the log from index start onwards with entries
 func (n *Node) appendLog(start uint64, entries []Entry) error {
+	if err := checkEntries(entries); err != nil {
+		return fmt.Errorf("append raft log: %w", err)
+	}
 	if err := n.wal.Append(encodeBatch(start, entries)); err != nil {
 		err = fmt.Errorf("append raft log: %w", err)
 		n.halt(err)
@@ -655,6 +695,12 @@ func (n *Node) appendLog(start uint64, entries []Entry) error {
 		}
 	}
 	n.log = append(n.log[:start-n.snapIndex], entries...)
+	switch last := lastConfig(entries); {
+	case last >= 0:
+		n.useConfig(membersOf(entries[last]), start+uint64(last))
+	case start <= n.cfgIndex:
+		n.loadConfig()
+	}
 	return nil
 }
 
@@ -701,7 +747,7 @@ func (n *Node) runTimer() {
 		case n.ctx.Err() != nil:
 		case n.role == Leader:
 			n.checkQuorum()
-		case time.Now().After(n.deadline):
+		case time.Now().After(n.deadline) && n.isMember(n.id):
 			n.startElection()
 		}
 		n.mu.Unlock()
@@ -710,25 +756,33 @@ func (n *Node) runTimer() {
 
 // checkQuorum steps down a leader that has not heard from a majority for an election timeout; mu must be held
 func (n *Node) checkQuorum() {
-	heard := 1
-	for _, p := range n.peers {
-		if time.Since(n.contact[p]) < n.election {
+	heard := n.selfVote()
+	for _, m := range n.members {
+		if p := n.peers[m.ID]; p != nil && time.Since(p.contact) < n.election {
 			heard++
 		}
 	}
 	if heard >= n.majority() {
 		return
 	}
+	_ = n.stepDown(0)
+}
+
+// stepDown resigns leadership, failing the proposals past keep, which may still commit; mu must be held
+func (n *Node) stepDown(keep uint64) error {
 	if err := n.becomeFollower(n.term); err != nil {
-		return
+		return err
 	}
 	n.leader = ""
 	for i, done := range n.waiters {
-		done <- outcome{err: ErrLeadershipLost}
-		delete(n.waiters, i)
+		if i > keep {
+			done <- outcome{err: ErrLeadershipLost}
+			delete(n.waiters, i)
+		}
 	}
 	close(n.applied)
 	n.applied = make(chan struct{})
+	return nil
 }
 
 func (n *Node) startElection() {
@@ -745,8 +799,10 @@ func (n *Node) startElection() {
 	}
 	last := n.lastIndex()
 	args := RequestVoteArgs{Term: n.term, Candidate: n.id, LastLogIndex: last, LastLogTerm: n.termAt(last)}
-	for _, p := range n.peers {
-		n.wg.Go(func() { n.requestVote(p, args) })
+	for _, m := range n.members {
+		if m.ID != n.id {
+			n.wg.Go(func() { n.requestVote(m.ID, args) })
+		}
 	}
 }
 
@@ -767,7 +823,7 @@ func (n *Node) requestVote(peer string, args RequestVoteArgs) {
 			return
 		}
 	}
-	if n.role != Candidate || n.term != args.Term || !reply.Granted {
+	if n.role != Candidate || n.term != args.Term || !reply.Granted || !n.isMember(peer) {
 		return
 	}
 	n.votes++
@@ -779,12 +835,8 @@ func (n *Node) requestVote(peer string, args RequestVoteArgs) {
 func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.setLeader(n.id)
-	n.nextIndex = map[string]uint64{}
-	n.matchIndex = map[string]uint64{}
-	n.contact = map[string]time.Time{}
 	for _, p := range n.peers {
-		n.nextIndex[p] = n.lastIndex() + 1
-		n.contact[p] = time.Now()
+		p.next, p.match, p.contact = n.lastIndex()+1, 0, time.Now()
 	}
 	if err := n.appendLog(n.lastIndex()+1, []Entry{{Term: n.term}}); err != nil {
 		return
@@ -799,9 +851,9 @@ func (n *Node) wakeAll() {
 	}
 }
 
-func (n *Node) wakeup(peer string) {
+func (n *Node) wakeup(p *peer) {
 	select {
-	case n.wake[peer] <- struct{}{}:
+	case p.wake <- struct{}{}:
 	default:
 	}
 }
@@ -809,27 +861,30 @@ func (n *Node) wakeup(peer string) {
 // advanceCommit commits by counting replicas only for entries of the current term (figure 8)
 func (n *Node) advanceCommit() {
 	for i := n.lastIndex(); i > n.commitIndex && n.termAt(i) == n.term; i-- {
-		count := 1
-		for _, p := range n.peers {
-			if n.matchIndex[p] >= i {
+		count := n.selfVote()
+		for _, m := range n.members {
+			if p := n.peers[m.ID]; p != nil && p.match >= i {
 				count++
 			}
 		}
 		if count >= n.majority() {
 			n.commitIndex = i
 			n.applyCond.Broadcast()
-			return
+			break
 		}
+	}
+	if n.role == Leader && !n.isMember(n.id) && n.commitIndex >= n.cfgIndex {
+		_ = n.stepDown(n.commitIndex)
 	}
 }
 
 // replicate sends entries to peer when woken, by a proposal, a new leadership, its own follow-up or a heartbeat reply from a lagging or wiped peer
-func (n *Node) replicate(peer string, wake chan struct{}) {
+func (n *Node) replicate(ctx context.Context, p *peer) {
 	for {
 		select {
-		case <-n.ctx.Done():
+		case <-ctx.Done():
 			return
-		case <-wake:
+		case <-p.wake:
 		}
 
 		n.mu.Lock()
@@ -837,11 +892,11 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 			n.mu.Unlock()
 			continue
 		}
-		next := n.nextIndex[peer]
+		next := p.next
 		if next <= n.snapIndex {
 			term, dir := n.term, n.dir
 			n.mu.Unlock()
-			n.sendSnapshot(peer, term, dir)
+			n.sendSnapshot(ctx, p, term, dir)
 			continue
 		}
 		args := AppendEntriesArgs{
@@ -855,31 +910,31 @@ func (n *Node) replicate(peer string, wake chan struct{}) {
 		n.mu.Unlock()
 
 		// ponytail: fixed timeout so a big batch can finish transferring and syncing; scale it with batch bytes if peers get slower
-		ctx, cancel := context.WithTimeout(n.ctx, 10*n.election)
-		reply, err := n.tr.AppendEntries(ctx, peer, args)
+		rpcCtx, cancel := context.WithTimeout(ctx, 10*n.election)
+		reply, err := n.tr.AppendEntries(rpcCtx, p.id, args)
 		cancel()
 		if err != nil {
 			continue
 		}
 
 		n.mu.Lock()
-		n.handleAppendReply(peer, args, reply)
+		n.handleAppendReply(p, args, reply)
 		n.mu.Unlock()
 	}
 }
 
 // sendSnapshot sends the snapshot on disk to a peer whose next entry it covers, as leader of term
-func (n *Node) sendSnapshot(peer string, term uint64, dir string) {
-	index, lastTerm, data, err := readSnapshot(n.fs, dir)
+func (n *Node) sendSnapshot(ctx context.Context, p *peer, term uint64, dir string) {
+	index, lastTerm, members, data, err := readSnapshot(n.fs, dir)
 	if err != nil {
 		n.mu.Lock()
 		n.halt(fmt.Errorf("read raft snapshot to send: %w", err))
 		n.mu.Unlock()
 		return
 	}
-	args := InstallSnapshotArgs{Term: term, Leader: n.id, LastIndex: index, LastTerm: lastTerm, Data: data}
-	ctx, cancel := context.WithTimeout(n.ctx, 10*n.election)
-	reply, err := n.tr.InstallSnapshot(ctx, peer, args)
+	args := InstallSnapshotArgs{Term: term, Leader: n.id, LastIndex: index, LastTerm: lastTerm, Members: members, Data: data}
+	rpcCtx, cancel := context.WithTimeout(ctx, 10*n.election)
+	reply, err := n.tr.InstallSnapshot(rpcCtx, p.id, args)
 	cancel()
 	if err != nil {
 		return
@@ -887,26 +942,26 @@ func (n *Node) sendSnapshot(peer string, term uint64, dir string) {
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if !n.recordReply(peer, term, reply.Term) {
+	if !n.recordReply(p, term, reply.Term) {
 		return
 	}
-	if index > n.matchIndex[peer] {
-		n.matchIndex[peer] = index
+	if index > p.match {
+		p.match = index
 		n.advanceCommit()
 	}
-	n.nextIndex[peer] = index + 1
-	if n.nextIndex[peer] <= n.lastIndex() {
-		n.wakeup(peer)
+	p.next = index + 1
+	if p.next <= n.lastIndex() {
+		n.wakeup(p)
 	}
 }
 
 // heartbeats sends an empty AppendEntries to peer every heartbeat interval, whatever replicate is doing
-func (n *Node) heartbeats(peer string) {
+func (n *Node) heartbeats(ctx context.Context, p *peer) {
 	t := time.NewTicker(n.heartbeat)
 	defer t.Stop()
 	for {
 		select {
-		case <-n.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
@@ -916,7 +971,7 @@ func (n *Node) heartbeats(peer string) {
 			n.mu.Unlock()
 			continue
 		}
-		match := n.matchIndex[peer]
+		match := p.match
 		// a peer behind the snapshot fails the check but still resets its election timer
 		prev := max(match, n.snapIndex)
 		args := AppendEntriesArgs{
@@ -928,16 +983,16 @@ func (n *Node) heartbeats(peer string) {
 		}
 		n.mu.Unlock()
 
-		ctx, cancel := context.WithTimeout(n.ctx, n.election)
-		reply, err := n.tr.AppendEntries(ctx, peer, args)
+		rpcCtx, cancel := context.WithTimeout(ctx, n.election)
+		reply, err := n.tr.AppendEntries(rpcCtx, p.id, args)
 		cancel()
 		if err != nil {
 			continue
 		}
 
 		n.mu.Lock()
-		if n.recordReply(peer, args.Term, reply.Term) && (!reply.Success || n.matchIndex[peer] < n.lastIndex()) {
-			n.wakeup(peer)
+		if n.recordReply(p, args.Term, reply.Term) && (!reply.Success || p.match < n.lastIndex()) {
+			n.wakeup(p)
 		}
 		n.mu.Unlock()
 	}
@@ -956,8 +1011,8 @@ func (n *Node) batch(next uint64) []Entry {
 	return n.log[next-n.snapIndex : end-n.snapIndex]
 }
 
-// recordReply steps down on a higher term and records contact, reporting whether a reply to a request sent in term answers this leadership; mu must be held
-func (n *Node) recordReply(peer string, term, replyTerm uint64) bool {
+// recordReply steps down on a higher term and records contact, reporting whether a reply from p to a request sent in term answers this leadership; mu must be held
+func (n *Node) recordReply(p *peer, term, replyTerm uint64) bool {
 	if n.ctx.Err() != nil {
 		return false
 	}
@@ -966,29 +1021,29 @@ func (n *Node) recordReply(peer string, term, replyTerm uint64) bool {
 			return false
 		}
 	}
-	if n.role != Leader || n.term != term {
+	if n.role != Leader || n.term != term || n.peers[p.id] != p {
 		return false
 	}
-	n.contact[peer] = time.Now()
+	p.contact = time.Now()
 	return true
 }
 
-func (n *Node) handleAppendReply(peer string, args AppendEntriesArgs, reply AppendEntriesReply) {
-	if !n.recordReply(peer, args.Term, reply.Term) {
+func (n *Node) handleAppendReply(p *peer, args AppendEntriesArgs, reply AppendEntriesReply) {
+	if !n.recordReply(p, args.Term, reply.Term) {
 		return
 	}
 	if reply.Success {
 		match := args.PrevLogIndex + uint64(len(args.Entries))
-		if match > n.matchIndex[peer] {
-			n.matchIndex[peer] = match
+		if match > p.match {
+			p.match = match
 			n.advanceCommit()
 		}
-		n.nextIndex[peer] = match + 1
+		p.next = match + 1
 	} else {
-		n.nextIndex[peer] = n.nextAfterConflict(reply)
+		p.next = n.nextAfterConflict(reply)
 	}
-	if n.nextIndex[peer] <= n.lastIndex() && (reply.Success || n.nextIndex[peer] <= args.PrevLogIndex) {
-		n.wakeup(peer)
+	if p.next <= n.lastIndex() && (reply.Success || p.next <= args.PrevLogIndex) {
+		n.wakeup(p)
 	}
 }
 
@@ -1031,7 +1086,7 @@ func (n *Node) runApplier() {
 		results := make([][]byte, len(entries))
 		n.mu.Unlock()
 		for i, e := range entries {
-			if len(e.Cmd) > 0 {
+			if e.Kind == EntryNormal && len(e.Cmd) > 0 {
 				results[i] = n.apply(start+uint64(i), e.Cmd)
 			}
 		}
@@ -1062,10 +1117,13 @@ func (n *Node) notifyApplied(start uint64, results [][]byte, err error) {
 
 // takeSnapshot snapshots the state machine at lastApplied and compacts the log, encoding and writing it without mu; mu must be held
 func (n *Node) takeSnapshot() {
-	index, term := n.lastApplied, n.termAt(n.lastApplied)
+	index, term, members := n.lastApplied, n.termAt(n.lastApplied), n.configAt(n.lastApplied)
+	if len(members) == 0 {
+		return
+	}
 	tmp := filepath.Join(n.dir, "snapshot.tmp")
 	n.mu.Unlock()
-	err := writeSnapshot(n.fs, tmp, index, term, n.snapshot())
+	err := writeSnapshot(n.fs, tmp, index, term, members, n.snapshot())
 	n.mu.Lock()
 	if err != nil {
 		n.halt(fmt.Errorf("write raft snapshot: %w", err))
@@ -1074,7 +1132,7 @@ func (n *Node) takeSnapshot() {
 	if n.ctx.Err() != nil || n.snapIndex >= index {
 		return
 	}
-	_ = n.compact(tmp, index, term)
+	_ = n.compact(tmp, index, term, members)
 }
 
 // ReadIndex returns once a majority has confirmed this node still leads and everything committed
@@ -1091,17 +1149,20 @@ func (n *Node) ReadIndex(ctx context.Context) error {
 		n.mu.Unlock()
 		return &NotLeaderError{Leader: leader}
 	}
-	term, idx := n.term, n.readIndex()
-	acks := make(chan bool, len(n.peers))
+	term, idx, need, confirmed := n.term, n.readIndex(), n.majority(), n.selfVote()
+	acks := make(chan bool, len(n.members))
 	args := AppendEntriesArgs{Term: term, Leader: n.id}
-	for _, p := range n.peers {
-		n.wg.Go(func() { acks <- n.confirm(p, args) })
+	voters := 0
+	for _, m := range n.members {
+		if m.ID != n.id {
+			voters++
+			n.wg.Go(func() { acks <- n.confirm(m.ID, args) })
+		}
 	}
 	n.mu.Unlock()
 
-	confirmed := 1
-	for range n.peers {
-		if confirmed >= n.majority() {
+	for range voters {
+		if confirmed >= need {
 			break
 		}
 		select {
@@ -1115,7 +1176,7 @@ func (n *Node) ReadIndex(ctx context.Context) error {
 			return context.Cause(n.ctx)
 		}
 	}
-	if confirmed < n.majority() {
+	if confirmed < need {
 		return ErrNoQuorum
 	}
 
@@ -1151,10 +1212,10 @@ func (n *Node) readIndex() uint64 {
 }
 
 // confirm sends an empty AppendEntries that any follower of this term accepts without change, reporting whether it acked the term
-func (n *Node) confirm(peer string, args AppendEntriesArgs) bool {
+func (n *Node) confirm(id string, args AppendEntriesArgs) bool {
 	ctx, cancel := context.WithTimeout(n.ctx, n.election)
 	defer cancel()
-	reply, err := n.tr.AppendEntries(ctx, peer, args)
+	reply, err := n.tr.AppendEntries(ctx, id, args)
 	if err != nil {
 		return false
 	}
@@ -1166,7 +1227,9 @@ func (n *Node) confirm(peer string, args AppendEntriesArgs) bool {
 		}
 	}
 	if n.role == Leader && n.term == args.Term && reply.Term == args.Term {
-		n.contact[peer] = time.Now()
+		if p := n.peers[id]; p != nil {
+			p.contact = time.Now()
+		}
 	}
 	return reply.Term == args.Term
 }

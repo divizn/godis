@@ -50,7 +50,7 @@ func TestReadIndexWaitsForApply(t *testing.T) {
 		release := make(chan struct{})
 		n, err := New(Config{
 			ID:        "a",
-			Peers:     []string{"a"},
+			Members:   ids("a"),
 			Dir:       t.TempDir(),
 			Transport: memTransport{net: newMemNet(1), from: "a"},
 			Apply: func(_ uint64, cmd []byte) []byte {
