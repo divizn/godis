@@ -332,12 +332,13 @@ type memberChanges struct {
 // whatever was not fsynced, message loss and delay, appends with entries held back while empty ones pass, and
 // membership changes, one at a time, that keep the cluster between three and five members
 func nemesis(c *cluster, rng *rand.Rand, end time.Time, changes *memberChanges) {
-	var changing atomic.Bool
+	var changing atomic.Int64
 	var pending sync.WaitGroup
 	defer pending.Wait()
 	change := func(leader string) {
 		n := c.node(leader)
-		if n == nil || !changing.CompareAndSwap(false, true) {
+		if n == nil || changing.Add(1) > 3 {
+			changing.Add(-1)
 			return
 		}
 		members := n.Members()
@@ -354,7 +355,7 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time, changes *memberChanges) 
 				c.start(id)
 			}
 			pending.Go(func() {
-				defer changing.Store(false)
+				defer changing.Add(-1)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				if n.AddMember(ctx, Member{ID: id, Addr: id}) == nil {
@@ -364,12 +365,12 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time, changes *memberChanges) 
 			return
 		}
 		if len(members) <= 3 {
-			changing.Store(false)
+			changing.Add(-1)
 			return
 		}
 		id := members[rng.IntN(len(members))].ID
 		pending.Go(func() {
-			defer changing.Store(false)
+			defer changing.Add(-1)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if n.RemoveMember(ctx, id) == nil {
@@ -396,7 +397,7 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time, changes *memberChanges) 
 	for time.Now().Before(end) {
 		time.Sleep(200*time.Millisecond + time.Duration(rng.Int64N(int64(time.Second))))
 		leader, _ := c.leaderAmong(c.live()...)
-		switch r := rng.IntN(20); {
+		switch r := rng.IntN(22); {
 		case r < 2:
 			ids := shuffled()
 			cut := 1 + rng.IntN(len(ids)-1)
@@ -447,7 +448,7 @@ func nemesis(c *cluster, rng *rand.Rand, end time.Time, changes *memberChanges) 
 			if leader != "" {
 				crashNode(leader)
 			}
-		case r < 19:
+		case r < 21:
 			if leader != "" {
 				change(leader)
 			}
