@@ -1,14 +1,14 @@
 # godis
 
-A distributed key-value store written from scratch in Go: a Raft-replicated log, an in-memory map as the state machine, and a small binary TCP protocol. Storage, the write-ahead log, consensus and networking use only the standard library; the one dependency is the Prometheus client for metrics. It runs as a 3-node cluster with linearizable reads and writes, applies each write exactly once through client sessions even when the client retries it, and compacts its log with snapshots that it ships to followers that fall behind. No membership changes yet (see Limitations).
+A distributed key-value store written from scratch in Go: a Raft-replicated log, an in-memory map as the state machine, and a small binary TCP protocol. Storage, the write-ahead log, consensus and networking use only the standard library; the one dependency is the Prometheus client for metrics. It runs as a 3-node cluster with linearizable reads and writes, applies each write exactly once through client sessions even when the client retries it, and compacts its log with snapshots that it ships to followers that fall behind. Nodes can be added and removed one at a time while it runs.
 
-Data dirs written before key expiry (TTL) can't be read: the log and snapshot formats changed again, as they did for client sessions before it. Wipe them.
+Data dirs written before membership changes can't be read: the log entries gained a kind byte and the snapshot file gained the member list, as the formats changed for key expiry and client sessions before. Wipe them.
 
 ## Layout
 
 - `internal/storage`: the in-memory `Store` (map behind an `RWMutex`), its client session table, key deadlines, and the command codec the Raft log carries
 - `internal/wal`: append-only log, one fsync per record (`uint32 len | crc32c | payload`), torn-tail truncation on replay
-- `internal/consensus`: Raft (elections, replication, `Propose`, `ReadIndex`, snapshots with log compaction and `InstallSnapshot`), persisted through the WAL and a checksummed snapshot file
+- `internal/consensus`: Raft (elections, replication, `Propose`, `ReadIndex`, snapshots with log compaction and `InstallSnapshot`, single-server membership changes), persisted through the WAL and a checksummed snapshot file
 - `client`: the Go client, importable as `github.com/divizn/godis/client`
 - `internal/protocol`: the client protocol's framing and request encoding
 - `internal/network`: the client protocol server
@@ -36,6 +36,7 @@ Followers never serve reads or writes; they answer REDIRECT with the leader's cl
 - Leader loss: the remaining majority elects a new leader within one to two election timeouts (1s by default) and the client retries through the redirect, or redials the other nodes if the leader is gone.
 - A leader that hasn't heard from a majority for an election timeout steps down instead of timing out its pending requests. Pending reads get a redirect. Pending writes get "outcome unknown" (a write already in the log may still commit), and the client resends them with the same seq.
 - Snapshots: every node snapshots the store after each `--snapshot-entries` applied entries and drops the log before it. The snapshot is fsynced and renamed into place before the log is rewritten, so a crash between the two restarts cleanly, and a follower acks an InstallSnapshot only once both are durable. A restart restores the snapshot and replays only the log after it.
+- Membership changes, one node at a time (Ongaro's single-server change, thesis chapter 4). The configuration is a config entry in the log and a node uses the latest one in its log as soon as it appends it, committed or not; a follower whose log is truncated past one reverts. Elections and commits count a majority of the configuration in use, and a leader counts itself only while it is in it. A leader refuses a change until it has committed an entry of its own term, and while an earlier change is uncommitted. A new node first catches up as a learner (replicated to, not counted) and only then joins the configuration. A leader that removes itself keeps leading, without counting itself, until the change commits, then steps down. A node that heard from a leader within the last election timeout ignores RequestVote, so a removed node that never learned of its removal cannot force elections. The snapshot and InstallSnapshot carry the configuration. See Running it for how to add and remove nodes.
 - A node that can no longer persist its log or term halts and the process exits non-zero, rather than serve from a state it can't make durable.
 
 ## Go client
@@ -78,7 +79,22 @@ docker compose up -d --build   # clients on 8081-8083, metrics on 2112-2114, Pro
 docker compose down -v         # also deletes the data volumes
 ```
 
-Server flags: `--id`, `--port` (8080), `--raft-port` (7000), `--metrics-port` (2112), `--data-dir`, `--election-timeout` (1s, heartbeats a tenth of it), `--snapshot-entries` (10000, applied entries between snapshots), `--cluster=id=raft-addr/client-addr,...` listing every member including itself (empty means a cluster of one).
+Server flags: `--id`, `--port` (8080), `--raft-port` (7000), `--metrics-port` (2112), `--data-dir`, `--election-timeout` (1s, heartbeats a tenth of it), `--snapshot-entries` (10000, applied entries between snapshots), `--cluster=id=raft-addr/client-addr,...` listing every member including itself (empty means a cluster of one), `--join` (start with no configuration, to be added to a running cluster; excludes `--cluster`), `--membership-ops` (off by default; see below).
+
+### Adding and removing nodes
+
+Start the new node empty, then add it from any member:
+
+```sh
+go run ./cmd/server --id=node-4 --port=8084 --raft-port=7004 --metrics-port=2115 --data-dir=data4 --join --membership-ops
+go run ./cmd/godis-cli --addr=localhost:8081 CLUSTER ADD node-4 localhost:7004 localhost:8084
+go run ./cmd/godis-cli --addr=localhost:8081 CLUSTER NODES
+go run ./cmd/godis-cli --addr=localhost:8081 CLUSTER REMOVE node-4
+```
+
+`CLUSTER ADD` returns once the new node has caught up and the change has committed (it fails after ten election timeouts if the node never catches up, and changes nothing). A node that is removed keeps running, harmless, until you stop it. A node that lost its data dir must not rejoin under its old id, since it may have voted in terms it has forgotten: give it a new id.
+
+The `CLUSTER` commands (client ops ADDNODE, REMOVENODE, NODES) are refused unless the servers run with `--membership-ops`. They are not authenticated: anyone who can reach the client port of a server running with it can add a node of their choosing or remove every node. Leave it off, or keep the client port private, except while you change the cluster.
 
 Client:
 
@@ -87,7 +103,7 @@ go run ./cmd/godis-cli --addr=localhost:8081,localhost:8082,localhost:8083   # R
 go run ./cmd/godis-cli --addr=localhost:8081 SET k v                         # one-shot
 ```
 
-Commands: `PING`, `GET k`, `SET k v`, `DEL k`, `CAS k expected new` (sets `k` to `new` only if it holds exactly `expected`; an `expected` of `-` means "only if `k` is absent"; prints 1 if it swapped, 0 if not), `INCR k [delta]` (adds `delta`, default 1, to the base-10 int64 at `k`, a missing key counting as 0, and prints the new value; fails without writing on a value that is not an integer or on overflow), `SET k v PX ms` (sets `k` with a deadline `ms` milliseconds from now), `PEXPIRE k ms` (prints 1 if `k` was live, 0 if not; a `ms` of 0 or less deletes it), `PTTL k` (prints -2 if `k` is missing or expired, -1 if it has no deadline, else the milliseconds left).
+Commands: `CLUSTER ADD id raft-addr client-addr`, `CLUSTER REMOVE id`, `CLUSTER NODES` (see above), `PING`, `GET k`, `SET k v`, `DEL k`, `CAS k expected new` (sets `k` to `new` only if it holds exactly `expected`; an `expected` of `-` means "only if `k` is absent"; prints 1 if it swapped, 0 if not), `INCR k [delta]` (adds `delta`, default 1, to the base-10 int64 at `k`, a missing key counting as 0, and prints the new value; fails without writing on a value that is not an integer or on overflow), `SET k v PX ms` (sets `k` with a deadline `ms` milliseconds from now), `PEXPIRE k ms` (prints 1 if `k` was live, 0 if not; a `ms` of 0 or less deletes it), `PTTL k` (prints -2 if `k` is missing or expired, -1 if it has no deadline, else the milliseconds left).
 
 Metrics are at `http://<node>:2112/metrics`:
 
@@ -96,6 +112,7 @@ Metrics are at `http://<node>:2112/metrics`:
 - `godis_expired_keys_total`: keys this node's state machine deleted in sweeps since the process started
 - `godis_request_duration_seconds{op}`: histogram, Raft round trip included
 - `godis_raft_term`, `godis_raft_commit_index`, `godis_raft_leader` (1 on the leader)
+- `godis_raft_members`: nodes in the configuration this node uses
 - `godis_raft_snapshot_index`: last log index this node's snapshot covers, 0 if none
 - `godis_raft_leader_changes_total`: times this node learned of a new leader
 
@@ -105,8 +122,8 @@ Plus the Go runtime and process collectors. Leadership transitions are also logg
 
 Every message is a frame: `uint32 length | payload`, big endian, payloads up to 16 MiB. One request in flight per connection.
 
-- Request: `op` byte (1 PING, 2 GET, 3 SET, 4 DEL, 5 CAS, 6 INCR, 7 EXPIRE, 8 TTL). Writes (SET, DEL, CAS, INCR, EXPIRE) then carry the session, `uvarint client | uvarint seq` (seq starts at 1). Every op but PING then has the key as `uvarint length | bytes`. SET adds the value the same way, then a `uvarint` ttl in ms (0 for none; at most about 100 years); EXPIRE adds the ttl in ms as a signed varint (0 or less deletes); CAS adds a byte (1 if the key must hold the expected value, 0 if it must be absent), the expected value and the new value, both length-prefixed; INCR adds the delta as a signed varint.
-- Response: `status` byte (0 OK, 1 NOT_FOUND, 2 ERROR, 3 REDIRECT, 4 UNKNOWN), then the body. OK: the value for a GET, one byte 1 or 0 for whether a CAS swapped, the new value in decimal for an INCR, one byte 1 or 0 for whether an EXPIRE found a live key, for a TTL the `uvarint` milliseconds left (0 for no deadline; NOT_FOUND if the key is missing or expired), empty otherwise. ERROR: the message, for a definite failure (a malformed request, INCR of a non-integer, an expired session): the write did not apply. REDIRECT: the leader's client address, empty when no leader is known (the client waits 100ms and retries); the request never ran. UNKNOWN: the message; the write may or may not apply, and the client resends it with the same seq.
+- Request: `op` byte (1 PING, 2 GET, 3 SET, 4 DEL, 5 CAS, 6 INCR, 7 EXPIRE, 8 TTL, 9 ADDNODE, 10 REMOVENODE, 11 NODES). Writes (SET, DEL, CAS, INCR, EXPIRE) then carry the session, `uvarint client | uvarint seq` (seq starts at 1). Every op but PING then has the key as `uvarint length | bytes`. SET adds the value the same way, then a `uvarint` ttl in ms (0 for none; at most about 100 years); EXPIRE adds the ttl in ms as a signed varint (0 or less deletes); CAS adds a byte (1 if the key must hold the expected value, 0 if it must be absent), the expected value and the new value, both length-prefixed; INCR adds the delta as a signed varint. ADDNODE has no session and carries the node id as the key, then the raft address and the client address, length-prefixed; REMOVENODE carries the id as the key; NODES carries nothing, like PING.
+- Response: `status` byte (0 OK, 1 NOT_FOUND, 2 ERROR, 3 REDIRECT, 4 UNKNOWN), then the body. OK: the value for a GET, one byte 1 or 0 for whether a CAS swapped, the new value in decimal for an INCR, one byte 1 or 0 for whether an EXPIRE found a live key, for a TTL the `uvarint` milliseconds left (0 for no deadline; NOT_FOUND if the key is missing or expired), for NODES a `uvarint` count then each node's id, raft address and client address, length-prefixed, empty otherwise. ERROR: the message, for a definite failure (a malformed request, INCR of a non-integer, an expired session): the write did not apply. REDIRECT: the leader's client address, empty when no leader is known (the client waits 100ms and retries); the request never ran. UNKNOWN: the message; the write may or may not apply, and the client resends it with the same seq.
 
 Peers talk to each other over `net/rpc` with gob on the raft port.
 
@@ -160,6 +177,8 @@ On 2026-10-19, with client sessions, CAS and INCR, 500 runs passed in 20 minutes
 
 Each node runs on `vfs.StrictMem` (`internal/vfs`), an in-memory filesystem that keeps only what a real crash keeps: file contents that were fsynced, and directory entries (creates, renames) whose directory was fsynced. The nemesis's crash action freezes a node's filesystem so nothing it does afterwards persists, stops it, reverts the filesystem (unsynced appends keep a random prefix, a torn tail; a rename without a directory fsync is undone) and restarts it later, alone or with the whole cluster. Half of the single-node crashes freeze the filesystem a few writes in the future, so the crash lands inside a snapshot or log rewrite. A node failing to restart after a crash fails the run, as does any persistence error on a node that was not crashed. `TestCrashAtEveryWrite` crashes a lone node after each of 100 possible write counts. On 2026-10-19, 500 runs with crashes passed in 5 minutes: about 59,000 operations, 38,000 writes, 9,000 crashes, 12,000 retries, 14,000 leader terms, 25,000 snapshots and 5,400 InstallSnapshots; 1.2% of writes ended pending. After group commit (see Benchmarks), 500 runs with crashes passed again: 58,820 operations, 38,392 writes and 9,115 crashes in 5 minutes. With the batch counted towards commit without being written to the log, the fuzz fails in 5 of 5 repetitions at the CI default (12 of 15 seeds). At the CI default of 3 seeds, 20 repetitions each (60 runs), reintroduced bugs fail: follower acks AppendEntries before persisting 20 of 20 repetitions (54 runs); WAL append without fsync 20 of 20 (52 runs); follower acks InstallSnapshot before the snapshot and rewrite are durable 15 of 20 (41 runs); log rewrite without the directory sync 16 of 20 (26 runs); term and vote file without fsync 20 of 20 (60 runs), without the directory sync 16 of 20 (27 runs). Not caught by the fuzz: rewriting the log before the snapshot rename is durable (caught only by `TestCrashAtEveryWrite`), a snapshot rename without its own directory sync (harmless: the log rewrite syncs the same directory before anything is acked), and replay dropping a batch that straddles the snapshot index (loses only unapplied tail entries from one log; unit test only).
 
+Membership changes are part of the nemesis. A run starts with 3 or 5 nodes and has 7 ids; the nemesis adds spare nodes (started with no configuration, possibly one that was removed earlier and keeps its old data) and removes members, up to three changes in flight at a time through whichever node leads, keeping the configuration between 3 and 5 nodes, alongside every fault above, crashes included. At the end the final configuration is read from the leader, its members must all hold the same applied log and store, and every other node, removed ones included, must have applied a prefix of it. On 2026-10-20, 500 runs passed in 526 seconds (with -race): about 61,000 operations, 40,000 writes, 6,400 retries, 11,000 leader terms, 11,000 crashes, 1,156 members added and 1,360 removed, 27,000 snapshots and 5,100 InstallSnapshots; `-race -count=20` on the Raft package passed too. At the CI default of 3 seeds, 20 repetitions each, reintroduced membership bugs fail the fuzz this often (the unit test in `internal/consensus/membership_test.go` that catches each is named in brackets): a config used when it commits instead of when it is appended 1 of 20 (`TestConfigTakesEffectOnAppendAndRevertsOnTruncation`); the majority counted on the committed configuration instead of the new one 4 of 20 (`TestNewConfigQuorumAppliesAtOnce`); two changes allowed at once 0 of 20 (`TestSecondChangeWhileOneIsUncommittedIsRefused`); the leader's no-op check dropped 0 of 20 (`TestChangeBeforeTheLeaderCommitsInItsTermIsRefused`); a removed leader stepping down before its removal commits, which costs liveness only, 0 of 20 (`TestRemoveLeaderKeepsLeadingUntilCommit`); the vote-ignoring rule dropped, also liveness only, 0 of 20 (`TestRemovedNodeDoesNotUnseatTheLeader`). So the fuzz is a weak net for the membership rules themselves: the unit tests carry them, and the fuzz mostly checks that membership changes do not break linearizability, durability or the at-most-once check under crashes.
+
 A seed reproduces the fault schedule, not every goroutine interleaving (synctest fixes time, not scheduling), so a replay usually but not always fails the same way. `TestLinearizableAcrossRestarts` in `internal/node` checks the real stack the same way (TCP client with its sessions and retries, net/rpc, fsync, all five ops) for 15 seconds while nodes, the leader included, are stopped and restarted; it is skipped under `-short`. It rarely produces a retried write, so it does not catch dedupe being switched off; `TestWriteRetriedAcrossALeaderKillAppliesOnce` does, by killing a leader that has logged an INCR it cannot commit.
 
 ## Limitations
@@ -172,5 +191,6 @@ A seed reproduces the fault schedule, not every goroutine interleaving (synctest
 - One heartbeat round per read; concurrent reads are not batched.
 - A follower holds the Raft mutex across the fsync of a big append or a received snapshot, so a heartbeat arriving meanwhile waits for it.
 - A corrupt log is not repaired: wipe that node's data dir by hand and let it catch up.
-- No membership changes: the cluster is fixed at startup.
+- One membership change at a time: no joint consensus, no leadership transfer, no automatic removal of dead nodes. A removed node is not told and keeps running with its old configuration until stopped.
+- A change waits for a new node to catch up (up to ten election timeouts) and then to commit; the client allows a minute.
 - No pre-vote, so a node rejoining after a partition bumps the term and forces an election.
