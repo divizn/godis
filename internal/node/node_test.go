@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,8 +23,12 @@ type testCluster struct {
 	election time.Duration
 	root     string
 	peers    []Peer
-	nodes    map[string]*Node
-	regs     map[string]*prometheus.Registry
+	// joined are the nodes started with no configuration, to be added through a client
+	joined []Peer
+	// membershipOps is passed to every node started from now on
+	membershipOps bool
+	nodes         map[string]*Node
+	regs          map[string]*prometheus.Registry
 	// snapEntries is passed to every node started from now on, zero for the default
 	snapEntries uint64
 	// sweep is passed to every node started from now on, zero for the default
@@ -47,7 +52,12 @@ func newTestCluster(t testing.TB, size int) *testCluster {
 // newTestClusterWithElection takes an election timeout, zero for the production default
 func newTestClusterWithElection(t testing.TB, size int, election time.Duration) *testCluster {
 	t.Helper()
-	c := &testCluster{t: t, election: election, root: t.TempDir(), nodes: map[string]*Node{}, regs: map[string]*prometheus.Registry{}}
+	return newTestClusterOpts(t, size, election, false)
+}
+
+func newTestClusterOpts(t testing.TB, size int, election time.Duration, membershipOps bool) *testCluster {
+	t.Helper()
+	c := &testCluster{t: t, election: election, membershipOps: membershipOps, root: t.TempDir(), nodes: map[string]*Node{}, regs: map[string]*prometheus.Registry{}}
 	var lns [][2]net.Listener
 	for i := range size {
 		cl, rl := listen(t, "127.0.0.1:0"), listen(t, "127.0.0.1:0")
@@ -62,7 +72,7 @@ func newTestClusterWithElection(t testing.TB, size int, election time.Duration) 
 }
 
 func (c *testCluster) peer(id string) Peer {
-	for _, p := range c.peers {
+	for _, p := range append(slices.Clone(c.peers), c.joined...) {
 		if p.ID == id {
 			return p
 		}
@@ -74,7 +84,11 @@ func (c *testCluster) peer(id string) Peer {
 func (c *testCluster) startOn(id string, cl, rl net.Listener) {
 	c.t.Helper()
 	reg := prometheus.NewRegistry()
-	n, err := Start(Config{ID: id, Peers: c.peers, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election, Metrics: reg, SnapshotEntries: c.snapEntries, SweepInterval: c.sweep})
+	peers := c.peers
+	if slices.ContainsFunc(c.joined, func(p Peer) bool { return p.ID == id }) {
+		peers = nil
+	}
+	n, err := Start(Config{ID: id, Peers: peers, MembershipOps: c.membershipOps, Dir: filepath.Join(c.root, id), ClientListener: cl, RaftListener: rl, ElectionTimeout: c.election, Metrics: reg, SnapshotEntries: c.snapEntries, SweepInterval: c.sweep})
 	if err != nil {
 		c.t.Fatalf("start %s: %v", id, err)
 	}
@@ -100,8 +114,8 @@ func (c *testCluster) stop(id string) {
 }
 
 func (c *testCluster) stopAll() {
-	for _, p := range c.peers {
-		c.stop(p.ID)
+	for id := range c.nodes {
+		c.stop(id)
 	}
 }
 
@@ -347,7 +361,7 @@ func TestMaxSizeValuesCommitWithoutElection(t *testing.T) {
 }
 
 func TestRaftErrorsTellTheClientWhatToRetry(t *testing.T) {
-	s := kvStore{clientAddrs: map[string]string{"node-2": "addr-2"}}
+	s := kvStore{book: &addrBook{client: map[string]string{"node-2": "addr-2"}}}
 	var re *client.RedirectError
 	if err := s.classify(fmt.Errorf("propose: %w", &consensus.NotLeaderError{Leader: "node-2"})); !errors.As(err, &re) || re.Addr != "addr-2" {
 		t.Fatalf("not the leader: got %v, want a redirect to addr-2", err)
@@ -359,6 +373,11 @@ func TestRaftErrorsTellTheClientWhatToRetry(t *testing.T) {
 	}
 	if err := s.classify(fmt.Errorf("propose: %w", consensus.ErrCommandTooLarge)); errors.Is(err, client.ErrOutcomeUnknown) || errors.As(err, &re) {
 		t.Fatalf("command too large: got %v, want a definite error", err)
+	}
+	for _, cause := range []error{consensus.ErrChangeInProgress, consensus.ErrMemberExists, consensus.ErrNotMember, consensus.ErrLastMember, consensus.ErrLeaderNotReady, consensus.ErrCatchUpTimeout} {
+		if err := s.classify(fmt.Errorf("add node: %w", cause)); errors.Is(err, client.ErrOutcomeUnknown) || errors.As(err, &re) {
+			t.Fatalf("%v: got %v, want a definite error, since the change never ran", cause, err)
+		}
 	}
 }
 

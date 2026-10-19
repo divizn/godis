@@ -76,7 +76,7 @@ func repl(c *client.Client, in io.Reader, out io.Writer, prompt string) error {
 }
 
 // arity is the least and most arguments of each command, its name included
-var arity = map[string][2]int{"PING": {1, 1}, "GET": {2, 2}, "SET": {3, 5}, "DEL": {2, 2}, "CAS": {4, 4}, "INCR": {2, 3}, "PEXPIRE": {3, 3}, "PTTL": {2, 2}}
+var arity = map[string][2]int{"PING": {1, 1}, "GET": {2, 2}, "SET": {3, 5}, "DEL": {2, 2}, "CAS": {4, 4}, "INCR": {2, 3}, "PEXPIRE": {3, 3}, "PTTL": {2, 2}, "CLUSTER": {2, 5}}
 
 // absent as CAS's expected value means "only if the key does not exist"
 const absent = "-"
@@ -144,6 +144,8 @@ func run(c *client.Client, args []string) (string, error) {
 			}
 			return fmt.Sprint("(integer) ", remaining.Milliseconds()), nil
 		}
+	case "CLUSTER":
+		return cluster(ctx, c, args[1:])
 	case "DEL":
 		err = c.Del(ctx, args[1])
 	case "CAS":
@@ -170,6 +172,34 @@ func run(c *client.Client, args []string) (string, error) {
 		return "", err
 	}
 	return "OK", nil
+}
+
+// cluster runs CLUSTER ADD id raft-addr client-addr, REMOVE id or NODES
+func cluster(ctx context.Context, c *client.Client, args []string) (string, error) {
+	sub := strings.ToUpper(args[0])
+	switch {
+	case sub == "ADD" && len(args) == 4:
+		if err := c.AddNode(ctx, args[1], args[2], args[3]); err != nil {
+			return "", err
+		}
+		return "OK", nil
+	case sub == "REMOVE" && len(args) == 2:
+		if err := c.RemoveNode(ctx, args[1]); err != nil {
+			return "", err
+		}
+		return "OK", nil
+	case sub == "NODES" && len(args) == 1:
+		nodes, err := c.Nodes(ctx)
+		if err != nil {
+			return "", err
+		}
+		lines := make([]string, len(nodes))
+		for i, n := range nodes {
+			lines[i] = fmt.Sprint(n.ID, " ", n.RaftAddr, " ", n.ClientAddr)
+		}
+		return strings.Join(lines, "\n"), nil
+	}
+	return "", errors.New("syntax error, expected CLUSTER ADD id raft-addr client-addr, CLUSTER REMOVE id or CLUSTER NODES")
 }
 
 // parseMillis reads a whole number of milliseconds, refusing one too large for a time.Duration

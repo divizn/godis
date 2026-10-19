@@ -14,10 +14,25 @@ import (
 // transport sends Raft RPCs over net/rpc, one lazily dialed connection per peer for appends with entries and one for the rest
 // so heartbeats never queue behind a big append, each redialed after any connection error
 type transport struct {
-	addrs map[string]string
-
 	mu      sync.Mutex
+	addrs   map[string]string
 	clients map[conn]*rpc.Client
+}
+
+// setAddr points peer at addr, closing connections to its old address
+func (t *transport) setAddr(peer, addr string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.addrs[peer] == addr {
+		return
+	}
+	t.addrs[peer] = addr
+	for to, c := range t.clients {
+		if to.peer == peer {
+			c.Close()
+			delete(t.clients, to)
+		}
+	}
 }
 
 type conn struct {
@@ -74,11 +89,11 @@ func (t *transport) call(ctx context.Context, to conn, method string, args, repl
 func (t *transport) client(ctx context.Context, to conn) (*rpc.Client, error) {
 	t.mu.Lock()
 	c := t.clients[to]
+	addr, ok := t.addrs[to.peer]
 	t.mu.Unlock()
 	if c != nil {
 		return c, nil
 	}
-	addr, ok := t.addrs[to.peer]
 	if !ok {
 		return nil, fmt.Errorf("unknown peer %q", to.peer)
 	}

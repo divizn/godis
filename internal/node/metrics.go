@@ -45,6 +45,8 @@ func registerRaftGauges(reg prometheus.Registerer, raft *consensus.Node) {
 		func() float64 { return float64(raft.Status().CommitIndex) })
 	f.NewGaugeFunc(prometheus.GaugeOpts{Name: "godis_raft_snapshot_index", Help: "Last Raft log index covered by this node's snapshot, 0 if none."},
 		func() float64 { return float64(raft.Status().SnapshotIndex) })
+	f.NewGaugeFunc(prometheus.GaugeOpts{Name: "godis_raft_members", Help: "Nodes in the cluster configuration this node uses."},
+		func() float64 { return float64(len(raft.Members())) })
 	f.NewGaugeFunc(prometheus.GaugeOpts{Name: "godis_raft_leader", Help: "1 if this node is the Raft leader, else 0."},
 		func() float64 {
 			if raft.Status().Role == consensus.Leader {

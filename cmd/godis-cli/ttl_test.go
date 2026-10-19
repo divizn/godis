@@ -8,7 +8,7 @@ import (
 )
 
 func TestTTLCommands(t *testing.T) {
-	c := soloClient(t)
+	c, _, _ := soloClient(t, false)
 	do := func(line string) string {
 		t.Helper()
 		args, err := splitArgs(line)

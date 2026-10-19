@@ -45,6 +45,24 @@ func TestParseCluster(t *testing.T) {
 	}
 }
 
+func TestBootstrapPeers(t *testing.T) {
+	peers, err := bootstrapPeers("", true, "n4", 7000, 8080)
+	if err != nil || len(peers) != 0 {
+		t.Fatalf("--join: got %+v, %v; want no peers", peers, err)
+	}
+	if _, err := bootstrapPeers("a=h:1/h:2", true, "n4", 7000, 8080); err == nil {
+		t.Fatal("--join with --cluster accepted")
+	}
+	peers, err = bootstrapPeers("", false, "solo", 7000, 8080)
+	want := []node.Peer{{ID: "solo", RaftAddr: "localhost:7000", ClientAddr: "localhost:8080"}}
+	if err != nil || !slices.Equal(peers, want) {
+		t.Fatalf("no flags: got %+v, %v; want %+v", peers, err, want)
+	}
+	if _, err := bootstrapPeers("garbage", false, "solo", 7000, 8080); err == nil {
+		t.Fatal("malformed --cluster accepted")
+	}
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

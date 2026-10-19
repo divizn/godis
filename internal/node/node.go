@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net"
 	"net/rpc"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 
 const (
 	requestTimeout         = 5 * time.Second
+	changeTimeout          = 30 * time.Second
 	defaultElectionTimeout = time.Second
 	defaultSweepInterval   = time.Second
 )
@@ -34,7 +37,8 @@ type Peer struct {
 
 type Config struct {
 	ID string
-	// Peers lists every member, including ID.
+	// Peers lists every member, including ID, when the cluster starts. Empty means a node that joins a running cluster:
+	// it has no configuration until the cluster adds it. Once the log holds a configuration, that one is used instead.
 	Peers []Peer
 	// Dir holds the Raft state and log.
 	Dir            string
@@ -48,6 +52,9 @@ type Config struct {
 	SnapshotEntries uint64
 	// SweepInterval is how often the leader checks for expired keys, defaulting to 1s.
 	SweepInterval time.Duration
+	// MembershipOps allows clients to add, remove and list nodes. These requests are not authenticated, so anyone who
+	// reaches the client port could remove every node.
+	MembershipOps bool
 }
 
 type Node struct {
@@ -78,13 +85,13 @@ func Start(cfg Config) (*Node, error) {
 }
 
 func start(cfg Config) (*Node, error) {
-	members := make([]consensus.Member, 0, len(cfg.Peers))
-	raftAddrs := map[string]string{}
-	clientAddrs := map[string]string{}
+	var members []consensus.Member
+	tr := &transport{addrs: map[string]string{}, clients: map[conn]*rpc.Client{}}
+	book := &addrBook{client: map[string]string{}}
 	for _, p := range cfg.Peers {
 		members = append(members, consensus.Member{ID: p.ID, Addr: p.RaftAddr + "/" + p.ClientAddr})
-		raftAddrs[p.ID] = p.RaftAddr
-		clientAddrs[p.ID] = p.ClientAddr
+		tr.addrs[p.ID] = p.RaftAddr
+		book.client[p.ID] = p.ClientAddr
 	}
 
 	election := cfg.ElectionTimeout
@@ -94,7 +101,6 @@ func start(cfg Config) (*Node, error) {
 	sweepEvery := cmp.Or(cfg.SweepInterval, defaultSweepInterval)
 	store := storage.New()
 	m := newMetrics(cfg.Metrics)
-	tr := &transport{addrs: raftAddrs, clients: map[conn]*rpc.Client{}}
 	raft, err := consensus.New(consensus.Config{
 		ID:        cfg.ID,
 		Members:   members,
@@ -114,6 +120,13 @@ func start(cfg Config) (*Node, error) {
 		Restore:         store.Restore,
 		SnapshotEntries: cfg.SnapshotEntries,
 		OnLeaderChange:  func(uint64, string) { m.leaderChanges.Inc() },
+		OnMembership: func(members []consensus.Member) {
+			for _, mem := range members {
+				raftAddr, clientAddr, _ := strings.Cut(mem.Addr, "/")
+				tr.setAddr(mem.ID, raftAddr)
+				book.set(mem.ID, clientAddr)
+			}
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("start raft: %w", err)
@@ -138,7 +151,7 @@ func start(cfg Config) (*Node, error) {
 		conns:      map[net.Conn]struct{}{},
 	}
 	go func() { n.raftDone <- n.serveRaft(srv) }()
-	kv := kvStore{raft: raft, store: store, clientAddrs: clientAddrs, metrics: m}
+	kv := kvStore{raft: raft, store: store, tr: tr, book: book, membershipOps: cfg.MembershipOps, metrics: m}
 	go func() { n.clientDone <- network.NewServer(kv).Serve(ctx, cfg.ClientListener) }()
 	go func() {
 		defer close(n.sweepDone)
@@ -200,10 +213,30 @@ func (n *Node) serveRaft(srv *rpc.Server) error {
 
 // kvStore serves the client protocol: writes through the Raft log, reads after a ReadIndex, both on the leader only
 type kvStore struct {
-	raft        *consensus.Node
-	store       *storage.Store
-	clientAddrs map[string]string
-	metrics     *metrics
+	raft          *consensus.Node
+	store         *storage.Store
+	tr            *transport
+	book          *addrBook
+	membershipOps bool
+	metrics       *metrics
+}
+
+// addrBook maps node ids to client addresses, for redirects; it only grows, since a redirect to a removed node is harmless
+type addrBook struct {
+	mu     sync.Mutex
+	client map[string]string
+}
+
+func (b *addrBook) set(id, addr string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.client[id] = addr
+}
+
+func (b *addrBook) get(id string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.client[id]
 }
 
 func (s kvStore) Get(key string) ([]byte, bool, error) {
@@ -348,9 +381,75 @@ func (s kvStore) classify(err error) error {
 	var nle *consensus.NotLeaderError
 	switch {
 	case errors.As(err, &nle):
-		return &protocol.RedirectError{Addr: s.clientAddrs[nle.Leader]}
-	case errors.Is(err, consensus.ErrCommandTooLarge), errors.Is(err, consensus.ErrEmptyCommand):
+		return &protocol.RedirectError{Addr: s.book.get(nle.Leader)}
+	case errors.Is(err, consensus.ErrCommandTooLarge), errors.Is(err, consensus.ErrEmptyCommand),
+		errors.Is(err, consensus.ErrChangeInProgress), errors.Is(err, consensus.ErrMemberExists), errors.Is(err, consensus.ErrNotMember),
+		errors.Is(err, consensus.ErrLastMember), errors.Is(err, consensus.ErrLeaderNotReady), errors.Is(err, consensus.ErrCatchUpTimeout):
 		return err
 	}
 	return fmt.Errorf("%w: %w", protocol.ErrOutcomeUnknown, err)
+}
+
+var errMembershipOpsOff = errors.New("membership operations are disabled; start the server with --membership-ops")
+
+func (s kvStore) AddNode(id, raftAddr, clientAddr string) error {
+	start := time.Now()
+	err := s.addNode(id, raftAddr, clientAddr)
+	s.metrics.observe("addnode", start, true, err)
+	return err
+}
+
+func (s kvStore) addNode(id, raftAddr, clientAddr string) error {
+	if !s.membershipOps {
+		return errMembershipOpsOff
+	}
+	if id == "" || raftAddr == "" || clientAddr == "" || strings.Contains(raftAddr+clientAddr, "/") {
+		return errors.New("a node needs an id and a raft and a client address without slashes")
+	}
+	m := consensus.Member{ID: id, Addr: raftAddr + "/" + clientAddr}
+	members := s.raft.Members()
+	if i := slices.IndexFunc(members, func(x consensus.Member) bool { return x.ID == id }); i >= 0 {
+		if members[i] == m {
+			return nil
+		}
+		return fmt.Errorf("node %s is already a member at a different address", id)
+	}
+	s.tr.setAddr(id, raftAddr)
+	ctx, cancel := context.WithTimeout(context.Background(), changeTimeout)
+	defer cancel()
+	if err := s.raft.AddMember(ctx, m); err != nil {
+		return s.classify(fmt.Errorf("add node %s: %w", id, err))
+	}
+	return nil
+}
+
+func (s kvStore) RemoveNode(id string) error {
+	start := time.Now()
+	err := s.removeNode(id)
+	s.metrics.observe("removenode", start, true, err)
+	return err
+}
+
+func (s kvStore) removeNode(id string) error {
+	if !s.membershipOps {
+		return errMembershipOpsOff
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), changeTimeout)
+	defer cancel()
+	if err := s.raft.RemoveMember(ctx, id); err != nil {
+		return s.classify(fmt.Errorf("remove node %s: %w", id, err))
+	}
+	return nil
+}
+
+func (s kvStore) Nodes() ([]protocol.Node, error) {
+	if !s.membershipOps {
+		return nil, errMembershipOpsOff
+	}
+	var nodes []protocol.Node
+	for _, m := range s.raft.Members() {
+		raftAddr, clientAddr, _ := strings.Cut(m.Addr, "/")
+		nodes = append(nodes, protocol.Node{ID: m.ID, RaftAddr: raftAddr, ClientAddr: clientAddr})
+	}
+	return nodes, nil
 }

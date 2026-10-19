@@ -30,14 +30,13 @@ func main() {
 	election := flag.Duration("election-timeout", time.Second, "raft election timeout, randomized up to twice this; heartbeats are a tenth of it")
 	snapshotEntries := flag.Uint64("snapshot-entries", 10000, "applied log entries that trigger a snapshot and log compaction")
 	cluster := flag.String("cluster", "", "every member as id=raft-addr/client-addr, comma separated; empty means a cluster of one")
+	join := flag.Bool("join", false, "start with no cluster configuration, to be added to a running cluster with CLUSTER ADD")
+	membershipOps := flag.Bool("membership-ops", false, "let clients add, remove and list nodes; these requests are not authenticated")
 	flag.Parse()
 
-	if *cluster == "" {
-		*cluster = fmt.Sprintf("%s=localhost:%d/localhost:%d", *id, *raftPort, *port)
-	}
-	peers, err := parseCluster(*cluster)
+	peers, err := bootstrapPeers(*cluster, *join, *id, *raftPort, *port)
 	if err != nil {
-		log.Fatalf("parse --cluster: %v", err)
+		log.Fatal(err)
 	}
 
 	cl, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
@@ -55,7 +54,7 @@ func main() {
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	n, err := node.Start(node.Config{ID: *id, Peers: peers, Dir: *dataDir, ClientListener: cl, RaftListener: rl, ElectionTimeout: *election, Metrics: reg, SnapshotEntries: *snapshotEntries})
+	n, err := node.Start(node.Config{ID: *id, Peers: peers, Dir: *dataDir, ClientListener: cl, RaftListener: rl, ElectionTimeout: *election, Metrics: reg, SnapshotEntries: *snapshotEntries, MembershipOps: *membershipOps})
 	if err != nil {
 		log.Fatalf("start node: %v", err)
 	}
@@ -83,6 +82,23 @@ func main() {
 	if err := metrics.Shutdown(context.Background()); err != nil {
 		log.Fatalf("stop metrics server: %v", err)
 	}
+}
+
+// bootstrapPeers is the configuration a node starts with: none to join a running cluster, the --cluster members, or itself alone
+func bootstrapPeers(cluster string, join bool, id string, raftPort, port int) ([]node.Peer, error) {
+	switch {
+	case join && cluster != "":
+		return nil, errors.New("--join starts a node with no configuration, so it cannot be combined with --cluster")
+	case join:
+		return nil, nil
+	case cluster == "":
+		cluster = fmt.Sprintf("%s=localhost:%d/localhost:%d", id, raftPort, port)
+	}
+	peers, err := parseCluster(cluster)
+	if err != nil {
+		return nil, fmt.Errorf("parse --cluster: %w", err)
+	}
+	return peers, nil
 }
 
 func parseCluster(s string) ([]node.Peer, error) {
