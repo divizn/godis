@@ -533,7 +533,7 @@ func TestLearnerIsNotCounted(t *testing.T) {
 		leader, _ := c.waitLeader()
 		c.mustPropose(leader, "x")
 		c.start("n4")
-		go c.node(leader).AddMember(context.Background(), Member{ID: "n4", Addr: "n4"})
+		go func() { _ = c.node(leader).AddMember(context.Background(), Member{ID: "n4", Addr: "n4"}) }()
 		waitFor(t, 10*time.Second, "the learner to be tracked", func() bool {
 			n := c.node(leader)
 			n.mu.Lock()
